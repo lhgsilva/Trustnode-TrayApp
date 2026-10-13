@@ -118,10 +118,35 @@ class ReportsStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _connect_read(self) -> sqlite3.Connection:
+        """A READ-ONLY connection with a short busy timeout.
+
+        2026-09-30: every call here used the read/write connection above, whose
+        busy timeout is 10s. This store shares one file with the historian - a
+        multi-gigabyte database under constant write load - so listing report
+        templates could sit behind the writer for longer than the UI's 12s
+        request budget. The page then reported "Failed to load templates:
+        signal is aborted without reason" at every start-up and an operator
+        had to reload the app until it happened to win the race.
+
+        Read-only at the driver level (no upgrade to a write lock is possible)
+        and capped at 3s, the same rule AppStore._connect_readonly already
+        applies for exactly this reason.
+        """
+        try:
+            conn = sqlite3.connect("file:%s?mode=ro" % str(self.db_path).replace("\\", "/"),
+                                   uri=True, timeout=3.0)
+        except sqlite3.OperationalError:
+            # First boot: the file may not exist yet, and mode=ro will not
+            # create it. Fall back so a fresh install still answers.
+            return self._connect()
+        conn.row_factory = sqlite3.Row
+        return conn
+
     # --- templates ---
     def list_templates(self, tenant_id: str | None = None) -> list[dict[str, Any]]:
         tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
-        with self._connect() as conn:
+        with self._connect_read() as conn:
             rows = conn.execute(
                 "SELECT id, name, description, definition_json, created_utc, updated_utc, created_by "
                 "FROM report_templates WHERE tenant_id = ? ORDER BY updated_utc DESC",
@@ -131,7 +156,7 @@ class ReportsStore:
 
     def get_template(self, template_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
         tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
-        with self._connect() as conn:
+        with self._connect_read() as conn:
             row = conn.execute(
                 "SELECT id, name, description, definition_json, created_utc, updated_utc, created_by "
                 "FROM report_templates WHERE tenant_id = ? AND id = ?",
@@ -236,7 +261,7 @@ class ReportsStore:
                             INSERT INTO "{schema}"."report_templates"
                               (id, tenant_id, name, description, definition_json, created_utc, updated_utc, created_by)
                             VALUES
-                              (:id, :tenant_id, :name, :description, :definition_json::jsonb,
+                              (:id, :tenant_id, :name, :description, CAST(:definition_json AS jsonb),
                                :created_utc, :updated_utc, :author)
                             ON CONFLICT (tenant_id, id) DO UPDATE SET
                               name            = EXCLUDED.name,
@@ -306,7 +331,7 @@ class ReportsStore:
                             INSERT INTO "{schema}"."report_templates"
                               (id, tenant_id, name, description, definition_json, created_utc, updated_utc, created_by)
                             VALUES
-                              (:id, :tenant_id, :name, :description, :definition_json::jsonb,
+                              (:id, :tenant_id, :name, :description, CAST(:definition_json AS jsonb),
                                :created_utc, :updated_utc, :author)
                             ON CONFLICT (tenant_id, id) DO UPDATE SET
                               name            = EXCLUDED.name,
@@ -398,7 +423,7 @@ class ReportsStore:
     # --- schedules ---
     def list_schedules(self, tenant_id: str | None = None) -> list[dict[str, Any]]:
         tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
-        with self._connect() as conn:
+        with self._connect_read() as conn:
             rows = conn.execute(
                 "SELECT * FROM scheduled_reports WHERE tenant_id = ? ORDER BY updated_utc DESC",
                 (tid,),
@@ -408,7 +433,7 @@ class ReportsStore:
     def list_enabled_schedules_all_tenants(self) -> list[dict[str, Any]]:
         """Used by the scheduler daemon: enumerate every enabled schedule
         across tenants in one pass (no tenant filter)."""
-        with self._connect() as conn:
+        with self._connect_read() as conn:
             rows = conn.execute(
                 "SELECT * FROM scheduled_reports WHERE enabled = 1"
             ).fetchall()
@@ -416,7 +441,7 @@ class ReportsStore:
 
     def get_schedule(self, schedule_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
         tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
-        with self._connect() as conn:
+        with self._connect_read() as conn:
             row = conn.execute(
                 "SELECT * FROM scheduled_reports WHERE tenant_id = ? AND id = ?",
                 (tid, str(schedule_id)),
@@ -434,8 +459,28 @@ class ReportsStore:
         template_id = str(schedule.get("template_id") or "").strip()
         enabled = 1 if bool(schedule.get("enabled", True)) else 0
         trigger_mode = str(schedule.get("trigger_mode") or "time").strip().lower()
-        if trigger_mode not in {"time", "tag", "both"}:
+        # "cycle" runs from a START condition going true to a STOP condition
+        # going true, and the report covers exactly that window.
+        if trigger_mode not in {"time", "tag", "both", "cycle"}:
             trigger_mode = "time"
+        stop_conditions = schedule.get("stop_conditions")
+        stop_conditions = stop_conditions if isinstance(stop_conditions, list) else []
+        stop_logic = str(schedule.get("stop_condition_logic") or "all").strip().lower()
+        if stop_logic not in {"all", "any"}:
+            stop_logic = "all"
+        id_tag = str(schedule.get("id_tag") or "").strip()
+        file_name_pattern = str(schedule.get("file_name_pattern") or "").strip()
+        # Divides a cycle run into segments. Listed in BOTH statements below:
+        # this upsert rebuilds the row column by column, and a field missing
+        # from either one saves cleanly and then vanishes.
+        segment_tag = str(schedule.get("segment_tag") or "").strip()
+        template_ids = [str(t).strip() for t in (schedule.get("template_ids") or [])
+                        if str(t or "").strip()]
+        output_path = str(schedule.get("output_path") or "").strip()
+        # Default ON: re-opening a cycle while the start bit is still high was
+        # the bug, not the feature.
+        start_edge = 0 if schedule.get("start_edge") is False else 1
+        segment_gateway = str(schedule.get("segment_gateway") or "").strip()
         recurrence = str(schedule.get("recurrence") or "daily").strip().lower()
         if recurrence not in {"daily", "weekly", "monthly", "hourly"}:
             recurrence = "daily"
@@ -485,6 +530,11 @@ class ReportsStore:
                           deliver_email = ?, recipients_json = ?, email_subject = ?, email_body = ?,
                           email_profile_id = ?, format = ?, require_gateway_running = ?,
                           attach_pdf = ?, attach_csv = ?, attach_txt = ?,
+                          stop_conditions_json = ?, stop_condition_logic = ?,
+                          id_tag = ?, file_name_pattern = ?,
+                          segment_tag = ?, segment_gateway = ?,
+                          template_ids_json = ?, output_path = ?,
+                          start_edge = ?,
                           updated_utc = ?
                         WHERE tenant_id = ? AND id = ?
                         """,
@@ -497,6 +547,11 @@ class ReportsStore:
                             email_subject, email_body, email_profile_id, fmt,
                             require_gateway_running,
                             attach_pdf, attach_csv, attach_txt,
+                            json.dumps(stop_conditions, ensure_ascii=False),
+                            stop_logic, id_tag, file_name_pattern,
+                            segment_tag, segment_gateway,
+                            json.dumps(template_ids, ensure_ascii=False), output_path,
+                            start_edge,
                             now,
                             tid, sid,
                         ),
@@ -512,8 +567,12 @@ class ReportsStore:
                           deliver_email, recipients_json, email_subject, email_body,
                           email_profile_id, format, require_gateway_running,
                           attach_pdf, attach_csv, attach_txt,
+                          stop_conditions_json, stop_condition_logic,
+                          id_tag, file_name_pattern,
+                          segment_tag, segment_gateway,
+                          template_ids_json, output_path, start_edge,
                           created_utc, updated_utc
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             sid, tid, name, template_id, enabled, trigger_mode,
@@ -524,6 +583,11 @@ class ReportsStore:
                             email_subject, email_body,
                             email_profile_id, fmt, require_gateway_running,
                             attach_pdf, attach_csv, attach_txt,
+                            json.dumps(stop_conditions, ensure_ascii=False),
+                            stop_logic, id_tag, file_name_pattern,
+                            segment_tag, segment_gateway,
+                            json.dumps(template_ids, ensure_ascii=False), output_path,
+                            start_edge,
                             now, now,
                         ),
                     )
@@ -541,6 +605,31 @@ class ReportsStore:
                 )
                 conn.commit()
         return cur.rowcount > 0
+
+    def set_cycle_state(self, schedule_id: str, started_utc: str,
+                        report_id: str = "", segments_json: str | None = None) -> None:
+        """Remember (or clear) the cycle a schedule is currently inside.
+
+        Held in the row rather than in memory so a restart mid-cycle does not
+        silently drop it - the report would then cover the wrong window, which
+        is worse than not producing one.
+        """
+        with self._write_lock:
+            with self._connect() as conn:
+                if segments_json is None:
+                    conn.execute(
+                        "UPDATE scheduled_reports SET cycle_started_utc = ?, "
+                        "cycle_report_id = ? WHERE id = ?",
+                        (str(started_utc or ""), str(report_id or ""), str(schedule_id)),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE scheduled_reports SET cycle_started_utc = ?, "
+                        "cycle_report_id = ?, cycle_segments_json = ? WHERE id = ?",
+                        (str(started_utc or ""), str(report_id or ""),
+                         str(segments_json or "[]"), str(schedule_id)),
+                    )
+                conn.commit()
 
     def mark_schedule_run(
         self,
@@ -563,6 +652,35 @@ class ReportsStore:
     def _row_to_schedule(row: sqlite3.Row | None) -> dict[str, Any] | None:
         if not row:
             return None
+
+        # The cycle columns are added by a migration, so a row read from a
+        # database that predates it simply does not have them. Missing means
+        # "not configured", never an error.
+        def _row_text(name: str, fallback: str = "") -> str:
+            try:
+                return str(row[name] or fallback)
+            except (IndexError, KeyError):
+                return fallback
+
+        def _row_flag(name: str, fallback: bool) -> bool:
+            """A 0/1 column, tolerant of a row written before it existed."""
+            try:
+                v = row[name]
+            except (IndexError, KeyError):
+                return fallback
+            if v is None:
+                return fallback
+            try:
+                return bool(int(v))
+            except (TypeError, ValueError):
+                return fallback
+
+        def _json_list(name: str) -> list:
+            try:
+                return json.loads(str(row[name] or "[]"))
+            except (IndexError, KeyError, ValueError, TypeError):
+                return []
+
         try:
             tag_conditions = json.loads(str(row["tag_conditions_json"] or "[]"))
         except Exception:
@@ -585,6 +703,18 @@ class ReportsStore:
             "day_of_month": (int(row["day_of_month"]) if row["day_of_month"] is not None else None),
             "tag_conditions": tag_conditions,
             "condition_logic": str(row["condition_logic"] or "all"),
+            "stop_conditions": _json_list("stop_conditions_json"),
+            "stop_condition_logic": _row_text("stop_condition_logic", "all"),
+            "id_tag": _row_text("id_tag"),
+            "file_name_pattern": _row_text("file_name_pattern"),
+            "cycle_started_utc": _row_text("cycle_started_utc"),
+            "cycle_report_id": _row_text("cycle_report_id"),
+            "segment_tag": _row_text("segment_tag"),
+            "segment_gateway": _row_text("segment_gateway"),
+            "template_ids": _json_list("template_ids_json"),
+            "output_path": _row_text("output_path"),
+            "start_edge": _row_flag("start_edge", True),
+            "cycle_segments": _json_list("cycle_segments_json"),
             "deliver_email": bool(int(row["deliver_email"] or 0)),
             "recipients": recipients,
             "email_subject": str(row["email_subject"] or ""),
@@ -638,13 +768,13 @@ class ReportsStore:
             + " ORDER BY created_utc DESC LIMIT ?"
         )
         params.append(lim)
-        with self._connect() as conn:
+        with self._connect_read() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_generated(r) for r in rows]
 
     def get_generated(self, generated_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
         tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
-        with self._connect() as conn:
+        with self._connect_read() as conn:
             row = conn.execute(
                 "SELECT * FROM generated_reports WHERE tenant_id = ? AND id = ?",
                 (tid, str(generated_id)),

@@ -107,8 +107,20 @@ def build_query(spec: Dict[str, Any], tenant_id: str) -> Tuple[str, list, List[s
     preview shows exactly what the query returned.
     """
     spec = spec or {}
-    where: List[str] = ["tenant_id = ?"]
-    params: List[Any] = [tenant_id]
+    # tenant_id may be ONE id or several (a bridged prior tenant). The
+    # pickers resolve tenants through app_store._tenant_filter_clause, and
+    # an export that scoped differently from the picker that filled it in
+    # would offer a tag and then return no rows for it (2026-10-08).
+    _tenants = ([str(t) for t in tenant_id]
+                if isinstance(tenant_id, (list, tuple, set))
+                else [str(tenant_id)])
+    _tenants = [t for t in _tenants if t]
+    if len(_tenants) > 1:
+        where: List[str] = ["tenant_id IN (%s)" % ",".join("?" for _ in _tenants)]
+        params: List[Any] = list(_tenants)
+    else:
+        where = ["tenant_id = ?"]
+        params = [_tenants[0] if _tenants else ""]
 
     # --- indexed predicates first ---------------------------------------
     frm = str(spec.get("from_utc") or "").strip()

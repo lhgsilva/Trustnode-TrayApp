@@ -21,6 +21,8 @@ const FIELDS = [
     hint: "Base URL of the AI inference endpoint." },
   { key: "web_client_url", label: "Cloud web client URL",
     hint: "Optional. Base URL of the cloud read-only web app." },
+  { key: "lite_url", label: "Lite / mobile view URL",
+    hint: "Where the Lite web and mobile view is served from. Moving Lite to another provider is a change here, not a file push." },
 ];
 
 export default function InfrastructureEndpoints({ tenantOptions = [], defaultTenant = "" }) {

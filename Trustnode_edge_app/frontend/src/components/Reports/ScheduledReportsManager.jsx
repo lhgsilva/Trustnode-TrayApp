@@ -10,6 +10,7 @@ import {
   listScheduledReports,
   runScheduledReport,
   saveScheduledReport,
+  validateDirectoryPath,
 } from "../../api";
 
 // ---------------------------------------------------------------------------
@@ -78,6 +79,9 @@ const TRIGGER_MODES = [
   { value: "time", label: "Time only" },
   { value: "tag", label: "Tag-condition only" },
   { value: "both", label: "Time AND tag conditions" },
+  // The run has a START and a STOP: one report per cycle, covering exactly
+  // the window between them.
+  { value: "cycle", label: "Start/stop trigger (cycle)" },
 ];
 const CONDITION_LOGICS = [
   { value: "all", label: "All conditions" },
@@ -97,6 +101,120 @@ function makeId(prefix) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
+// One condition list, used for BOTH the start and the stop set.
+//
+// 2026-10-01: cycle mode needs a second list, and copying this one would give
+// two editors for the same shape that drift apart - which is how the designer
+// ended up with controls that only existed on one of them.
+//
+// It also refuses to let you build a condition that can never be true: a bit
+// is 0 or 1, so "> 1" never fires. A schedule was configured exactly that way
+// and silently never ran.
+function ConditionList({ conditions, logic, onLogic, onChange, gatewayOptions,
+                         tagListForGateway, formatTagForDisplay, emptyHint }) {
+  const rows = conditions || [];
+  const patch = (idx, fields) =>
+    onChange(rows.map((c, i) => (i === idx ? { ...c, ...fields } : c)));
+
+  const impossible = (c) => {
+    const v = Number(c.value ?? c.value1);
+    if (!Number.isFinite(v)) return "";
+    if (c.operator === "gt" && v >= 1) return "A 0/1 bit is never > 1 — use “= 1”.";
+    if (c.operator === "lt" && v <= 0) return "A 0/1 bit is never < 0 — use “= 0”.";
+    return "";
+  };
+
+  return (
+    <>
+      <div className="schedule-form-grid">
+        <label>
+          Match logic
+          <select value={logic || "all"} onChange={(e) => onLogic(e.target.value)}>
+            {CONDITION_LOGICS.map((c) => (
+              <option key={c.value} value={c.value}>{c.label}</option>
+            ))}
+          </select>
+        </label>
+      </div>
+      <div className="tag-condition-list">
+        {rows.length === 0 && emptyHint ? (
+          <p className="schedule-hint">{emptyHint}</p>
+        ) : null}
+        {rows.map((c, idx) => (
+          <div key={c.id || idx}>
+            <div className="tag-condition-row">
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={c.enabled !== false}
+                  onChange={(e) => patch(idx, { enabled: e.target.checked })}
+                />
+              </label>
+              <select
+                value={c.gateway_id || ""}
+                onChange={(e) => patch(idx, { gateway_id: e.target.value, tag_name: "" })}
+              >
+                <option value="">Gateway…</option>
+                {gatewayOptions.map((g) => (
+                  <option key={g.id} value={g.id}>{g.name || g.id}</option>
+                ))}
+              </select>
+              <select
+                value={c.tag_name || ""}
+                onChange={(e) => patch(idx, { tag_name: e.target.value })}
+              >
+                <option value="">Tag…</option>
+                {tagListForGateway(c.gateway_id).map((t) => (
+                  <option key={t} value={t}>{formatTagForDisplay(t)}</option>
+                ))}
+              </select>
+              <select
+                value={c.operator || "eq"}
+                onChange={(e) => patch(idx, { operator: e.target.value })}
+              >
+                {RULE_OPERATORS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+              <input
+                value={c.value ?? c.value1 ?? ""}
+                placeholder="Value"
+                onChange={(e) => patch(idx, { value: e.target.value })}
+              />
+              <button
+                type="button"
+                className="icon-btn icon-btn-danger"
+                title="Remove condition"
+                onClick={() => onChange(rows.filter((_, i) => i !== idx))}
+              >
+                <IconTrash />
+              </button>
+            </div>
+            {impossible(c) ? (
+              <p className="schedule-warning">{impossible(c)}</p>
+            ) : null}
+          </div>
+        ))}
+        <button
+          type="button"
+          className="btn btn-link"
+          onClick={() =>
+            onChange([
+              ...rows,
+              // "= 1" is what a cycle bit needs; the old default of ">" with a
+              // typed 1 could never fire.
+              { id: makeId("cnd"), enabled: true, gateway_id: "", tag_name: "",
+                operator: "eq", value: "1" },
+            ])
+          }
+        >
+          <IconPlus /> Add condition
+        </button>
+      </div>
+    </>
+  );
+}
+
 function emptySchedule(templateId = "") {
   return {
     id: "",
@@ -111,6 +229,18 @@ function emptySchedule(templateId = "") {
     day_of_month: 1,
     tag_conditions: [],
     condition_logic: "all",
+    // Cycle mode. Listed here so the spread in the save payload carries them;
+    // a field missing from this default never reaches the backend.
+    stop_conditions: [],
+    stop_condition_logic: "all",
+    start_edge: true,
+    id_tag: "",
+    segment_tag: "",
+    file_name_pattern: "",
+    // One trigger can produce several reports, and the file can be written to
+    // a chosen folder (a synced OneDrive folder is just a local path).
+    template_ids: [],
+    output_path: "",
     deliver_email: false,
     recipients: [],
     email_subject: "",
@@ -174,6 +304,58 @@ export function ScheduledReportsManager({
   const [schedules, setSchedules] = useState([]);
   const [generated, setGenerated] = useState([]);
   const [draft, setDraft] = useState(emptySchedule());
+
+  // Live check of the "Save to" folder. Debounced, because it runs while the
+  // operator types; {tokens} are only resolved at run time, so the backend
+  // checks the fixed part of the path ahead of the first "{".
+  const [pathCheck, setPathCheck] = useState({ ok: true, state: "", message: "" });
+  const folderPickerAvailable = Boolean(window?.trustnodeDialogs?.pickFolder);
+
+  useEffect(() => {
+    const raw = String(draft.output_path || "");
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      try {
+        const r = await validateDirectoryPath(raw);
+        if (!cancelled) {
+          setPathCheck({ ok: Boolean(r?.ok), state: String(r?.state || ""),
+                         message: String(r?.message || "") });
+        }
+      } catch (_) {
+        // A failed CHECK is not a failed path - say nothing rather than
+        // warning about a folder that may well be fine.
+        if (!cancelled) setPathCheck({ ok: true, state: "", message: "" });
+      }
+    }, 500);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [draft.output_path]);
+
+  const pickOutputFolder = async () => {
+    if (!window?.trustnodeDialogs?.pickFolder) return;
+    try {
+      const picked = await window.trustnodeDialogs.pickFolder({
+        title: "Where should these reports be saved?" });
+      if (!picked) return;
+      // Keep whatever file-name pattern is already in the path.
+      const current = String(draft.output_path || "");
+      const tail = /[\\/]/.test(current)
+        ? current.replace(/\\/g, "/").split("/").pop()
+        : "";
+      const base = String(picked).replace(/[\\/]+$/, "");
+      setDraft((p) => ({ ...p, output_path: tail ? `${base}/${tail}` : base }));
+    } catch (_) { /* the operator cancelled */ }
+  };
+
+  const createOutputFolder = async () => {
+    try {
+      const r = await validateDirectoryPath(String(draft.output_path || ""), { create: true });
+      setPathCheck({ ok: Boolean(r?.ok), state: String(r?.state || ""),
+                     message: String(r?.message || "") });
+    } catch (e) {
+      setPathCheck({ ok: false, state: "error",
+                     message: String(e?.message || e) });
+    }
+  };
   const [recipientsInput, setRecipientsInput] = useState("");
   const [busy, setBusy] = useState("");
   const [filterScheduleId, setFilterScheduleId] = useState("");
@@ -587,130 +769,161 @@ export function ScheduledReportsManager({
                 </fieldset>
               ) : null}
 
-              {(draft.trigger_mode === "tag" || draft.trigger_mode === "both") ? (
+              {/* START conditions. In cycle mode these OPEN the run; in tag
+                  mode they fire the report directly. One editor either way -
+                  a second copy of this list would drift from the first. */}
+              {(draft.trigger_mode === "tag" || draft.trigger_mode === "both"
+                || draft.trigger_mode === "cycle") ? (
                 <fieldset className="schedule-fieldset">
-                  <legend>Tag conditions</legend>
-                  <div className="schedule-form-grid">
-                    <label>
-                      Match logic
-                      <select
-                        value={draft.condition_logic || "all"}
-                        onChange={(e) => setDraft((p) => ({ ...p, condition_logic: e.target.value }))}
-                      >
-                        {CONDITION_LOGICS.map((c) => (
-                          <option key={c.value} value={c.value}>{c.label}</option>
-                        ))}
-                      </select>
+                  <legend>
+                    {draft.trigger_mode === "cycle" ? "Start conditions" : "Tag conditions"}
+                  </legend>
+                  <ConditionList
+                    conditions={draft.tag_conditions}
+                    logic={draft.condition_logic}
+                    gatewayOptions={gatewayOptions}
+                    tagListForGateway={tagListForGateway}
+                    formatTagForDisplay={formatTagForDisplay}
+                    onLogic={(v) => setDraft((p) => ({ ...p, condition_logic: v }))}
+                    onChange={(next) => setDraft((p) => ({ ...p, tag_conditions: next }))}
+                  />
+                </fieldset>
+              ) : null}
+
+              {draft.trigger_mode === "cycle" ? (
+                <>
+                  <fieldset className="schedule-fieldset">
+                    <legend>Stop conditions</legend>
+                    <ConditionList
+                      conditions={draft.stop_conditions}
+                      logic={draft.stop_condition_logic}
+                      gatewayOptions={gatewayOptions}
+                      tagListForGateway={tagListForGateway}
+                      formatTagForDisplay={formatTagForDisplay}
+                      onLogic={(v) => setDraft((p) => ({ ...p, stop_condition_logic: v }))}
+                      onChange={(next) => setDraft((p) => ({ ...p, stop_conditions: next }))}
+                      emptyHint="Leave empty to close when the start condition stops being true."
+                    />
+                  </fieldset>
+                  <fieldset className="schedule-fieldset">
+                    <legend>Cycle options</legend>
+                    {/* 2026-10-11, reported: "when a condifition is start
+                        rigger =1 but this keep on until is off". The cycle
+                        closed while the start bit was still high, so the next
+                        15s tick opened another one - one physical run
+                        producing a report every quarter minute. */}
+                    <label className="tn-checkbox">
+                      <input
+                        type="checkbox"
+                        checked={draft.start_edge !== false}
+                        title="Wait for the start condition to go FALSE before another cycle can open. Leave on unless the start tag is a momentary pulse that is cleared by the PLC."
+                        onChange={(e) => setDraft((p) => ({ ...p, start_edge: e.target.checked }))}
+                      />
+                      Only re-open on a new rising edge
                     </label>
-                  </div>
-                  <div className="tag-condition-list">
-                    {(draft.tag_conditions || []).map((c, idx) => (
-                      <div key={c.id || idx} className="tag-condition-row">
-                        <label className="checkbox-row">
-                          <input
-                            type="checkbox"
-                            checked={c.enabled !== false}
-                            onChange={(e) =>
-                              setDraft((p) => ({
-                                ...p,
-                                tag_conditions: p.tag_conditions.map((cc, i) =>
-                                  i === idx ? { ...cc, enabled: e.target.checked } : cc
-                                ),
-                              }))
-                            }
-                          />
-                        </label>
+                    <div className="schedule-form-grid">
+                      <label>
+                        Report ID tag
                         <select
-                          value={c.gateway_id || ""}
-                          onChange={(e) =>
-                            setDraft((p) => ({
-                              ...p,
-                              tag_conditions: p.tag_conditions.map((cc, i) =>
-                                i === idx ? { ...cc, gateway_id: e.target.value, tag_name: "" } : cc
-                              ),
-                            }))
-                          }
+                          value={draft.id_tag || ""}
+                          title="Read when the cycle STARTS - a serial read at the end may already be the next part."
+                          onChange={(e) => setDraft((p) => ({ ...p, id_tag: e.target.value }))}
                         >
-                          <option value="">Gateway…</option>
-                          {gatewayOptions.map((g) => (
-                            <option key={g.id} value={g.id}>{g.name || g.id}</option>
-                          ))}
-                        </select>
-                        <select
-                          value={c.tag_name || ""}
-                          onChange={(e) =>
-                            setDraft((p) => ({
-                              ...p,
-                              tag_conditions: p.tag_conditions.map((cc, i) =>
-                                i === idx ? { ...cc, tag_name: e.target.value } : cc
-                              ),
-                            }))
-                          }
-                        >
-                          <option value="">Tag…</option>
-                          {tagListForGateway(c.gateway_id).map((t) => (
+                          <option value="">None</option>
+                          {tagListForGateway(
+                            (draft.tag_conditions || [])[0]?.gateway_id || ""
+                          ).map((t) => (
                             <option key={t} value={t}>{formatTagForDisplay(t)}</option>
                           ))}
                         </select>
+                      </label>
+                      <label>
+                        Test / cycle tag
                         <select
-                          value={c.operator || "gt"}
-                          onChange={(e) =>
-                            setDraft((p) => ({
-                              ...p,
-                              tag_conditions: p.tag_conditions.map((cc, i) =>
-                                i === idx ? { ...cc, operator: e.target.value } : cc
-                              ),
-                            }))
-                          }
+                          value={draft.segment_tag || ""}
+                          title="Each change of this tag closes one sub-period and opens the next."
+                          onChange={(e) => setDraft((p) => ({ ...p, segment_tag: e.target.value }))}
                         >
-                          {RULE_OPERATORS.map((o) => (
-                            <option key={o.value} value={o.value}>{o.label}</option>
+                          <option value="">One segment per run</option>
+                          {tagListForGateway(
+                            (draft.tag_conditions || [])[0]?.gateway_id || ""
+                          ).map((t) => (
+                            <option key={t} value={t}>{formatTagForDisplay(t)}</option>
                           ))}
                         </select>
-                        <input
-                          value={c.value ?? c.value1 ?? ""}
-                          placeholder="Threshold"
-                          onChange={(e) =>
-                            setDraft((p) => ({
-                              ...p,
-                              tag_conditions: p.tag_conditions.map((cc, i) =>
-                                i === idx ? { ...cc, value: e.target.value } : cc
-                              ),
-                            }))
-                          }
-                        />
-                        <button
-                          type="button"
-                          className="icon-btn icon-btn-danger"
-                          title="Remove condition"
-                          onClick={() =>
-                            setDraft((p) => ({
-                              ...p,
-                              tag_conditions: p.tag_conditions.filter((_, i) => i !== idx),
-                            }))
-                          }
+                      </label>
+                      <label>
+                        Also produce
+                        <select
+                          multiple
+                          size={3}
+                          title="Hold Ctrl to pick more than one. Each produces its own report for the same cycle."
+                          value={draft.template_ids || []}
+                          onChange={(e) => setDraft((p) => ({
+                            ...p,
+                            template_ids: Array.from(e.target.selectedOptions).map((o) => o.value),
+                          }))}
                         >
-                          <IconTrash />
-                        </button>
-                      </div>
-                    ))}
-                    <button
-                      type="button"
-                      className="btn btn-link"
-                      onClick={() =>
-                        setDraft((p) => ({
-                          ...p,
-                          tag_conditions: [
-                            ...(p.tag_conditions || []),
-                            { id: makeId("cnd"), enabled: true, gateway_id: "", tag_name: "", operator: "gt", value: "" },
-                          ],
-                        }))
-                      }
-                    >
-                      <IconPlus /> Add condition
-                    </button>
-                  </div>
-                </fieldset>
+                          {templates.map((t) => (
+                            <option key={t.id} value={t.id}>{t.name}</option>
+                          ))}
+                        </select>
+                      </label>
+                      {/* 2026-10-07: "the location ... should be a option to
+                          pick the folder and validated". Free text meant a
+                          typo or an un-synced OneDrive folder only showed up
+                          when a scheduled run failed hours later. */}
+                      <label className="sr-path-field">
+                        Save to
+                        <div className="sr-path-row">
+                          <input
+                            value={draft.output_path || ""}
+                            placeholder="C:/Reports/{Work_Order}/{template}.pdf"
+                            onChange={(e) => setDraft((p) => ({ ...p, output_path: e.target.value }))}
+                          />
+                          <button type="button" className="btn btn-secondary btn-sm"
+                                  disabled={!folderPickerAvailable}
+                                  title={folderPickerAvailable
+                                    ? "Pick a folder"
+                                    : "Folder picker is only available in the desktop app"}
+                                  onClick={pickOutputFolder}>
+                            Browse…
+                          </button>
+                        </div>
+                        {pathCheck.message ? (
+                          <span className={pathCheck.ok ? "sr-path-ok" : "sr-path-bad"}>
+                            {pathCheck.ok ? "✓" : "⚠"} {pathCheck.message}
+                            {!pathCheck.ok && pathCheck.state === "missing" ? (
+                              <button type="button" className="btn btn-secondary btn-sm"
+                                      style={{ marginLeft: 8 }}
+                                      onClick={createOutputFolder}>
+                                Create it
+                              </button>
+                            ) : null}
+                          </span>
+                        ) : null}
+                      </label>
+                      <label>
+                        File name
+                        <input
+                          value={draft.file_name_pattern || ""}
+                          placeholder="{Work_Order}_{date}"
+                          onChange={(e) => setDraft((p) => ({ ...p, file_name_pattern: e.target.value }))}
+                        />
+                        {/* The tokens, written out. The operator typed
+                            {R1_Work_Order_string} and got a file called
+                            exactly that, because only {tag:Name} resolved -
+                            a bare name now works too, but nothing on screen
+                            said so. */}
+                        <span className="sr-token-hint">
+                          Use <code>{"{TagName}"}</code> for a tag value, plus{" "}
+                          <code>{"{template}"}</code> <code>{"{id}"}</code>{" "}
+                          <code>{"{date}"}</code> <code>{"{time}"}</code>.
+                        </span>
+                      </label>
+                    </div>
+                  </fieldset>
+                </>
               ) : null}
 
               <fieldset className="schedule-fieldset">

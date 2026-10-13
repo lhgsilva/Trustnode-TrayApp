@@ -676,7 +676,14 @@ def _restore_domain_secrets(scope_key: str, domain: str, payload: Any) -> Any:
         return payload
     try:
         if scope_key:
-            stored = (app_store.get_bootstrap_scoped_or_shout(scope_key, prefer_cloud_reads=False) or {}).get(domain)
+            # One document, read-only, off the global lock. Three of these
+            # ran per save and each read EVERY domain; on a busy store that
+            # alone pushed the save past the UI's 20 s timeout. The vetted
+            # full-bootstrap path is still the fallback on a miss.
+            stored = app_store.get_domain_for_scope_fast(scope_key, domain)
+            if stored is None:
+                stored = (app_store.get_bootstrap_scoped_or_shout(
+                    scope_key, prefer_cloud_reads=False) or {}).get(domain)
         else:
             stored = (app_store.get_bootstrap(prefer_cloud_reads=False) or {}).get(domain)
     except Exception:
@@ -715,7 +722,14 @@ def _preserve_omitted_keys(scope_key: str, domain: str, payload: Any) -> Any:
         return payload
     try:
         if scope_key:
-            stored = (app_store.get_bootstrap_scoped_or_shout(scope_key, prefer_cloud_reads=False) or {}).get(domain)
+            # One document, read-only, off the global lock. Three of these
+            # ran per save and each read EVERY domain; on a busy store that
+            # alone pushed the save past the UI's 20 s timeout. The vetted
+            # full-bootstrap path is still the fallback on a miss.
+            stored = app_store.get_domain_for_scope_fast(scope_key, domain)
+            if stored is None:
+                stored = (app_store.get_bootstrap_scoped_or_shout(
+                    scope_key, prefer_cloud_reads=False) or {}).get(domain)
         else:
             stored = (app_store.get_bootstrap(prefer_cloud_reads=False) or {}).get(domain)
     except Exception:
@@ -741,7 +755,14 @@ def _guard_not_blanking(scope_key: str, domain: str, payload: Any, actor: str, a
         return
     try:
         if scope_key:
-            stored = (app_store.get_bootstrap_scoped_or_shout(scope_key, prefer_cloud_reads=False) or {}).get(domain)
+            # One document, read-only, off the global lock. Three of these
+            # ran per save and each read EVERY domain; on a busy store that
+            # alone pushed the save past the UI's 20 s timeout. The vetted
+            # full-bootstrap path is still the fallback on a miss.
+            stored = app_store.get_domain_for_scope_fast(scope_key, domain)
+            if stored is None:
+                stored = (app_store.get_bootstrap_scoped_or_shout(
+                    scope_key, prefer_cloud_reads=False) or {}).get(domain)
         else:
             stored = (app_store.get_bootstrap(prefer_cloud_reads=False) or {}).get(domain)
     except Exception:
@@ -825,6 +846,18 @@ def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
     # waiting to reconnect" about the thing they just removed, and asked to
     # press "Stop All". Only ids that were stored and are now absent qualify,
     # so a gateway started ad-hoc through the API is never touched.
+    # A power-meter save must reach the RUNNING meter. get_config() latches
+    # after its first successful read, so without this the operator's change -
+    # a new export sink, a changed register - sat in the database until the
+    # next restart while every screen showed it as applied.
+    if _domain_name == "power_management_config":
+        try:
+            from app.state import power_manager as _pm_reload
+            _inv = getattr(_pm_reload, "invalidate_config_cache", None)
+            if callable(_inv):
+                _inv()
+        except Exception:
+            pass
     if _domain_name == "gateway_configurations":
         try:
             _before = _prev_gateway_payload if isinstance(_prev_gateway_payload, list) else []

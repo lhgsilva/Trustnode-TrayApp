@@ -21,7 +21,7 @@
 //
 // Its own component and its own backend router, so nothing here can slow the
 // historian read path that every chart and widget shares.
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./dataExport.css";
 
 const QUALITY_OPTIONS = [
@@ -79,21 +79,58 @@ export default function DataExportPage({ api, isCloudClient = false, onError }) 
 
   const patch = useCallback((p) => setSpec((prev) => ({ ...prev, ...p })), []);
 
+  // Latest props without making them effect triggers - see below.
+  const apiRef = useRef(api);
+  apiRef.current = api;
+  const patchRef = useRef(patch);
+  patchRef.current = patch;
+  const [loadError, setLoadError] = useState("");
+
+  const loadSources = useCallback(async () => {
+    const [opt, src] = await Promise.all([
+      apiRef.current.exportOptions(), apiRef.current.exportSources()]);
+    setOptions(opt || null);
+    setSources(src || null);
+    setLoadError("");
+    if (opt?.default_columns?.length) patchRef.current({ columns: opt.default_columns });
+  }, []);
+
+  // RUNS ONCE - the dependency array MUST stay empty.
+  //
+  // 2026-10-08, reported: the export page is "not loading the data to be
+  // filters, gateways and tags to be selected". It was not slow and it did
+  // not error; it never settled. This effect depended on `api`, and App.jsx
+  // passes that as an INLINE object literal - a new identity on every
+  // render. The Dashboard re-renders continuously from live polling, so the
+  // page re-ran this on every one of them, re-issuing /sources (a bounded
+  // but real historian scan) over and over. The renderer runs out of its
+  // ~6 connections per host long before any of them finishes, which is why
+  // it surfaces as "Failed to fetch" on a page that is simply waiting.
+  // Same shape as the templates-designer loop fixed the day before.
+  //
+  // The read is also retried now: at startup the backend is still finishing
+  // deferred init, and a single failed attempt used to leave the pickers
+  // empty for the rest of the session - indistinguishable from a historian
+  // with nothing in it.
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    let timer = null;
+    let attempt = 0;
+    const tick = async () => {
       try {
-        const [opt, src] = await Promise.all([api.exportOptions(), api.exportSources()]);
-        if (cancelled) return;
-        setOptions(opt || null);
-        setSources(src || null);
-        if (opt?.default_columns?.length) patch({ columns: opt.default_columns });
+        await loadSources();
       } catch (err) {
-        if (!cancelled) setStatus(`Could not load export options: ${String(err?.message || err)}`);
+        if (cancelled) return;
+        const msg = String(err?.message || err);
+        setLoadError(msg);
+        setStatus(`Could not load export options: ${msg}`);
+        attempt += 1;
+        timer = setTimeout(tick, Math.min(15000, 2000 * Math.pow(2, attempt - 1)));
       }
-    })();
-    return () => { cancelled = true; };
-  }, [api, patch]);
+    };
+    tick();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, [loadSources]);
 
   const gatewayOptions = useMemo(() => {
     const names = sources?.gateway_names || {};
@@ -159,41 +196,84 @@ export default function DataExportPage({ api, isCloudClient = false, onError }) 
     <div className="dexp-page">
       {/* ── ONE control card, everything above the preview ─────────────── */}
       <section className="card dexp-controls">
-        <div className="dexp-row">
-          <label className="dexp-field">
-            <span>From</span>
-            <input type="datetime-local" value={spec.from_utc}
-              onChange={(e) => patch({ from_utc: e.target.value })} />
-          </label>
-          <label className="dexp-field">
-            <span>To</span>
-            <input type="datetime-local" value={spec.to_utc}
-              onChange={(e) => patch({ to_utc: e.target.value })} />
-          </label>
-          <FilterSelect label="Gateway" options={gatewayOptions} allLabel="All gateways"
-            value={one("gateways")} onChange={setOne("gateways")} />
-          <FilterSelect label="Tag" options={tagOptions} allLabel="All tags"
-            value={one("tags")} onChange={setOne("tags")} />
-          <FilterSelect label="Device" options={deviceOptions} allLabel="All devices"
-            value={one("devices")} onChange={setOne("devices")} />
-          <label className="dexp-field">
-            <span>Quality</span>
-            <select value={spec.quality} onChange={(e) => patch({ quality: e.target.value })}>
-              {QUALITY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-            </select>
-          </label>
-          <div className="dexp-actions">
-            <button type="button" className="btn" onClick={runPreview} disabled={busy}>
-              {busy ? "Working…" : "Preview"}
-            </button>
-            <button type="button" className="btn btn-ghost" onClick={clearAll} disabled={busy}>
-              Clear
-            </button>
-            <button type="button" className="btn btn-primary" onClick={runExport}
-              disabled={busy || !preview || preview.ok === false}>
-              Export
-            </button>
+        {/* Four named groups, in the order the question is actually asked:
+            WHEN, then WHAT, then how it should be SHAPED, then anything to
+            narrow it further. Previously the time range, the source pickers
+            and the three action buttons shared one flat row, so the buttons
+            sat as a seventh field cell and the whole strip read as one
+            undifferentiated line of inputs. */}
+        <div className="dexp-subgroup">
+          <span className="dexp-subgroup-title">Time range</span>
+          <div className="dexp-row">
+            <label className="dexp-field">
+              <span>From</span>
+              {/* step=1 or the browser silently rounds the range to whole
+                  minutes, which loses rows at both ends of a short export. */}
+              <input type="datetime-local" step="1" value={spec.from_utc}
+                onChange={(e) => patch({ from_utc: e.target.value })} />
+            </label>
+            <label className="dexp-field">
+              <span>To</span>
+              <input type="datetime-local" step="1" value={spec.to_utc}
+                onChange={(e) => patch({ to_utc: e.target.value })} />
+            </label>
+            <label className="dexp-field">
+              <span>Order</span>
+              <select value={spec.order} onChange={(e) => patch({ order: e.target.value })}>
+                <option value="asc">Oldest first</option>
+                <option value="desc">Newest first</option>
+              </select>
+            </label>
           </div>
+          <p className="dexp-hint">
+            Leave both empty to export everything recorded.
+          </p>
+        </div>
+
+        <div className="dexp-subgroup">
+          <span className="dexp-subgroup-title">Source</span>
+          <div className="dexp-row">
+            <FilterSelect label="Gateway" options={gatewayOptions} allLabel="All gateways"
+              value={one("gateways")} onChange={setOne("gateways")} />
+            <FilterSelect label="Tag" options={tagOptions} allLabel="All tags"
+              value={one("tags")} onChange={setOne("tags")} />
+            <FilterSelect label="Device" options={deviceOptions} allLabel="All devices"
+              value={one("devices")} onChange={setOne("devices")} />
+            <label className="dexp-field">
+              <span>Quality</span>
+              <select value={spec.quality} onChange={(e) => patch({ quality: e.target.value })}>
+                {QUALITY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
+            </label>
+          </div>
+          {/* The pickers come from the recent historian. Say when that window
+              held nothing and the newest rows were used instead - an operator
+              seeing older names than expected should know why. */}
+          {sources?.widened ? (
+            <p className="dexp-hint">
+              Nothing was recorded in the last {sources.window_days || 30} days, so
+              these lists show the most recent data instead.
+            </p>
+          ) : null}
+          {/* A read that FAILED and a historian with nothing in it produce
+              the same empty dropdowns. Say which, and let the operator
+              retry now rather than wait out the backoff (2026-10-08). */}
+          {loadError ? (
+            <p className="dexp-hint dexp-hint-bad" role="alert">
+              The filter lists could not be loaded: {loadError}
+              <button type="button" className="btn btn-secondary btn-sm"
+                      style={{ marginLeft: 8 }}
+                      onClick={() => { loadSources().catch(() => {}); }}>
+                Try again
+              </button>
+            </p>
+          ) : null}
+          {/* The backend says so when the historian holds rows this edge's
+              tenant cannot see - otherwise an empty picker reads as a
+              broken page. */}
+          {!loadError && sources?.note ? (
+            <p className="dexp-hint dexp-hint-bad" role="alert">{sources.note}</p>
+          ) : null}
         </div>
 
         <div className="dexp-subgroup">
@@ -221,13 +301,6 @@ export default function DataExportPage({ api, isCloudClient = false, onError }) 
                 onChange={(e) => patch({ pivot: e.target.value === "pivot" })}>
                 <option value="long">Long — one row per reading</option>
                 <option value="pivot">Pivot — a column per tag</option>
-              </select>
-            </label>
-            <label className="dexp-field">
-              <span>Order</span>
-              <select value={spec.order} onChange={(e) => patch({ order: e.target.value })}>
-                <option value="asc">Oldest first</option>
-                <option value="desc">Newest first</option>
               </select>
             </label>
             <label className="dexp-field">
@@ -313,7 +386,21 @@ export default function DataExportPage({ api, isCloudClient = false, onError }) 
           ) : null}
         </div>
 
-        {status ? <p className="dexp-status">{status}</p> : null}
+        <div className="dexp-footer">
+          <p className="dexp-status">{status}</p>
+          <div className="dexp-actions">
+            <button type="button" className="btn" onClick={runPreview} disabled={busy}>
+              {busy ? "Working…" : "Preview"}
+            </button>
+            <button type="button" className="btn btn-ghost" onClick={clearAll} disabled={busy}>
+              Clear
+            </button>
+            <button type="button" className="btn btn-primary" onClick={runExport}
+              disabled={busy || !preview || preview.ok === false}>
+              Export
+            </button>
+          </div>
+        </div>
         {preview?.truncated ? (
           <p className="dexp-status">
             Showing the first {Number(preview.preview_rows || 0).toLocaleString()} of{" "}

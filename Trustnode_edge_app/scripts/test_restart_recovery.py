@@ -26,6 +26,7 @@ recovery guarantee. Power gets pulled.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -195,6 +196,71 @@ check("devices are still deleted", (final.get("devices") or []) == [])
 check("  but the database connection is untouched",
       len(final.get("database_configurations") or []) == 1,
       "deleting one domain must not disturb another")
+
+print()
+print("[a gateway started during the boot window is not killed]")
+# 2026-09-02. Deferred init used to call plc_manager.stop_all_gateways()
+# unconditionally, about 4.8 s after process start. Workers are in-process
+# objects, so a FRESH process has none - the call could never clean up
+# anything a previous run left behind. The only thing it could ever stop was a
+# gateway started by THIS process during the boot window, which it did
+# silently, logging "reason=requested" as though an operator had asked for it.
+#
+# /api/health answers at about +4.0 s and the stop fired at +4.8 s, so anything
+# started in that gap - the UI reconnecting, a LAN client, auto-resume on a
+# slower machine, or a test - died with writes=0 and no explanation. It is
+# what made three gate tests look intermittently flaky for a day.
+#
+# boot() returns the moment health answers, so starting here IS the window.
+kill(proc)
+log_path = os.path.join(tmp, "o.log")
+log_before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+proc = boot()
+tok = login()
+BOOT_GW = "gw-boot-window"
+st, _ = call("POST", "/api/plc/gateways/start", tok, {
+    "gateway_id": BOOT_GW,
+    "config": {"gateway_type": "modbus_tcp", "name": "Boot window",
+               "plc_ip": "198.51.100.9",      # unreachable on purpose - a
+               "modbus_port": 502,            # gateway that cannot read still
+               "modbus_unit_id": 1,           # stays RUNNING, which is the
+               "modbus_registers": [{"name": "R", "address": "4x:0",
+                                     "function": "holding", "kind": "uint16",
+                                     "enabled": True}],
+               "tags": ["R"], "interval_ms": 1000,
+               "equipment": "SIM", "site": "B", "area": "T"}})
+check("a gateway starts during the boot window", st == 200, "HTTP %s" % st)
+
+time.sleep(12)                      # well past the +4.8 s the stop used to fire
+_, rows = call("GET", "/api/plc/gateways/status", tok)
+row = next((g for g in (rows if isinstance(rows, list) else [])
+            if g.get("gateway_id") == BOOT_GW), None)
+check("  it is still RUNNING 12 s later", bool(row) and bool(row.get("running")),
+      "boot killed it silently" if not row else "running=%s" % row.get("running"))
+
+with io.open(log_path, encoding="utf-8", errors="replace") as fh:
+    fh.seek(log_before)
+    boot_log = fh.read()
+check("  and boot never asked it to stop",
+      ("stop gateway=%s" % BOOT_GW) not in boot_log,
+      "'reason=requested' in the log with no operator behind it is the "
+      "signature of this bug")
+
+# The two checks above are a RACE, and losing the race means passing: boot()
+# returns when /api/health answers, which on a warm machine is already past
+# the moment the stop used to fire. Reintroducing the bug and re-running this
+# file proved exactly that - both checks still passed. So the rule is also
+# asserted directly on the source, where there is nothing to race.
+_main = io.open(os.path.join(ROOT, "backend", "app", "main.py"),
+                encoding="utf-8", errors="replace").read()
+_start = _main.index("async def _deferred_startup")
+_end = _main.index("@app.on_event", _start)
+_deferred_body = _main[_start:_end]
+_calls = [ln.strip() for ln in _deferred_body.splitlines()
+          if "stop_all_gateways" in ln and not ln.strip().startswith("#")]
+check("  deferred init does not stop gateways AT ALL", not _calls,
+      _calls or "boot has nothing to stop - a fresh process owns no workers, "
+      "so this could only ever kill a gateway started seconds earlier")
 
 kill(proc)
 print()

@@ -4460,6 +4460,20 @@ function GeneratedReportsView() {
     return () => { stop = true; supabase.removeChannel(ch).catch(() => {}); };
   }, [pickedTenantId]);
 
+  // On a LAN link there is no object storage: the shim hands back a
+  // local_file_url served by the edge itself. Without this every row sat
+  // disabled at "UPLOADING" forever, because storage_path is only ever set
+  // by the cloud uploader.
+  const localUrl = (r, inline) => {
+    if (!r.local_file_url) return null;
+    let token = "";
+    try { token = sessionStorage.getItem("tn_lite_local_token") || ""; } catch (_) {}
+    const q = [`inline=${inline ? "true" : "false"}`];
+    if (token) q.push(`token=${encodeURIComponent(token)}`);
+    return `${r.local_file_url}?${q.join("&")}`;
+  };
+  const isReady = (r) => Boolean(r.storage_path || r.local_file_url);
+
   const signedUrl = async (storagePath) => {
     if (!storagePath) return null;
     const { data, error: e } = await supabase
@@ -4470,6 +4484,8 @@ function GeneratedReportsView() {
   };
 
   const onPreview = async (r) => {
+    const local = localUrl(r, true);
+    if (local) { setPreviewUrl(local); return; }
     if (!r.storage_path) {
       setError("This report has not finished uploading to cloud Storage yet — try again in a moment.");
       return;
@@ -4481,6 +4497,8 @@ function GeneratedReportsView() {
   };
 
   const onDownload = async (r) => {
+    const local = localUrl(r, false);
+    if (local) { window.location.href = local; return; }
     if (!r.storage_path) {
       setError("This report has not finished uploading to cloud Storage yet.");
       return;
@@ -4512,9 +4530,9 @@ function GeneratedReportsView() {
             ...rows.map((r) => h("div", { key: `${r.tenant_id}|${r.id}`, className: "report-card" },
               h("div", { className: "report-card-head" },
                 h("div", { className: "report-card-title" }, r.template_name || r.file_name || r.id),
-                h("span", { className: `status-pill ${r.storage_path ? "status-online" : "status-muted"}` },
+                h("span", { className: `status-pill ${isReady(r) ? "status-online" : "status-muted"}` },
                   h("span", { className: "pill-dot" }),
-                  h("span", null, r.storage_path ? "READY" : "UPLOADING")
+                  h("span", null, isReady(r) ? "READY" : "UPLOADING")
                 )
               ),
               h("div", { className: "report-card-summary" },
@@ -4524,12 +4542,12 @@ function GeneratedReportsView() {
               h("div", { className: "report-card-actions" },
                 h("button", {
                   className: "btn btn-primary",
-                  disabled: !r.storage_path || busyId === r.id,
+                  disabled: !isReady(r) || busyId === r.id,
                   onClick: () => onPreview(r),
                 }, busyId === r.id ? "…" : "Preview"),
                 h("button", {
                   className: "btn-ghost",
-                  disabled: !r.storage_path || busyId === r.id,
+                  disabled: !isReady(r) || busyId === r.id,
                   onClick: () => onDownload(r),
                 }, "Download")
               )
@@ -4601,6 +4619,34 @@ function ReportTemplatesView() {
     setQueueing(t.id);
     setError("");
     try {
+      // On a LAN link the edge renders the PDF itself and the report is ready
+      // at once. Try that first: on the cloud the endpoint does not exist, the
+      // call 404s, and we fall through to the request queue below. No flag to
+      // keep in sync - the deployment answers for itself.
+      try {
+        let token = "";
+        try { token = sessionStorage.getItem("tn_lite_local_token") || ""; } catch (_) {}
+        const url = "/api/lite-local/reports/generate"
+          + (token ? `?token=${encodeURIComponent(token)}` : "");
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ template_id: t.id }),
+        });
+        if (res.ok) {
+          setSubmittedFor(t.id);
+          setTimeout(() => setSubmittedFor((cur) => (cur === t.id ? "" : cur)), 4000);
+          return;
+        }
+        if (res.status !== 404) {
+          let detail = "";
+          try { detail = (await res.json())?.detail || ""; } catch (_) {}
+          setError(`Could not generate the report: ${detail || res.status}`);
+          return;
+        }
+      } catch (_) { /* not a LAN edge - use the cloud queue */ }
+
       const { data: userRes } = await supabase.auth.getUser();
       const user = userRes?.user;
       const payload = {

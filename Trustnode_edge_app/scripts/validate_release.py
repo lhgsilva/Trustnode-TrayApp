@@ -151,6 +151,19 @@ SOURCE_CHECKS = [
     ("a session survives a shift", "test_session_survives_a_shift.py"),
     ("every page opens in a browser", "run_ui_smoke.py"),
     ("csv / txt file exports", "test_file_sinks.py"),
+    ("file exports: scope, rate, xlsx", "test_file_exports.py"),
+    ("csv/txt/excel written for real", "test_export_files_e2e.py"),
+    ("historical dashboards freeze", "test_dashboard_historical.py"),
+    ("cycle-triggered reports", "test_report_cycle_triggers.py"),
+    ("reports on the phone (lite LAN)", "test_lite_reports.py"),
+    ("the cloud report mirror binds", "test_cloud_report_mirror.py"),
+    ("report segments + per-section windows", "test_report_segments.py"),
+    ("a slow start-up retries", "test_startup_reads_retry.py"),
+    ("report reads do not wait on the writer", "test_reports_store_reads.py"),
+    ("report layout + side-by-side", "test_report_layout.py"),
+    ("a TCU test report renders", "smoke_tcu_test_report.py"),
+    ("cycle trigger -> report", "smoke_cycle_trigger_report.py"),
+    ("the schedule editor can set a cycle", "test_schedule_ui_contract.py"),
 ]
 
 # --------------------------------------------------------------- containment

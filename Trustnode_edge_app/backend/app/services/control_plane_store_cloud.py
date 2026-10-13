@@ -355,12 +355,21 @@ class ControlPlaneStoreCloud(ControlPlaneStore):
             # Read cloud target from env DIRECTLY rather than going through
             # app_store._get_cloud_database_target — the latter touches the
             # local SQLite which adds startup risk and isn't necessary here.
-            host = str(os.environ.get("TRUSTNODE_CLOUD_DB_HOST", "") or "").strip()
-            port = int(os.environ.get("TRUSTNODE_CLOUD_DB_PORT", "5432") or "5432")
-            database = str(os.environ.get("TRUSTNODE_CLOUD_DB_NAME", "postgres") or "postgres").strip() or "postgres"
-            username = str(os.environ.get("TRUSTNODE_CLOUD_DB_USER", "") or "").strip()
-            password = str(os.environ.get("TRUSTNODE_CLOUD_DB_PASSWORD", "") or "")
-            sslmode = str(os.environ.get("TRUSTNODE_CLOUD_DB_SSLMODE", "require") or "require").strip().lower() or "require"
+            # 2026-10-13: resolved from the portal-editable target, which
+            # falls back to exactly these env vars when nothing is saved - so
+            # a deployment that has never touched the portal behaves as it
+            # always did.
+            try:
+                from app.services import control_plane_target as _cp_target
+                _t = _cp_target.db_settings()
+            except Exception:
+                _t = {}
+            host = str(_t.get("host") or os.environ.get("TRUSTNODE_CLOUD_DB_HOST", "") or "").strip()
+            port = int(str(_t.get("port") or os.environ.get("TRUSTNODE_CLOUD_DB_PORT", "5432") or "5432"))
+            database = str(_t.get("database") or os.environ.get("TRUSTNODE_CLOUD_DB_NAME", "postgres") or "postgres").strip() or "postgres"
+            username = str(_t.get("username") or os.environ.get("TRUSTNODE_CLOUD_DB_USER", "") or "").strip()
+            password = str(_t.get("password") or os.environ.get("TRUSTNODE_CLOUD_DB_PASSWORD", "") or "")
+            sslmode = str(_t.get("sslmode") or os.environ.get("TRUSTNODE_CLOUD_DB_SSLMODE", "require") or "require").strip().lower() or "require"
             if not host or not username:
                 raise RuntimeError(
                     "ControlPlaneStoreCloud: missing TRUSTNODE_CLOUD_DB_HOST or _USER "

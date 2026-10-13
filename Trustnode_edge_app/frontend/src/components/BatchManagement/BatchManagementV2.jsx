@@ -1360,12 +1360,20 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
 
       <Card title="KPIs" collapsible>
         {kpis.length ? (
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          /* 2026-10-08: "the KIPS should be better arranged designed".
+             These were a flex-wrap row of inline-styled boxes with their own
+             11/18/10 px sizes, so the cards ragged at the end of each line,
+             the values did not sit on a common baseline, and nothing matched
+             the modules around them. A grid on the app's tokens instead:
+             equal columns, equal heights, one type scale. */
+          <div className="bm-kpi-grid">
             {kpis.filter((k) => k.numeric_value != null).slice(0, 16).map((k) => (
-              <div key={k.id} className="mini-card" style={{ border: "1px solid var(--stroke)", borderRadius: 10, padding: "8px 12px", minWidth: 120 }}>
-                <div style={{ fontSize: 11, color: "var(--muted)" }}>{k.label || k.kpi_code}</div>
-                <div style={{ fontSize: 18, fontWeight: 700 }}>{fmtNum(k.numeric_value, k.unit)}</div>
-                {k.quality_status !== "valid" && <div style={{ fontSize: 10, color: "var(--danger)" }}>{k.quality_status}</div>}
+              <div key={k.id} className="bm-kpi-card">
+                <span className="bm-kpi-label" title={k.label || k.kpi_code}>{k.label || k.kpi_code}</span>
+                <span className="bm-kpi-value">{fmtNum(k.numeric_value, k.unit)}</span>
+                {k.quality_status !== "valid"
+                  ? <span className="bm-kpi-flag">{k.quality_status}</span>
+                  : null}
               </div>
             ))}
           </div>
@@ -1544,11 +1552,11 @@ function BatchGroupDetailV2({ groupId, canEdit, onBack, onOpenBatch }) {
 
       <Card title="Group KPIs" collapsible>
         {kpis.length ? (
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <div className="bm-kpi-grid">
             {kpis.filter((k) => k.numeric_value != null).map((k) => (
-              <div key={k.id} className="mini-card" style={{ border: "1px solid var(--stroke)", borderRadius: 10, padding: "8px 12px", minWidth: 120 }}>
-                <div style={{ fontSize: 11, color: "var(--muted)" }}>{k.label || k.kpi_code}</div>
-                <div style={{ fontSize: 18, fontWeight: 700 }}>{fmtNum(k.numeric_value, k.unit)}</div>
+              <div key={k.id} className="bm-kpi-card">
+                <span className="bm-kpi-label" title={k.label || k.kpi_code}>{k.label || k.kpi_code}</span>
+                <span className="bm-kpi-value">{fmtNum(k.numeric_value, k.unit)}</span>
               </div>
             ))}
           </div>

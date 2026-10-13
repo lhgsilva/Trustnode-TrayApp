@@ -9,7 +9,11 @@
  * evicted on activate. Browsers re-check the service worker on each navigation
  * so users pick the new shell up automatically next time they open the app.
  */
-const CACHE_VERSION = "tnlite-v47-gap-nulls-no-carry-forward";
+// BUMP THIS WHENEVER index.html CHANGES. The shell is served cache-FIRST,
+// so a browser that has visited before keeps running the old app until
+// the version changes - a new index.html was pushed to the VPS on
+// 2026-09-30 under the old version and could not reach anyone.
+const CACHE_VERSION = "tnlite-v48-reports-segments";
 const SHELL = [
   "./",
   "./index.html",

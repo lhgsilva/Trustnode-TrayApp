@@ -56,14 +56,26 @@ conn.execute("""CREATE TABLE IF NOT EXISTS historian_readings (
                   created_utc TEXT NOT NULL)""")
 # 2 gateways x 3 tags x 120 seconds. Values are the second index, so an
 # aggregate over a known bucket has an arithmetic answer.
+#
+# Seeded RELATIVE to now. A fixed date rots: these rows were written as
+# 2026-08-30 and on 2026-09-29 they fell outside the pickers' 30-day window,
+# so the test failed with empty lists and pointed at nothing real.
+import datetime as _dt
+# TWO days back, not one: the widening check below asks for a 1-day window and
+# needs the seed to fall outside it at EVERY hour of the day. At one day back
+# the seed is inside that window all morning, so the test passed in the
+# evening and failed at 07:00.
+BASE = (_dt.datetime.utcnow() - _dt.timedelta(days=2)).replace(
+    hour=10, minute=0, second=0, microsecond=0)
+DAY = BASE.strftime("%Y-%m-%d")
 rows = []
 for sec in range(120):
-    ts = "2026-08-30 10:%02d:%02d" % (sec // 60, sec % 60)
+    ts = (BASE + _dt.timedelta(seconds=sec)).strftime("%Y-%m-%d %H:%M:%S")
     for gw, gwname, dev in (("gw-a", "Line A", "PLC-A"), ("gw-b", "Line B", "PLC-B")):
         for tag in ("Temp", "Pressure", "Flow"):
             q = 192 if tag != "Flow" else 0
             rows.append(("default", ts, gw, gwname, dev, tag, float(sec), q,
-                         "GOOD" if q >= 192 else "BAD", "test", "2026-08-30 10:00:00"))
+                         "GOOD" if q >= 192 else "BAD", "test", BASE.strftime("%Y-%m-%d %H:%M:%S")))
 conn.executemany(
     "INSERT INTO historian_readings (tenant_id, ts_utc, gateway_id, gateway_name,"
     " device_name, tag_name, value, quality, quality_label, source, created_utc)"
@@ -135,6 +147,19 @@ check("pickers are built from the DATA, not live config",
       and set((src or {}).get("tags") or []) == {"Temp", "Pressure", "Flow"},
       "gateways=%s tags=%s" % ((src or {}).get("gateways"), (src or {}).get("tags")))
 
+# The pickers must never come back empty while the historian holds rows. A
+# lookback that predates the data returns nothing from the bounded window, and
+# an empty picker is indistinguishable from "the filters are broken" - which is
+# how it was reported on 2026-09-29, after the 30-day window aged past the data.
+st, narrow = call("GET", "/api/data-export/sources?window_days=1", tok)
+check("  an empty lookback window still finds the data",
+      st == 200 and set((narrow or {}).get("gateways") or []) == {"gw-a", "gw-b"},
+      "seeded two days back, so a 1-day window excludes it: %s"
+      % ((narrow or {}).get("gateways"),))
+check("    and says the window was widened",
+      bool((narrow or {}).get("widened")),
+      "the operator must know the lists are 'the newest', not 'the last day'")
+
 print()
 print("[filters narrow what they claim to]")
 st, r = call("POST", "/api/data-export/preview", tok, {})
@@ -163,7 +188,7 @@ check("by a value condition", (r or {}).get("total_rows") == 20,
 
 st, r = call("POST", "/api/data-export/preview", tok,
              {"tags": ["Temp"], "gateways": ["gw-a"],
-              "from_utc": "2026-08-30 10:00:30", "to_utc": "2026-08-30 10:00:39"})
+              "from_utc": DAY + " 10:00:30", "to_utc": DAY + " 10:00:39"})
 check("by time range", (r or {}).get("total_rows") == 10, (r or {}).get("total_rows"))
 
 print()
@@ -181,8 +206,8 @@ if len(rows_out) == 2:
           int(rows_out[0].get("samples") or 0) == 60, rows_out[0].get("samples"))
 
 st, r = call("POST", "/api/data-export/preview", tok,
-             {"gateways": ["gw-a"], "from_utc": "2026-08-30 10:00:00",
-              "to_utc": "2026-08-30 10:00:04", "pivot": True})
+             {"gateways": ["gw-a"], "from_utc": DAY + " 10:00:00",
+              "to_utc": DAY + " 10:00:04", "pivot": True})
 cols = (r or {}).get("columns") or []
 prow = ((r or {}).get("rows") or [{}])[0]
 check("pivot gives one column per tag",

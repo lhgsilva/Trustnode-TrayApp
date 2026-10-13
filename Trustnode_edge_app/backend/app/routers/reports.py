@@ -297,9 +297,21 @@ def download_generated(generated_id: str, inline: bool = Query(default=False)) -
     if not record:
         raise HTTPException(status_code=404, detail="Report not found")
     path = Path(record.get("file_path") or "")
-    if not path.exists():
-        raise HTTPException(status_code=410, detail="Report file is no longer on disk")
     disposition = "inline" if inline else "attachment"
+    if not path.exists():
+        # Same rule as the Lite route: a cloud/web deployment never has the
+        # edge's filesystem, so "not on disk" is its normal state. Serve the
+        # uploaded copy rather than a 410 (2026-10-08).
+        from app.services.reports_cloud_uploader import fetch_pdf_from_storage
+        blob = fetch_pdf_from_storage(str(record.get("storage_path") or ""))
+        if blob:
+            name = record.get("file_name") or path.name or "report.pdf"
+            return Response(
+                content=blob, media_type="application/pdf",
+                headers={"Content-Disposition": f'{disposition}; filename="{name}"'})
+        raise HTTPException(
+            status_code=410,
+            detail="This report is not on this machine and has no cloud copy.")
     return FileResponse(
         str(path),
         media_type="application/pdf",

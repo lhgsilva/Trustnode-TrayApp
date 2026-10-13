@@ -16,7 +16,7 @@ router = APIRouter(prefix="/api/database", tags=["database"])
 
 
 class DatabaseConnectionTestRequest(BaseModel):
-    engine: Literal["mysql", "postgresql", "mssql", "influxdb", "sqlite", "legacy_http", "csv_file", "txt_file"] = "mysql"
+    engine: Literal["mysql", "postgresql", "mssql", "influxdb", "sqlite", "legacy_http", "csv_file", "txt_file", "xlsx_file"] = "mysql"
     host: str = ""
     port: int = 0
     database: str = ""
@@ -37,7 +37,7 @@ class DatabaseConnectionTestResult(BaseModel):
 
 
 class DatabaseProvisionRequest(BaseModel):
-    engine: Literal["mysql", "postgresql", "mssql", "influxdb", "sqlite", "legacy_http", "csv_file", "txt_file"] = "postgresql"
+    engine: Literal["mysql", "postgresql", "mssql", "influxdb", "sqlite", "legacy_http", "csv_file", "txt_file", "xlsx_file"] = "postgresql"
     host: str = ""
     port: int = 0
     database: str = ""
@@ -58,7 +58,7 @@ class DatabaseProvisionResult(BaseModel):
 
 
 class ActiveSinkRequest(BaseModel):
-    engine: Literal["postgresql", "sqlite", "legacy_http", "csv_file", "txt_file"] = "postgresql"
+    engine: Literal["postgresql", "sqlite", "legacy_http", "csv_file", "txt_file", "xlsx_file"] = "postgresql"
     host: str = ""
     port: int = 0
     database: str = ""
@@ -86,7 +86,7 @@ class ActiveSinkResult(BaseModel):
 class RecoveryConnection(BaseModel):
     id: str = ""
     name: str = ""
-    engine: Literal["postgresql", "sqlite", "legacy_http", "csv_file", "txt_file"] = "postgresql"
+    engine: Literal["postgresql", "sqlite", "legacy_http", "csv_file", "txt_file", "xlsx_file"] = "postgresql"
     host: str = ""
     port: int = 0
     database: str = ""
@@ -558,7 +558,10 @@ def test_connection(payload: DatabaseConnectionTestRequest) -> DatabaseConnectio
                 message=f"SQLite connection failed: {err}"
             )
 
-    if payload.engine in ("csv_file", "txt_file"):
+    # xlsx_file included: an Excel export is a file path like any other, and
+    # leaving it out of the test meant the one engine most likely to hit a
+    # permissions problem was the one that could not be checked.
+    if payload.engine in ("csv_file", "txt_file", "xlsx_file"):
         import os
 
         path = payload.file_path.strip()
@@ -786,7 +789,7 @@ def _recover_one_connection(conn_cfg: RecoveryConnection, activate: bool = False
         )
 
     # Provision/create required objects automatically.
-    if engine in ("postgresql", "sqlite", "legacy_http", "csv_file", "txt_file"):
+    if engine in ("postgresql", "sqlite", "legacy_http", "csv_file", "txt_file", "xlsx_file"):
         prov_req = DatabaseProvisionRequest(
             engine=engine,
             host=conn_cfg.host,

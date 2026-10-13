@@ -80,9 +80,43 @@ def upload_pdf_to_storage(
             resp = requests.post(endpoint, headers=headers, data=fh.read(), timeout=_UPLOAD_TIMEOUT)
         if resp.status_code in (200, 201):
             return object_key
-        log.debug("Lite storage upload failed: %s %s", resp.status_code, resp.text[:200])
+        log.warning("Lite storage upload failed: %s %s", resp.status_code, resp.text[:200])
     except Exception as exc:
-        log.debug("Lite storage upload error: %s", exc)
+        log.warning("Lite storage upload error: %s", exc)
+    return None
+
+
+def fetch_pdf_from_storage(storage_path: str) -> bytes | None:
+    """The bytes of a report already uploaded to the lite-reports bucket.
+
+    2026-10-08, requested: "we should also be able to read the reports from
+    the webview from the lite version and web version, that is why it is
+    important we ship everything to the cloud vps".
+
+    The PDFs were already being SHIPPED - every report since 2026-10-01 has
+    a storage_path - but nothing could read them back. Both download routes
+    served `record["file_path"]` from local disk and returned 410 "Report
+    file is no longer on disk" when it was absent. That is always the case
+    for a cloud/web client: the copy it can reach lives in the bucket, not
+    on the edge's filesystem. One upload, no way down.
+
+    Returns None on any failure; the caller falls back to its own error.
+    """
+    cfg = _supabase_cfg()
+    key_path = str(storage_path or "").strip()
+    if not cfg or not key_path:
+        return None
+    url, key, bucket = cfg
+    endpoint = f"{url}/storage/v1/object/{bucket}/{key_path}"
+    headers = {"Authorization": f"Bearer {key}", "apikey": key}
+    try:
+        resp = requests.get(endpoint, headers=headers, timeout=_UPLOAD_TIMEOUT)
+        if resp.status_code == 200 and resp.content:
+            return resp.content
+        log.warning("Lite storage fetch failed: %s %s",
+                    resp.status_code, resp.text[:200])
+    except Exception as exc:                            # noqa: BLE001
+        log.warning("Lite storage fetch error: %s", exc)
     return None
 
 
@@ -125,8 +159,8 @@ def mirror_generated_row(record: dict[str, Any], storage_path: str | None) -> bo
                       :id, :tenant_id, :template_id, :template_name,
                       :schedule_id, :schedule_name, :triggered_by,
                       :file_name, :file_bytes, :file_sha256, :storage_path,
-                      :email_status, :email_message, :email_recipients_json::jsonb,
-                      :meta_json::jsonb, :created_utc
+                      :email_status, :email_message, CAST(:email_recipients_json AS jsonb),
+                      CAST(:meta_json AS jsonb), :created_utc
                     )
                     ON CONFLICT (tenant_id, id) DO UPDATE SET
                       template_id   = EXCLUDED.template_id,
@@ -165,7 +199,11 @@ def mirror_generated_row(record: dict[str, Any], storage_path: str | None) -> bo
             )
         return True
     except Exception as exc:
-        log.debug("Lite generated_reports mirror failed: %s", exc)
+        # WARNING, not debug. This mirror was broken from the day it shipped
+        # and nobody saw it: the cloud Lite showed an empty Reporting page
+        # while the edge reported success, because the only trace of the
+        # failure was a debug line no deployment turns on.
+        log.warning("Lite generated_reports mirror failed: %s", exc)
         return False
 
 

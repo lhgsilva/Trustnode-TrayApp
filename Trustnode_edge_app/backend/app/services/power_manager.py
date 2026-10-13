@@ -14,6 +14,8 @@ from typing import Any
 
 from pymodbus.client import ModbusTcpClient
 
+from app.services import file_sinks as _file_sinks
+
 
 REGISTER_PROFILES: dict[str, dict[str, int]] = {
     "weidmuller_em525_single_phase_basic": {
@@ -207,6 +209,23 @@ def enabled_registers(device: dict) -> dict:
     return {k: v for k, v in registers.items() if off.get(k, True)}
 
 
+# File-export engines. A meter reaches one of these through the sink's own
+# gateway_filters as well as through the device's database_id.
+# Quantities that carry a SIGN, and therefore flip when a meter is wired
+# backwards. Everything else a meter reports - voltage, current, frequency,
+# apparent power, phase angle - is a magnitude and must be left alone.
+_DIRECTIONAL_PARTS = ("active_power", "reactive_power", "power_factor", "energy")
+
+
+def _is_directional(tag: str) -> bool:
+    name = str(tag or "").strip().lower()
+    if name.startswith("apparent_power"):
+        return False
+    return any(part in name for part in _DIRECTIONAL_PARTS)
+
+_FILE_ENGINES = ("csv_file", "txt_file", "xlsx_file")
+
+
 class PowerManager:
     def __init__(self, app_store: Any) -> None:
         # Operator 2026-06-18 (boot fix): __init__ must NOT block on the
@@ -242,6 +261,12 @@ class PowerManager:
         # tuning a queue that is working perfectly.
         self._blocked_rows: int = 0
         self._blocked_by_trigger: str = ""
+        # Per device. A single shared flag would report one meter's pause on
+        # every meter, and rules are scoped per gateway.
+        self._blocked_by_device: dict[str, str] = {}
+        # sink id -> why its last write failed. Surfaced in the device
+        # status so a bad export path is visible, not silent.
+        self._sink_errors: dict[str, str] = {}
         self._rows_queue: queue.Queue[list[dict[str, Any]]] = queue.Queue(
             maxsize=max(50, int(os.environ.get("TRUSTNODE_POWER_ROWS_QUEUE_MAX", "1000") or "1000"))
         )
@@ -572,6 +597,22 @@ class PowerManager:
         # Carry through the chosen database connection id. Empty string means
         # "local app-store only" (the default).
         base["database_id"] = str(raw.get("database_id") or "").strip()
+        # A reversed installation, corrected in software. _normalize_device
+        # copies fields one by one, so anything not named here is discarded -
+        # the same allowlist that silently dropped the export sinks.
+        base["reverse_direction"] = bool(raw.get("reverse_direction"))
+        # The resolved export sinks the UI hands down (see powerConfigWithSinks).
+        #
+        # 2026-09-03: this function builds a device from DEFAULT_DEVICE and
+        # copies fields across one by one, so anything not named here is
+        # SILENTLY DISCARDED. The sinks were pushed correctly, stored
+        # correctly, and then dropped on the way into the running meter - the
+        # export looked broken while every config screen looked right. Third
+        # time an allowlist like this has cost a day; it is the reason the
+        # export writes nothing.
+        sinks_raw = raw.get("sinks")
+        base["sinks"] = [s for s in sinks_raw
+                         if isinstance(s, dict) and s.get("engine")]             if isinstance(sinks_raw, list) else []
         return base
 
     def _normalize_config(self, raw: Any) -> dict[str, Any]:
@@ -693,6 +734,23 @@ class PowerManager:
         out["devices"] = devices
         return out
 
+    def invalidate_config_cache(self) -> None:
+        """Make the next read come from the store instead of memory.
+
+        2026-09-03. get_config() latches: `if self._config_loaded: return
+        self._config`. It is read ONCE per process, and the only thing that
+        updated it afterwards was set_config() - the power-specific endpoint.
+        A save through the GENERIC domain endpoint, which is what the UI
+        actually uses, never reached the running meter.
+
+        The operator configured a CSV export, the document was written
+        correctly, every screen showed it - and the meter carried on with the
+        configuration it had read at boot, two seconds before the save landed.
+        Nothing looked broken anywhere, and nothing was exported.
+        """
+        with self._lock:
+            self._config_loaded = False
+
     def _load_config(self) -> tuple[dict[str, Any], bool]:
         """Returns (config, ok). `ok` is False when the store could not be read.
 
@@ -708,7 +766,11 @@ class PowerManager:
         # boot - the operator's meters sat in the database for MINUTES while the
         # Power page showed "No power meters configured" (2026-08-26).
         try:
-            fast = self._app_store.get_domain_fast("power_management_config")
+            # SCOPED read. 2026-09-03: this used get_domain_fast(), which reads
+            # the legacy unscoped table; the UI saves the scoped document. The
+            # meter therefore ran on a copy from the previous evening and never
+            # saw the export sinks that had just been configured.
+            fast = self._app_store.get_domain_scoped_fast("power_management_config")
             if isinstance(fast, dict):
                 return self._normalize_config(fast), True
         except Exception as exc:
@@ -1074,6 +1136,7 @@ class PowerManager:
         # to compensate for an unusual register encoding (e.g.
         # "energy in 0.1 kWh units" → scale 10). Default is 1.0
         # i.e. pass-through.
+        reverse_direction = bool(device.get("reverse_direction"))
         values_scaled: dict[str, float] = {}
         for key in list(raw_values.keys()):
             value = raw_values[key]
@@ -1081,6 +1144,18 @@ class PowerManager:
             if reg_scale == 0:
                 reg_scale = 1.0
             value = value / reg_scale
+            if reverse_direction and _is_directional(key):
+                # 2026-09-04: this meter reads -27 W at power factor -0.45 -
+                # a reversed installation, not export. Integrating negative
+                # power gave a NEGATIVE total_kwh and a negative cost, so the
+                # Usage chart and the Tariff panel had nothing they could
+                # sensibly draw and came up empty.
+                #
+                # Only DIRECTIONAL quantities flip. Voltage, current,
+                # frequency and apparent power are magnitudes and stay as
+                # they are; `values_raw` keeps exactly what the meter sent, so
+                # the correction is visible rather than hidden.
+                value = -value
             values_scaled[key] = value
 
         sample = {
@@ -1146,8 +1221,23 @@ class PowerManager:
         try:
             insight_rows = self._compute_insight_rows(device, values_scaled, now)
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("insight tags failed for %s: %s", device_id, exc)
+            # A one-line WARNING per cycle turned a hard NameError into 15 684
+            # identical lines that said what broke but never where. The FIRST
+            # failure now carries a traceback; after that it is counted and
+            # repeated rarely, so the log stays readable AND diagnosable.
+            self._insight_fail_count = getattr(self, "_insight_fail_count", 0) + 1
+            if self._insight_fail_count == 1:
+                logger.warning("insight tags failed for %s: %s", device_id, exc,
+                               exc_info=True)
+            elif self._insight_fail_count % 600 == 0:
+                logger.warning("insight tags still failing for %s after %d "
+                               "cycles: %s", device_id, self._insight_fail_count, exc)
             insight_rows = []
+        else:
+            if getattr(self, "_insight_fail_count", 0):
+                logger.info("insight tags recovered for %s after %d failed cycles",
+                            device_id, self._insight_fail_count)
+                self._insight_fail_count = 0
         rows.extend(insight_rows)
 
         status = {
@@ -1414,7 +1504,13 @@ class PowerManager:
         canon = {}
         for _name in ("voltage_v", "power_factor", "frequency_hz",
                       "apparent_power_va", "reactive_power_var", "energy_wh"):
-            _v = canonical_measurement(values_scaled, _name)
+            # `values` is this method's parameter - the caller passes its
+            # values_scaled dict in under that name. Referring to the caller's
+            # variable here raised NameError on EVERY cycle, and the caller
+            # swallows the exception into an empty list, so ALL insight tags
+            # were lost - not just these six. 15 684 silent failures before
+            # anyone could see why Power Overview had no KPIs.
+            _v = canonical_measurement(values, _name)
             if _v is not None:
                 canon[_name] = float(_v)
 
@@ -1446,7 +1542,8 @@ class PowerManager:
                 rows.append(_row(f"insight.tariff_{idx + 1}_cost_eur", cost_i))
         return rows
 
-    def _fanout_live(self, device_id: str, rows: list[dict[str, Any]]) -> None:
+    def _fanout_live(self, device_id: str, rows: list[dict[str, Any]],
+                     publish: bool = True) -> None:
         """Push this cycle's readings onto the live WebSocket stream.
 
         2026-08-26: power meters wrote to the historian and nothing else, so a
@@ -1474,6 +1571,13 @@ class PowerManager:
                      interval_ms=int(self._interval_ms_for_gate()))
         except Exception:
             pass
+        # PAUSED MEANS NOTHING MOVES, charts included (2026-09-03). The
+        # readings above are still NOTED for the trigger gate - without that a
+        # rule written against a meter's own tag could never become true again
+        # and the meter would stay paused for ever - but nothing new is
+        # published, so a live chart stops where the pause began.
+        if not publish:
+            return
         try:
             from app.state import plc_manager
             fan = getattr(plc_manager, "fanout_threadsafe", None)
@@ -1541,10 +1645,22 @@ class PowerManager:
             # gateway must not pause it, and its own rule must.
             allowed, reason = _pm.collection_allowed_now(device_id)
             if not allowed:
-                self._blocked_by_trigger = reason or "trigger condition is false"
+                why = reason or "trigger condition is false"
+                self._blocked_by_trigger = why
+                if device_id:
+                    self._blocked_by_device[str(device_id)] = why
                 self._blocked_rows += len(rows)
+                # PAUSED MEANS NOTHING MOVES. 2026-09-03, after seeing it run:
+                # "when is not running the charts and historian should be
+                # paused". A brief 2026-09-02 version kept publishing live
+                # values while withholding the historian write, so the charts
+                # carried on scrolling under a COLLECTION PAUSED badge - which
+                # read as the badge being wrong rather than as a feature.
+                # One meaning of paused: the row is withheld from everything.
                 return
             self._blocked_by_trigger = ""
+            if device_id:
+                self._blocked_by_device.pop(str(device_id), None)
         except Exception:
             pass
 
@@ -1743,25 +1859,86 @@ class PowerManager:
         devices = {str(d.get("id") or ""): d for d in (cfg.get("devices") or []) if isinstance(d, dict)}
         for did, rows in rows_by_device.items():
             device = devices.get(did) or {}
-            db_id = str(device.get("database_id") or "").strip()
-            if not db_id:
-                continue
-            sink = self._lookup_db_connection(db_id)
-            if not sink:
-                continue
-            engine = str(sink.get("engine") or "").strip().lower()
-            try:
-                if engine == "csv_file":
-                    self._sink_write_csv(sink, rows)
-                elif engine == "txt_file":
-                    self._sink_write_txt(sink, rows)
-                elif engine == "sqlite":
-                    self._sink_write_sqlite(sink, rows)
-                # Other engines (postgres/mysql/...) are not handled by the
-                # side-channel yet; the local app-store still has the data
-                # and can be synced upstream via the regular cloud pipeline.
-            except Exception:
-                pass
+            for sink in self._sinks_for_device(did, device):
+                engine = str(sink.get("engine") or "").strip().lower()
+                # 2026-09-02: the meter used to write EVERY row it produced.
+                # The operator ticks gateways and tags in the sink's own
+                # dialog and the PLC path has honoured that for a while; the
+                # meter path ignored it, so a CSV scoped to two tags still
+                # received all forty registers.
+                scoped = _file_sinks.filter_rows(sink, rows)
+                if not scoped:
+                    continue
+                # ... and at the sink's export rate, so a 1 s meter does not
+                # put 40 rows a second into a file meant to be read.
+                due = _file_sinks.due_rows(str(sink.get("id") or did), sink, scoped)
+                if not due:
+                    continue
+                try:
+                    if engine == "csv_file":
+                        self._sink_write_csv(sink, due)
+                    elif engine == "txt_file":
+                        self._sink_write_txt(sink, due)
+                    elif engine == "xlsx_file":
+                        _file_sinks.write_xlsx(
+                            str(sink.get("file_path") or ""), due,
+                            str(sink.get("rollover") or "daily"),
+                            self._utc_str_to_local_iso,
+                            max_file_mb=sink.get("max_file_mb") or 0)
+                    elif engine == "sqlite":
+                        self._sink_write_sqlite(sink, due)
+                    # Other engines (postgres/mysql/...) are not handled by the
+                    # side-channel yet; the local app-store still has the data
+                    # and can be synced upstream via the regular cloud pipeline.
+                    self._sink_errors.pop(str(sink.get("id") or ""), None)
+                except Exception as exc:
+                    # 2026-09-29, reported: "I set a new location and it is not
+                    # logging". It was not logging because this said NOTHING.
+                    # An unwritable folder, a path with no file name, a drive
+                    # that is not mounted - every one of them landed here and
+                    # was discarded, so the export simply stopped with no error
+                    # in the log, no error in the UI, and nothing to look at.
+                    key = str(sink.get("id") or sink.get("name") or engine)
+                    msg = "%s export to %r failed: %s: %s" % (
+                        engine, str(sink.get("file_path") or ""),
+                        type(exc).__name__, exc)
+                    if self._sink_errors.get(key) != msg:
+                        logger.warning("power: %s", msg)
+                    self._sink_errors[key] = msg
+
+    def _sinks_for_device(self, device_id: str, device: dict[str, Any]
+                          ) -> list[dict[str, Any]]:
+        """The sinks this meter writes to, as handed to it by the UI.
+
+        2026-09-03. This used to resolve the connections itself, through
+        app_store.get_bootstrap() - which reads `config_documents`, the LEGACY
+        unscoped table. Database connections are saved to
+        `config_documents_scoped`, so the meter was reading a list last
+        written in June that held only "Local SQLite". It could not see the
+        operator's CSV export at all, and NEITHER route worked: not the new
+        gateway_filters one, and not the older database_id one.
+
+        A PLC gateway has never had this problem, because it does not read
+        configuration - the UI hands it resolved sinks in its Start payload.
+        The meter now works the same way: `device["sinks"]` is written by
+        powerConfigWithSinks() when power_management_config is saved, in the
+        identical shape toSink() produces for a gateway. One source, no
+        lookup, and nothing reading a table that has not been written in
+        months.
+        """
+        sinks = device.get("sinks")
+        if isinstance(sinks, list):
+            return [s for s in sinks if isinstance(s, dict) and s.get("engine")]
+        # A configuration saved before the UI started pushing sinks carries no
+        # list at all. Returning [] here would silently stop an export that
+        # used to work, so fall back to the old per-device lookup - it only
+        # ever resolved connections present in the unscoped table, which is
+        # exactly the set that behaved correctly before this change.
+        db_id = str(device.get("database_id") or "").strip()
+        if not db_id:
+            return []
+        legacy = self._lookup_db_connection(db_id)
+        return [legacy] if legacy else []
 
     def _utc_str_to_local_iso(self, ts: str) -> str:
         raw = str(ts or "").strip()
@@ -1780,45 +1957,23 @@ class PowerManager:
             return raw
 
     def _sink_write_csv(self, sink: dict[str, Any], rows: list[dict[str, Any]]) -> None:
-        import csv as _csv
+        """CSV export, through the SHARED writer.
 
-        file_path = str(sink.get("file_path") or "").strip()
-        if not file_path:
-            return
-        new_file = not os.path.exists(file_path) or os.path.getsize(file_path) == 0
-        os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
-        with open(file_path, "a", encoding="utf-8", newline="") as f:
-            writer = _csv.writer(f)
-            if new_file:
-                writer.writerow(["ts_local", "ts_utc", "gateway_id", "gateway_name", "tag_name", "value", "quality", "quality_label", "source"])
-            for r in rows:
-                ts_utc = str(r.get("ts_utc") or "")
-                writer.writerow([
-                    self._utc_str_to_local_iso(ts_utc),
-                    ts_utc,
-                    str(r.get("gateway_id") or ""),
-                    str(r.get("gateway_name") or ""),
-                    str(r.get("tag_name") or ""),
-                    r.get("value"),
-                    r.get("quality"),
-                    str(r.get("quality_label") or ""),
-                    str(r.get("source") or ""),
-                ])
+        2026-09-03: this used to build its own row here, in its own column
+        order, and only wrote a header when the file was empty. The operator's
+        file had been created by a different writer, so every row was appended
+        under a header that named other columns - the data looked scrambled
+        and had been wrong for as long as the file existed. One writer, one
+        header, and a file whose header does not match is rotated aside rather
+        than written into.
+        """
+        _file_sinks.write_csv(str(sink.get("file_path") or ""), sink, rows,
+                              self._utc_str_to_local_iso)
 
     def _sink_write_txt(self, sink: dict[str, Any], rows: list[dict[str, Any]]) -> None:
-        file_path = str(sink.get("file_path") or "").strip()
-        if not file_path:
-            return
-        os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
-        with open(file_path, "a", encoding="utf-8") as f:
-            for r in rows:
-                ts_utc = str(r.get("ts_utc") or "")
-                f.write(
-                    f"{self._utc_str_to_local_iso(ts_utc)}|{ts_utc}|"
-                    f"{r.get('gateway_id', '')}|{r.get('gateway_name', '')}|"
-                    f"{r.get('tag_name', '')}|{r.get('value')}|{r.get('quality')}|"
-                    f"{r.get('quality_label', '')}|{r.get('source', '')}\n"
-                )
+        """TXT export - the same content and header, delimiter-separated."""
+        _file_sinks.write_txt(str(sink.get("file_path") or ""), sink, rows,
+                              self._utc_str_to_local_iso)
 
     def _sink_write_sqlite(self, sink: dict[str, Any], rows: list[dict[str, Any]]) -> None:
         try:
@@ -1903,7 +2058,11 @@ class PowerManager:
             try:
                 sample, rows, status = self._poll_device(device)
                 self._enqueue_rows(rows, device_id)
-                self._fanout_live(device_id, rows)
+                # _enqueue_rows records the block per device; a paused meter
+                # keeps feeding the gate but publishes no new values.
+                self._fanout_live(
+                    device_id, rows,
+                    publish=not self._blocked_by_device.get(str(device_id)))
                 with self._lock:
                     self._last_samples[device_id] = sample
                     self._status_by_device[device_id] = status
@@ -1958,6 +2117,11 @@ class PowerManager:
                     "collection_blocked": bool(getattr(self, "_blocked_by_trigger", "")),
                     "collection_block_reason": str(getattr(self, "_blocked_by_trigger", "") or ""),
                     "blocked_rows": int(getattr(self, "_blocked_rows", 0) or 0),
+                    # Why an export stopped. A file sink that cannot be written
+                    # used to fail in silence; the operator saw a healthy meter
+                    # and an empty file with nothing connecting the two.
+                    "sink_error": "; ".join(sorted(
+                        (getattr(self, "_sink_errors", {}) or {}).values()))[:300],
                     "writer_batches": int(self._writer_batches),
                     "updated_utc": self._utc_now(),
                 }
@@ -2049,6 +2213,16 @@ class PowerManager:
                         "skipped_cycles": int(metrics.get("skipped_cycles") or 0),
                         "writer_queue_depth": int(metrics.get("writer_queue_depth") or self._rows_queue.qsize()),
                         "writer_dropped_rows": int(metrics.get("writer_dropped_rows") or self._dropped_rows),
+                        # 2026-09-02: THIS is the dict the API returns. The
+                        # paused flag was added to the per-cycle metrics dict
+                        # instead, which is never merged here - so a meter that
+                        # was correctly withholding every row still reported
+                        # RUNNING, and a working gate looked like a dead meter.
+                        "collection_blocked": bool(
+                            self._blocked_by_device.get(str(st.get("device_id") or ""))),
+                        "collection_block_reason": str(
+                            self._blocked_by_device.get(str(st.get("device_id") or "")) or ""),
+                        "blocked_rows": int(getattr(self, "_blocked_rows", 0) or 0),
                     }
                 )
                 devices_out.append(st)

@@ -229,8 +229,14 @@ def run(remote: bool = True) -> tuple[bool, list[str], dict]:
     st, vtok, body, _ = _login(LAN, *VIEWER)
     chk("viewer login from LAN", st == 200 and bool(vtok), f"status={st}")
     if vtok:
-        st, _, _ = _call("GET", f"{LAN}/api/plc/gateways/status", token=vtok)
-        chk("viewer read allowed", st == 200, f"status={st}")
+        st, rb, _ = _call("GET", f"{LAN}/api/plc/gateways/status", token=vtok)
+        # status=0 means the request never got an HTTP answer at all - a TLS or
+        # connection error. _call returns the exception text as the body, so
+        # report it: a bare "status=0" says the check failed without saying why,
+        # which is how a transient LAN blip and a real access-policy regression
+        # end up looking identical.
+        chk("viewer read allowed", st == 200,
+            f"status={st}" + (f" transport error: {str(rb)[:110]}" if st == 0 else ""))
         st, b, _ = _call("POST", f"{LAN}/api/plc/gateways/stop", token=vtok, body={"gateway_id": "does-not-exist"})
         chk("viewer mutation refused (403)", st == 403, f"status={st}")
         st, _, _ = _call("GET", f"{LAN}/trustnode/full/app/", raw=True, token=vtok, follow=False)

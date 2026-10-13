@@ -136,6 +136,11 @@ class AppStore:
             os.environ.get("TRUSTNODE_FORCE_SQLITE_READS", "")
         ).strip().lower() in {"1", "true", "yes", "on"}
         self._db_path = self._resolve_db_path()
+        # Repeated-failure collapse for append_log_rows(). See
+        # _throttle_log_rows: one message was writing 3,600 rows an hour.
+        self._log_repeat: Dict[tuple, Dict[str, Any]] = {}
+        self._log_repeat_lock = threading.Lock()
+
         self._stop_event = threading.Event()
         self._sync_wakeup_event = threading.Event()
         self._live_sync_wakeup_event = threading.Event()
@@ -995,6 +1000,97 @@ class AppStore:
                 conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_live_latest_tenant_ts" ON "{schema}"."live_latest"(tenant_id, ts_utc DESC)'))
             self._cloud_schema_ready_keys.add(target_key)
 
+    #: A legacy store larger than this is USED WHERE IT IS rather than
+    #: copied into %ProgramData%. Override with TRUSTNODE_MIGRATE_MAX_MB.
+    _MIGRATE_MAX_MB = 512
+
+    def _adopt_legacy_store(self, new_path: str) -> str:
+        """Decide what to do about a pre-%ProgramData% database.
+
+        Returns the path the store should actually open.
+
+        2026-10-07, reported: the new build "fail to start, backend did not
+        started" on a computer that had an older version. This is why. The
+        old shape was a bare `shutil.copy2(legacy, new)` run at IMPORT time,
+        so nothing answered /api/health until the whole file had been
+        duplicated. Measured on a 4.96 GB store: 36 s to first health on a
+        warm NVMe, against 5 s once migrated. The desktop shell gives up at
+        120 s with "Backend service did not respond", and on a plant PC with
+        slower storage - and Defender scanning a 5 GB write - that copy runs
+        for minutes. A fresh machine has no legacy store and never does any
+        of this, which is why it only ever broke on upgrades. The packaged
+        --boot-probe sets TRUSTNODE_APP_STORE_PATH, so it takes the branch
+        above and never saw this at all.
+
+        Three rules now:
+
+        * A big store is ADOPTED IN PLACE. Nothing is copied, boot is
+          instant, and no data moves - which is also the safest thing to do
+          with the only copy of a customer's history. Fresh installs still
+          start life in %ProgramData% under the installer's ACL.
+        * A small one is still copied, but ATOMICALLY: into `.migrating`,
+          then os.replace(). The old code could leave a half-written file
+          that EXISTS, so the next boot skipped the migration and opened a
+          TRUNCATED database. That is silent corruption, not a slow start.
+        * Anything unexpected - no space, no permission, a failed copy -
+          falls back to the legacy file. An app that boots on its real data
+          beats one that boots on a partial copy, or not at all.
+        """
+        legacy = os.path.join(os.path.expanduser("~"), ".trustnode_edge",
+                              "data", "trustnode_app_store.db")
+        try:
+            if not os.path.exists(legacy) or os.path.exists(new_path):
+                return new_path
+            size = os.path.getsize(legacy)
+        except OSError:
+            return new_path
+
+        try:
+            cap_mb = float(os.environ.get("TRUSTNODE_MIGRATE_MAX_MB", "")
+                           or self._MIGRATE_MAX_MB)
+        except ValueError:
+            cap_mb = float(self._MIGRATE_MAX_MB)
+        size_mb = size / 1048576.0
+
+        if size_mb > cap_mb:
+            print("[trustnode] app store: using the existing database at %s "
+                  "(%.0f MB). Copying it into %s would delay startup past "
+                  "the launcher's budget, so it stays where it is."
+                  % (legacy, size_mb, os.path.dirname(new_path)), flush=True)
+            return legacy
+
+        try:
+            free = shutil.disk_usage(os.path.dirname(new_path)).free
+            if free < size * 1.2:
+                print("[trustnode] WARN: app store migration skipped - %s has "
+                      "%.0f MB free and the database needs %.0f MB. Using %s."
+                      % (os.path.dirname(new_path), free / 1048576.0,
+                         size_mb * 1.2, legacy), flush=True)
+                return legacy
+        except Exception as exc:                        # noqa: BLE001
+            print("[trustnode] WARN: could not check free space (%s); using %s"
+                  % (exc, legacy), flush=True)
+            return legacy
+
+        staging = new_path + ".migrating"
+        try:
+            if os.path.exists(staging):
+                os.remove(staging)
+            shutil.copy2(legacy, staging)
+            os.replace(staging, new_path)
+            print("[trustnode] migrated app store from %s -> %s (%.0f MB)"
+                  % (legacy, new_path, size_mb), flush=True)
+            return new_path
+        except Exception as exc:                        # noqa: BLE001
+            print("[trustnode] WARN: app store migration failed (%s); using %s"
+                  % (exc, legacy), flush=True)
+            try:
+                if os.path.exists(staging):
+                    os.remove(staging)
+            except OSError:
+                pass
+            return legacy
+
     def _resolve_db_path(self) -> str:
         # Resolution order (operator 2026-06-18):
         #   1. TRUSTNODE_APP_STORE_PATH env var (explicit override)
@@ -1013,6 +1109,13 @@ class AppStore:
             base = env_path
         else:
             data_dir = os.environ.get("TRUSTNODE_DATA_DIR", "").strip()
+            # Whether this location is the DEFAULT or one the operator named.
+            # Only a defaulted location may adopt a legacy database: an
+            # explicit TRUSTNODE_DATA_DIR means "use this workspace", never
+            # "copy my old data into it" - and a test or a build probe that
+            # points at a scratch dir must never pull in a multi-gigabyte
+            # production store.
+            defaulted = not data_dir
             if not data_dir:
                 if sys.platform == "win32":
                     program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
@@ -1020,19 +1123,9 @@ class AppStore:
                 else:
                     data_dir = os.path.join(os.path.expanduser("~"), ".trustnode_edge", "data")
             os.makedirs(data_dir, exist_ok=True)
-            # Migrate from the legacy ~\.trustnode_edge\data location to
-            # %ProgramData% if a legacy DB exists and the new one doesn't.
-            if sys.platform == "win32":
-                legacy = os.path.join(os.path.expanduser("~"), ".trustnode_edge", "data", "trustnode_app_store.db")
-                new = os.path.join(data_dir, "trustnode_app_store.db")
-                if os.path.exists(legacy) and not os.path.exists(new):
-                    try:
-                        import shutil
-                        shutil.copy2(legacy, new)
-                        print(f"[trustnode] migrated app store from {legacy} -> {new}", flush=True)
-                    except Exception as exc:
-                        print(f"[trustnode] WARN: app store migration failed: {exc}", flush=True)
             base = os.path.join(data_dir, "trustnode_app_store.db")
+            if sys.platform == "win32" and defaulted:
+                base = self._adopt_legacy_store(base)
         base = os.path.abspath(base)
         os.makedirs(os.path.dirname(base), exist_ok=True)
         # Operator 2026-08-21 (retention/backup): a staged restore or a
@@ -5276,6 +5369,44 @@ class AppStore:
                     conn.execute("ALTER TABLE scheduled_reports ADD COLUMN attach_csv INTEGER NOT NULL DEFAULT 0")
                 if "attach_txt" not in sched_cols:
                     conn.execute("ALTER TABLE scheduled_reports ADD COLUMN attach_txt INTEGER NOT NULL DEFAULT 0")
+                # 2026-09-29: CYCLE reports. A schedule can carry a STOP
+                # condition as well as a start one, so a report covers exactly
+                # the window between them - "everytime we have a new start and
+                # end time a new report is generated". The two cycle_* columns
+                # hold the in-flight cycle so a restart mid-cycle does not lose
+                # it, and id_tag captures the batch/serial number at the start
+                # so the report can be named and filtered by it.
+                for _col, _ddl in (
+                    ("stop_conditions_json", "TEXT NOT NULL DEFAULT '[]'"),
+                    ("stop_condition_logic", "TEXT NOT NULL DEFAULT 'all'"),
+                    ("id_tag", "TEXT NOT NULL DEFAULT ''"),
+                    ("file_name_pattern", "TEXT NOT NULL DEFAULT ''"),
+                    ("cycle_started_utc", "TEXT NOT NULL DEFAULT ''"),
+                    ("cycle_report_id", "TEXT NOT NULL DEFAULT ''"),
+                    # 2026-09-30: a run is divided into SEGMENTS - one per
+                    # value of segment_tag while the cycle is open, e.g. each
+                    # cycle of a repeated test. segment_tag names the tag to
+                    # watch; cycle_segments_json holds the segments closed so
+                    # far, in the row for the same reason the cycle is: a
+                    # restart mid-run must not silently lose them.
+                    ("segment_tag", "TEXT NOT NULL DEFAULT ''"),
+                    ("segment_gateway", "TEXT NOT NULL DEFAULT ''"),
+                    ("cycle_segments_json", "TEXT NOT NULL DEFAULT '[]'"),
+                    # 2026-10-01: one trigger may produce several reports, and
+                    # the file may be written to a chosen folder (a synced
+                    # OneDrive folder is just a local path).
+                    ("template_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+                    ("output_path", "TEXT NOT NULL DEFAULT ''"),
+                    # 2026-10-11: a cycle must not re-open while its START
+                    # condition is still true - one physical run was producing
+                    # a report on every 15s tick. 1 = wait for a new rising
+                    # edge (the default); 0 = the old level-triggered
+                    # behaviour, for a start tag the PLC clears itself.
+                    ("start_edge", "INTEGER NOT NULL DEFAULT 1"),
+                ):
+                    if _col not in sched_cols:
+                        conn.execute("ALTER TABLE scheduled_reports ADD COLUMN %s %s"
+                                     % (_col, _ddl))
                 # 2026-05-18: generated_reports gained a `storage_path` column so the
                 # edge can remember where each PDF was uploaded inside the Lite
                 # Storage bucket (lets the Lite app render signed-URL downloads).
@@ -7271,6 +7402,123 @@ class AppStore:
         except Exception:
             return None
 
+    def site_scope_key(self) -> str:
+        """`tenant|customer|edge` - the scope SITE-level domains are saved under.
+
+        Delegates to routers.app_store.shared_edge_scope_key(), which is THE
+        implementation of this key and is already used to overlay the shared
+        domains. Reproducing the rule here looked simpler and was wrong: a
+        fresh edge with no customer is saved under `default|-|edge-...`, and a
+        second copy of the logic that treated a missing customer as "no scope"
+        read the wrong document. One rule, one place.
+
+        Imported lazily - the router imports this service, so a module-level
+        import would be circular.
+        """
+        try:
+            from app.routers.app_store import shared_edge_scope_key
+            return str(shared_edge_scope_key() or "")
+        except Exception:
+            return ""
+
+    def get_domain_scoped_fast(self, domain: str) -> Any:
+        """One domain from the SCOPED store, off the global lock.
+
+        2026-09-03: the power meter loaded its configuration with
+        get_domain_fast(), which reads `config_documents` - the LEGACY
+        unscoped table. The UI saves to `config_documents_scoped`. The two
+        happened to agree for months, so nothing looked wrong; then the
+        operator's export sinks were written to the scoped document alone and
+        the running meter carried on with a copy from the previous evening.
+
+        Scoped first, unscoped only when this edge has no scoped document at
+        all (a fresh install, or a config written before scoping existed).
+        Returns None for "unknown" - never treat that as "empty" (see
+        config_wipe_on_failed_read).
+        """
+        name = str(domain or "").strip()
+        if not name:
+            return None
+        scope_key = self.site_scope_key()
+        if scope_key:
+            conn = None
+            try:
+                conn = self._connect_readonly()
+                row = conn.execute(
+                    "SELECT payload_json FROM config_documents_scoped "
+                    "WHERE scope_key = ? AND domain = ?",
+                    (scope_key, name),
+                ).fetchone()
+                if row and row["payload_json"] is not None:
+                    return json.loads(str(row["payload_json"] or "null"))
+            except Exception:
+                pass
+            finally:
+                try:
+                    if conn is not None:
+                        conn.close()
+                except Exception:
+                    pass
+            # SCOPE IS NOT OPTIONAL. This edge HAS an identity, so it must
+            # never be served the unscoped document as if it were its own:
+            # one SQLite can hold rows for several customers and edges (a
+            # re-activated install has both), and handing back the unscoped
+            # copy would leak another customer's configuration into this one.
+            #
+            # A miss here goes through the VETTED fallback instead - the same
+            # ordered candidate list get_bootstrap_scoped uses for configs
+            # written under an older scope shape. It costs a full bootstrap,
+            # which is why it is only on the miss path and never per cycle.
+            try:
+                scoped = self.get_bootstrap_scoped(scope_key, prefer_cloud_reads=False) or {}
+                if isinstance(scoped, dict) and name in scoped:
+                    return scoped.get(name)
+            except Exception:
+                pass
+            return None
+        # No identity yet: saves go to the unscoped store too, so reading it is
+        # consistent rather than a cross-scope read.
+        return self.get_domain_fast(name)
+
+    def get_domain_for_scope_fast(self, scope_key: str, domain: str) -> Any:
+        """One domain for an EXPLICIT scope, off the global lock.
+
+        2026-10-02: saving a config ran three separate
+        get_bootstrap_scoped_or_shout() calls - the blank guard, the
+        omitted-key preserver and the secret restorer - and each reads EVERY
+        domain and takes the global lock. On a 5 GB store under 41 writes/s
+        that queued behind the historian writer, so PUT /api/app-store/domain
+        passed the UI's 20 s timeout and every page showed "Database
+        connections could not be saved".
+
+        Reads the one document, read-only, so it cannot wait on the writer.
+        Returns None for "unknown" - never treat that as "empty"; the caller
+        falls back to the vetted path.
+        """
+        key = str(scope_key or "").strip()
+        name = str(domain or "").strip()
+        if not key or not name:
+            return None
+        conn = None
+        try:
+            conn = self._connect_readonly()
+            row = conn.execute(
+                "SELECT payload_json FROM config_documents_scoped "
+                "WHERE scope_key = ? AND domain = ?",
+                (key, name),
+            ).fetchone()
+            if row and row["payload_json"] is not None:
+                return json.loads(str(row["payload_json"] or "null"))
+        except Exception:
+            return None
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+        return None
+
     def upsert_domain(self, domain: str, payload: Any, actor: str = "system") -> Dict[str, Any]:
         now = self._utc_now()
         domain_name = str(domain or "").strip()
@@ -8073,6 +8321,75 @@ class AppStore:
         self._live_sync_wakeup_event.set()
         return len(safe_rows)
 
+    #: A repeating failure is written at most once per this many seconds.
+    #: Override with TRUSTNODE_LOG_REPEAT_WINDOW_S.
+    _LOG_REPEAT_WINDOW_S = 60.0
+
+    def _log_repeat_window(self) -> float:
+        try:
+            v = float(os.environ.get("TRUSTNODE_LOG_REPEAT_WINDOW_S", "")
+                      or self._LOG_REPEAT_WINDOW_S)
+        except ValueError:
+            return float(self._LOG_REPEAT_WINDOW_S)
+        return max(0.0, v)
+
+    def _throttle_log_rows(self, safe_rows: list[tuple]) -> list[tuple]:
+        """Keep the first of a repeating message, then one summary a minute.
+
+        2026-10-08: app_logs held 1,589,193 rows on the operator's machine.
+        One message - "Power meter EM1 read failed: Unable to connect" - was
+        written every second for days (3,600 rows an hour, 35% of the whole
+        table), and a four-day Supabase outage in September added 1,027,988
+        copies of "Data sync failed: connection failed". The operator sees
+        this as "multiple messages with problems with database connection or
+        gateways"; the store sees it as gigabytes of identical text that
+        then has to be compacted.
+
+        A failure that repeats every second is ONE fault, not 3,600 events
+        an hour. The first occurrence is written immediately - nothing is
+        hidden - and while it keeps repeating a single line per window
+        carries the count, so the Logs page says "still failing, 3,600 times
+        since 09:00" instead of burying everything else.
+
+        Keyed on what makes a message the SAME fault: level, category,
+        message text and the device it came from.
+        """
+        window = self._log_repeat_window()
+        if window <= 0:
+            return safe_rows
+        import time as _time
+        now_mono = _time.monotonic()
+        out: list[tuple] = []
+        with self._log_repeat_lock:
+            for row in safe_rows:
+                level, category, message, gw = row[2], row[3], row[4], row[5]
+                # Only failures repeat like this; info is low-volume and a
+                # suppressed info line would be a surprise.
+                if str(level).lower() not in ("warning", "warn", "error"):
+                    out.append(row)
+                    continue
+                key = (level, category, message, gw)
+                state = self._log_repeat.get(key)
+                if state is None or (now_mono - state["at"]) >= window:
+                    suppressed = int(state["n"]) if state else 0
+                    if suppressed:
+                        row = list(row)
+                        row[4] = ("%s  [repeated %d more time(s) in the previous "
+                                  "%.0fs]" % (message, suppressed, window))
+                        row = tuple(row)
+                    self._log_repeat[key] = {"at": now_mono, "n": 0}
+                    out.append(row)
+                else:
+                    state["n"] = int(state["n"]) + 1
+            # The map is keyed by message text, so a flood of DISTINCT
+            # messages must not become a leak of its own.
+            if len(self._log_repeat) > 2000:
+                cutoff = now_mono - (window * 10)
+                for k in [k for k, v in self._log_repeat.items()
+                          if v["at"] < cutoff]:
+                    self._log_repeat.pop(k, None)
+        return out
+
     def append_log_rows(self, rows: list[dict[str, Any]]) -> int:
         now = self._utc_now()
         tenant_id = self._current_tenant_id()
@@ -8093,6 +8410,7 @@ class AppStore:
                     now,
                 )
             )
+        safe_rows = self._throttle_log_rows(safe_rows)
         if not safe_rows:
             return 0
         with self._lock:
@@ -9067,11 +9385,27 @@ class AppStore:
             params["device_like"] = f"%{device_txt}%"
             params_unscoped["device_like"] = f"%{device_txt}%"
         if tag_txt:
-            if "%" in tag_txt or "_" in tag_txt:
-                where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
-                where_unscoped += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
-                params["tag_like"] = f"%{tag_txt}%"
-                params_unscoped["tag_like"] = f"%{tag_txt}%"
+            # ONLY "%" asks for a wildcard search.
+            #
+            # 2026-10-01: this also took the LIKE path when the name merely
+            # CONTAINED an underscore - which is nearly every industrial tag.
+            # SQL LIKE reads "_" as "any one character" and the pattern was
+            # wrapped in %...%, so a chart, KPI or report trigger on
+            # `cycle_started` silently also read `cycle_started1` and
+            # `cycle_started2`, and `active_power_w` also read
+            # `active_power_w_raw`. It cost correctness and the index with it.
+            # Where a wildcard IS wanted, "_" is escaped so it stays literal.
+            if "%" in tag_txt:
+                # "!" is the escape character - it needs no backslash of its
+                # own, which keeps this readable in both Python and SQL.
+                like = (tag_txt.replace("!", "!!")
+                               .replace("_", "!_"))
+                clause = (" AND LOWER(COALESCE(tag_name,'')) LIKE"
+                          " LOWER(:tag_like) ESCAPE '!'")
+                where += clause
+                where_unscoped += clause
+                params["tag_like"] = like
+                params_unscoped["tag_like"] = like
             else:
                 # Index-friendly direct equality (case-sensitive). Tag names are
                 # stored exactly as configured, so this aligns with the composite
@@ -9225,11 +9559,19 @@ class AppStore:
             params["device_like"] = f"%{device_txt}%"
             params_unscoped["device_like"] = f"%{device_txt}%"
         if tag_txt:
-            if "%" in tag_txt or "_" in tag_txt:
-                where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
-                where_unscoped += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
-                params["tag_like"] = f"%{tag_txt}%"
-                params_unscoped["tag_like"] = f"%{tag_txt}%"
+            if "%" in tag_txt:
+                # Only "%" is a wildcard. See get_historian_rows_range: an
+                # underscore is a literal in nearly every tag name, and SQL
+                # LIKE reads it as "any character", so stats for one tag
+                # silently folded in its neighbours.
+                like = (tag_txt.replace("!", "!!")
+                               .replace("_", "!_"))
+                clause = (" AND LOWER(COALESCE(tag_name,'')) LIKE"
+                          " LOWER(:tag_like) ESCAPE '!'")
+                where += clause
+                where_unscoped += clause
+                params["tag_like"] = like
+                params_unscoped["tag_like"] = like
             else:
                 # Index-friendly direct equality. Tag names are stored exactly as
                 # configured, so case-sensitive match aligns with the composite

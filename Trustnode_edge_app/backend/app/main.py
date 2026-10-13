@@ -1,6 +1,7 @@
 from app import boot_clock as _boot_clock  # noqa: E402  (BOOT-HEALTH: capture T0 first)
 import asyncio
 import json
+import math
 import logging
 import os
 import sys
@@ -673,10 +674,29 @@ async def _deferred_startup() -> None:
             print(f"[trustnode][boot] activation restored from registry: {result.get('applied')}", flush=True)
     except Exception as exc:
         print(f"[trustnode][boot] activation registry restore failed: {exc!r}", flush=True)
-    try:
-        await plc_manager.stop_all_gateways()
-    except Exception:
-        pass
+    # 2026-09-02: this used to be an unconditional
+    #     await plc_manager.stop_all_gateways()
+    # here in deferred init, roughly 4.8 s after process start.
+    #
+    # Workers are in-process objects, so a FRESH process has none - the call
+    # could never clean up anything left by a previous run. The only thing it
+    # could ever stop was a gateway started by THIS process during the boot
+    # window, which it did silently, logging "reason=requested" as though an
+    # operator had asked. Start a gateway in the first few seconds after
+    # launch - auto-resume, a quick operator, or a test - and it stopped dead
+    # with writes=0 and no explanation.
+    #
+    # It is also the intermittent failure that made
+    # test_collection_trigger_gates_writes look flaky all day: the gateway
+    # starts just after /api/health answers at +4.05 s, and this fired at
+    # +4.8 s. Whichever won the race decided whether the run passed.
+    #
+    # Anything genuinely stale is handled where it belongs: start_gateway()
+    # tears down a stalled or non-running worker before reusing it, and the
+    # supervisor stops workers whose gateway was deleted.
+    if plc_manager.workers:
+        print("[trustnode][boot] %d gateway(s) were started during boot; "
+              "leaving them running" % len(plc_manager.workers), flush=True)
 
     # Operator 2026-06-19 (L5): SQLite integrity check on boot. Quick
     # PRAGMA quick_check is O(N) over pages but bounded — typically a
@@ -1583,6 +1603,44 @@ def root() -> dict[str, str]:
     return {"message": "Trustnode Edge API is running", "docs": "/docs", "health": "/api/health"}
 
 
+def _ws_json(payload: object) -> str:
+    """Serialise a stream frame as JSON the browser can actually parse.
+
+    json.dumps with Python's defaults emits bare NaN, Infinity and -Infinity
+    for non-finite floats. None of the three is valid JSON, so JSON.parse
+    throws on the whole frame - the browser cannot read one bad reading and
+    keep the rest. One faulted analog channel therefore silently kills the
+    live stream for every tag on the gateway.
+
+    allow_nan=False would raise instead, which just moves the failure to the
+    server and drops the frame entirely. The reading is genuinely unknown, so
+    it is sent as null - which is already how a missing value is represented
+    everywhere else in this payload (2026-10-12).
+    """
+    def _key(k):
+        # json.dumps writes a float key through repr(), so a non-finite one
+        # becomes the literal key "NaN" - valid JSON carrying a corrupted
+        # name. Keys here are tag names, so this is belt and braces.
+        if isinstance(k, float) and not math.isfinite(k):
+            return "null"
+        return k
+
+    def _clean(v):
+        if isinstance(v, float):
+            return v if math.isfinite(v) else None
+        if isinstance(v, dict):
+            return {_key(k): _clean(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [_clean(x) for x in v]
+        return v
+
+    # allow_nan=False is the tripwire: with keys and values both cleaned
+    # nothing can reach it, so if it ever fires something new is producing
+    # non-finite numbers and we want to hear about it rather than ship
+    # invalid JSON to every browser.
+    return json.dumps(_clean(payload), allow_nan=False)
+
+
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket) -> None:
     tenant_id = resolve_websocket_tenant(websocket)
@@ -1607,7 +1665,7 @@ async def websocket_stream(websocket: WebSocket) -> None:
     queue = plc_manager.subscribe()
     try:
         await websocket.send_text(
-            json.dumps(
+            _ws_json(
                 {
                     "type": "status",
                     "status": plc_manager.get_status().model_dump(),
@@ -1617,7 +1675,7 @@ async def websocket_stream(websocket: WebSocket) -> None:
         )
         while True:
             event = await queue.get()
-            await websocket.send_text(json.dumps(event))
+            await websocket.send_text(_ws_json(event))
     except WebSocketDisconnect:
         pass
     finally:
@@ -1727,7 +1785,7 @@ async def _websocket_cloud_live_loop(websocket: WebSocket, tenant_id: str) -> No
                     "last_check_utc": newest_ts,
                 },
             }
-            await websocket.send_text(json.dumps(payload))
+            await websocket.send_text(_ws_json(payload))
             last_fp = fp
             last_sent_mono = now_mono
             await asyncio.sleep(sample_interval_seconds)

@@ -471,6 +471,25 @@ class EdgeLocalFinalizeRequest(BaseModel):
     # ({cloud_api_url, supabase_url, ai_endpoint_url, web_client_url}). The edge
     # may forward these; finalize also resolves them from the store as a fallback.
     infrastructure: dict[str, str] = Field(default_factory=dict)
+
+
+class ControlPlaneDatabaseRequest(BaseModel):
+    """Where the control-plane (portal) database lives.
+
+    2026-10-13: "the portal database can also be moved to a different
+    database where the portal website would be pointed out (to be configured
+    from the portal)". `password` blank on an update means "keep the stored
+    one" - the portal never receives the password back, so a round-trip must
+    not be able to erase it.
+    """
+    backend: str = "cloud"
+    host: str = ""
+    port: str = "5432"
+    database: str = "postgres"
+    username: str = ""
+    password: str = ""
+    sslmode: str = "require"
+    keep_password: bool = True
     admin_username: str = "admin"
     admin_password: str = ""
 
@@ -734,6 +753,91 @@ def put_infrastructure_endpoints(payload: InfrastructureEndpointsRequest, reques
         details={"scope": tid or "__global__", "keys": sorted((payload.endpoints or {}).keys())},
     )
     return {"ok": True, "config": saved, "resolved": control_plane_store.resolve_infrastructure_endpoints(tenant_id=tid)}
+
+
+@router.get("/database")
+def get_control_plane_database(request: Request) -> dict[str, Any]:
+    """Developer-admin: where the portal's own database currently points.
+
+    Never returns the password - only whether one is set. `source` says
+    whether the live value came from the saved setting or the environment,
+    which is the question an operator actually has when the portal looks
+    like it is talking to the wrong database.
+    """
+    payload = _require_auth_payload(request)
+    if not _is_global_admin(payload):
+        raise HTTPException(status_code=403, detail="Global admin required")
+    from app.services import control_plane_target
+    return {"ok": True, "target": control_plane_target.describe()}
+
+
+@router.post("/database/test")
+def test_control_plane_database(payload: ControlPlaneDatabaseRequest,
+                                request: Request) -> dict[str, Any]:
+    """Developer-admin: try a candidate target WITHOUT saving it.
+
+    This is what makes moving the portal database a safe operation: the
+    operator finds out that the host is wrong, or that the database has no
+    cp_* tables yet, before the portal is pointed at it.
+    """
+    user_payload = _require_auth_payload(request)
+    if not _is_global_admin(user_payload):
+        raise HTTPException(status_code=403, detail="Global admin required")
+    from app.services import control_plane_target
+    cfg = payload.model_dump()
+    if payload.keep_password and not str(payload.password or "").strip():
+        cfg["password"] = control_plane_target.db_settings().get("password") or ""
+    return {"ok": True, "result": control_plane_target.test_connection(cfg)}
+
+
+@router.put("/database")
+def put_control_plane_database(payload: ControlPlaneDatabaseRequest,
+                               request: Request) -> dict[str, Any]:
+    """Developer-admin: point the portal at a different database.
+
+    The candidate is TESTED first and refused if it cannot be reached - a
+    saved target that does not work would take the portal down on the next
+    restart, and the operator would have to go to the shell to undo it.
+    """
+    user_payload = _require_auth_payload(request)
+    if not _is_global_admin(user_payload):
+        raise HTTPException(status_code=403, detail="Global admin required")
+    actor = str(user_payload.get("sub") or user_payload.get("username") or "admin")
+    from app.services import control_plane_target
+    cfg = payload.model_dump()
+    if payload.keep_password and not str(payload.password or "").strip():
+        cfg["password"] = control_plane_target.db_settings().get("password") or ""
+    probe = control_plane_target.test_connection(cfg)
+    if not probe.get("ok"):
+        raise HTTPException(
+            status_code=400,
+            detail="connection_failed: %s" % str(probe.get("error") or "unknown"))
+    try:
+        saved = control_plane_target.save(cfg, actor=actor)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="save_failed: %s" % exc) from exc
+    _audit(request, tenant_id="__global__", action="control_plane_database.set",
+           outcome="ok",
+           details={"backend": saved.get("backend"), "host": saved.get("host"),
+                    "database": saved.get("database")})
+    return {"ok": True, "target": saved, "test": probe,
+            "restart_required": True}
+
+
+@router.delete("/database")
+def clear_control_plane_database(request: Request) -> dict[str, Any]:
+    """Developer-admin: forget the saved target and fall back to the
+    environment. The undo for the endpoint above."""
+    user_payload = _require_auth_payload(request)
+    if not _is_global_admin(user_payload):
+        raise HTTPException(status_code=403, detail="Global admin required")
+    from app.services import control_plane_target
+    target = control_plane_target.clear()
+    _audit(request, tenant_id="__global__", action="control_plane_database.clear",
+           outcome="ok", details={})
+    return {"ok": True, "target": target, "restart_required": True}
 
 
 @router.get("/tenants")

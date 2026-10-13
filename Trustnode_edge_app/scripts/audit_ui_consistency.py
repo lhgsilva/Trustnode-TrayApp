@@ -81,6 +81,28 @@ check("font families come from tokens, not ad-hoc stacks",
 check("  the tokens themselves are declared",
       "--font-sans:" in CSS and "--font-mono:" in CSS)
 
+# 2026-10-08, reported: the OEE pages "are not using the app design pattern
+# ... not aligned and same sizes and fonts of other well stabilhed modules".
+# They had their own scale - 10, 10.5, 11.5, 15, 16, 18 and 22 px against the
+# app's 11/13/14/20/28 - so nothing lined up with the module beside it. A
+# module-local font scale is invisible in review and obvious on screen.
+# Only the modules that have actually been aligned. The same drift exists
+# in the dashboard, report and export CSS; those are tuned surfaces the
+# operator has already signed off, so they are not swept in silently - add
+# a prefix here when one is deliberately brought onto the scale.
+_MODULES = ("oee",)
+_offscale = []
+for _m in re.finditer(r"([^{}]+)\{([^{}]*)\}", CSS, re.S):
+    _sel, _body = _m.group(1), _m.group(2)
+    if not any(("." + p) in _sel for p in _MODULES):
+        continue
+    for _px in re.findall(r"font-size:\s*([\d.]+)px", _body):
+        _offscale.append("%s:%spx" % (_sel.strip().split()[0][:28], _px))
+check("module CSS takes its font sizes from the tokens",
+      len(_offscale) == 0,
+      "%d raw size(s): %s" % (len(_offscale), ", ".join(sorted(set(_offscale))[:4]))
+      if _offscale else "every module rule uses var(--font-*)")
+
 # ------------------------------------------------------- the widget picker
 print()
 print("[the Add Widget picker]")

@@ -6,6 +6,9 @@ frontend/node_modules/
 frontend/dist/
 frontend/dist_client_view/
 frontend/dist_cloud_readonly/
+# Test harness for the widget editor (test_designer_entry.jsx);
+# never packaged - desktop/package.json copies frontend/dist only.
+frontend/dist_designer/
 desktop/node_modules/
 desktop/dist/
 *.log

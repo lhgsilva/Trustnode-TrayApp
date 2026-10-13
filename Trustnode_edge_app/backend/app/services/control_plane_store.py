@@ -1160,6 +1160,9 @@ class ControlPlaneStore:
         "supabase_url",        # Supabase project URL (informational / future edge-direct)
         "ai_endpoint_url",     # TrustNode Intelligence endpoint base
         "web_client_url",      # optional cloud web client base
+        # 2026-10-13: the Lite/mobile surface is migratable too, so where it
+        # lives is a portal setting rather than a file pushed over SSH.
+        "lite_url",            # Lite / mobile web view base
     )
 
     def get_infrastructure_config(self, *, tenant_id: str | None = None) -> dict[str, Any]:

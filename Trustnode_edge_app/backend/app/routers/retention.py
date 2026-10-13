@@ -97,7 +97,10 @@ def retention_storage() -> dict:
             p = path + suffix
             if os.path.exists(p):
                 file_bytes += os.path.getsize(p)
-        with _store._connect() as conn:
+        # Read-only: these are PRAGMA size probes, and a read/write handle
+        # queues behind the historian writer - which is why the page showed
+        # 0 MB for a 5 GB store (2026-10-02).
+        with _store._connect_readonly() as conn:
             page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
             page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
             freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])

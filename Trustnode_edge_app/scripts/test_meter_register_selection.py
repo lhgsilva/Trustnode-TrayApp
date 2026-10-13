@@ -33,6 +33,7 @@ offset 6 = 0.241 A, offset 70 = 50.04 Hz.
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
 
@@ -171,6 +172,40 @@ check("a measurement the meter does not have returns None, not 0.0",
       canonical_measurement({"voltage_v": 230.0}, "energy_wh") is None,
       "a zero and 'this meter has no such register' look identical on a KPI "
       "card, and only one of them is a fact")
+
+print()
+print("[a meter wired backwards is corrected, without hiding it]")
+# 2026-09-04: the live EM122 reads -27 W at power factor -0.45. That is a
+# reversed installation, not export - and integrating negative power gave a
+# NEGATIVE total_kwh and a negative cost, so the Usage chart and the Tariff
+# panel had nothing they could draw and came up empty.
+from app.services.power_manager import _is_directional     # noqa: E402
+
+for tag in ("active_power_w", "active_power_total_w", "reactive_power_var",
+            "power_factor", "power_factor_l1", "energy_wh", "energy_import_wh"):
+    check("%-22s flips" % tag, _is_directional(tag),
+          "a signed quantity follows the direction of flow")
+for tag in ("voltage_v", "voltage_l1_v", "current_a", "current_l1_a",
+            "frequency_hz", "apparent_power_va", "phase_angle_l1_deg"):
+    check("%-22s does NOT flip" % tag, not _is_directional(tag),
+          "a magnitude has no direction; negating it would invent a fault")
+
+check("the flag survives normalisation",
+      pm._normalize_device({"id": "EM1", "ip": "1.2.3.4",
+                            "reverse_direction": True}).get("reverse_direction") is True,
+      "_normalize_device copies fields one at a time - the same allowlist "
+      "that silently dropped the export sinks")
+check("  and defaults to OFF",
+      pm._normalize_device({"id": "EM1", "ip": "1.2.3.4"}).get("reverse_direction") is False,
+      "an existing meter must not change sign because a new setting appeared")
+
+_pm_src = io.open(os.path.join(ROOT, "backend", "app", "services", "power_manager.py"),
+                  encoding="utf-8", errors="replace").read()
+check("only the SCALED values are flipped",
+      "if reverse_direction and _is_directional(key):" in _pm_src
+      and "values_raw" in _pm_src,
+      "values_raw keeps exactly what the meter sent, so the correction is "
+      "visible rather than hidden")
 
 print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))

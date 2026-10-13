@@ -10,6 +10,7 @@
    a plausible number rather than an error — so "Read live assembly" shows the
    raw bytes beside the decoded values before anything is saved. */
 import { useCallback, useMemo, useState } from "react";
+import ValueMappingDialog from "./ValueMappingDialog";
 import { parseEdsFile, previewEipAssembly, identifyEipDevice, generateIfmPinMap,
          scanCipParameters, previewCipParameters } from "../../api";
 import DeviceCatalogue from "./DeviceCatalogue";
@@ -39,6 +40,8 @@ export function eipTagNames(signals) {
 
 export default function EthernetIpMapper({ form, onChange, disabled = false }) {
   const [busy, setBusy] = useState("");
+  // Which signal row has its value-mapping dialog open.
+  const [mappingIdx, setMappingIdx] = useState(null);
   const [note, setNote] = useState("");
   const [eds, setEds] = useState(null);
   const [live, setLive] = useState(null);
@@ -554,7 +557,7 @@ export default function EthernetIpMapper({ form, onChange, disabled = false }) {
         <div className="ifm-field-head eip-head">
           <span>Collect</span>
           <span>Tag name</span><span>Byte offset</span><span>Type</span>
-          <span>Bit</span><span>Scale</span><span>Offset</span><span>Unit</span><span />
+          <span>Bit</span><span>Scale</span><span>Offset</span><span>Unit</span><span>Mapping</span><span />
         </div>
         {shown.map(({ sig, idx }) => (
           <div className={`ifm-field-row eip-row ${sig.enabled === false ? "eip-row-off" : ""}`}
@@ -580,10 +583,27 @@ export default function EthernetIpMapper({ form, onChange, disabled = false }) {
               onChange={(e) => patchSignal(idx, { offset: Number(e.target.value || 0) })} />
             <input value={sig.unit || ""} placeholder="rpm" disabled={disabled}
               onChange={(e) => patchSignal(idx, { unit: e.target.value })} />
+            {/* Per-row mapping. 2026-09-06, asked for: a value that sits in
+                part of a byte, spans two words, or IS a single bit cannot be
+                described by scale and offset, so it needs its own editor
+                rather than more columns in this row. */}
+            <button type="button" className="btn btn-secondary btn-sm" disabled={disabled}
+              title="Describe where this value sits in the device's bytes"
+              onClick={() => setMappingIdx(idx)}>
+              {Number(sig.bit_length) > 0 ? "Mapping ✓" : "Mapping"}
+            </button>
             <button type="button" className="btn btn-danger btn-sm" disabled={disabled}
               onClick={() => patchSignals(signals.filter((_, i) => i !== idx))}>Remove</button>
           </div>
         ))}
+        {mappingIdx !== null && signals[mappingIdx] ? (
+          <ValueMappingDialog
+            signal={signals[mappingIdx]}
+            sampleHex={String(form.last_assembly_hex || "")}
+            onApply={(patch) => { patchSignal(mappingIdx, patch); setMappingIdx(null); }}
+            onClose={() => setMappingIdx(null)}
+          />
+        ) : null}
         <button type="button" className="btn btn-secondary btn-sm" style={{ marginTop: 6 }}
           disabled={disabled}
           onClick={() => patchSignals([...signals, {

@@ -1177,10 +1177,66 @@ export function DashboardDesigner({
    *     immediately produces a visible historical view.
    *   - One drag = one window shift; the window width is preserved.
    */
-  const panHistoricalWindow = useCallback((direction) => {
+  /**
+   * How far one arrow press moves the window.
+   *
+   * 2026-09-03, requested: step "to the next unit, second, minute or hours
+   * based on the X axis of the chart" for smooth scrubbing. The first attempt
+   * returned the axis UNIT itself - 1 s whenever the window was under five
+   * minutes - and on the operator's 60-second window that is a 1.7% shift.
+   * The chart redrew almost identically and the arrows were reported as doing
+   * nothing at all. They were working; the step was invisible.
+   *
+   * So: aim for about an eighth of the window - a couple of axis ticks, which
+   * is what "one step" looks like in a SCADA trend - and snap DOWN to a round
+   * unit so the window still lands on whole seconds, minutes or hours.
+   */
+  const STEP_LADDER_MS = useMemo(() => [
+    1000, 2000, 5000, 10000, 15000, 30000,                    // seconds
+    60000, 2 * 60000, 5 * 60000, 10 * 60000, 15 * 60000, 30 * 60000,  // minutes
+    3600000, 2 * 3600000, 3 * 3600000, 6 * 3600000, 12 * 3600000,     // hours
+    24 * 3600000,                                             // a day
+  ], []);
+
+  const axisStepMs = useCallback((span) => {
+    const target = Math.max(1000, Number(span) / 8);
+    let chosen = STEP_LADDER_MS[0];
+    for (const unit of STEP_LADDER_MS) {
+      if (unit <= target) chosen = unit;
+    }
+    return chosen;
+  }, [STEP_LADDER_MS]);
+
+  /**
+   * Entering Historical with no range selected used to leave the charts on the
+   * live stream - the exact symptom reported on 2026-09-03 ("when we set to
+   * historical, the charts should not update any more"). A mode with no window
+   * has nothing to freeze, so switching in seeds the last 30 minutes: the
+   * operator gets an immediate, frozen view they can scrub with the arrows,
+   * and every later render has a range to honour.
+   */
+  const enterHistoricalMode = useCallback(() => {
+    if (!dashboardFrom && !dashboardTo) {
+      const pad = (n) => String(n).padStart(2, "0");
+      const fmt = (ms) => {
+        const d = new Date(ms);
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T`
+          + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+      };
+      const now = Date.now();
+      setDashboardFrom(fmt(now - 30 * 60 * 1000));
+      setDashboardTo(fmt(now));
+    }
+    setDashboardTimeMode("historical");
+  }, [dashboardFrom, dashboardTo, setDashboardFrom, setDashboardTo, setDashboardTimeMode]);
+
+  const panHistoricalWindow = useCallback((direction, opts) => {
     const step = Math.sign(Number(direction) || 0);
     if (step === 0) return;
     if (dashboardTimeMode !== "historical") return;
+    // Arrows step ONE axis unit; a drag still moves a whole window, which is
+    // the gesture operators already have in their fingers.
+    const byUnit = Boolean(opts && opts.unit);
     const dtLocalToMs = (s) => {
       const t = String(s || "").trim();
       if (!t) return NaN;
@@ -1190,7 +1246,10 @@ export function DashboardDesigner({
     const msToDtLocal = (ms) => {
       const d = new Date(ms);
       const pad = (n) => String(n).padStart(2, "0");
-      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      // Seconds included: a one-second step that gets rounded away leaves the
+      // window exactly where it was, and the arrow looks broken.
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T`
+        + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
     };
     let fromMs = dtLocalToMs(dashboardFrom);
     let toMs = dtLocalToMs(dashboardTo);
@@ -1203,12 +1262,12 @@ export function DashboardDesigner({
     const span = Math.max(60 * 1000, toMs - fromMs);
     // Drag right (positive direction) → go BACK in time (operator pulls past
     // history toward them). Drag left → go forward.
-    const shift = span * step * -1;
+    const shift = (byUnit ? axisStepMs(span) : span) * step * -1;
     fromMs += shift;
     toMs += shift;
     setDashboardFrom(msToDtLocal(fromMs));
     setDashboardTo(msToDtLocal(toMs));
-  }, [dashboardTimeMode, dashboardFrom, dashboardTo, setDashboardFrom, setDashboardTo]);
+  }, [dashboardTimeMode, dashboardFrom, dashboardTo, setDashboardFrom, setDashboardTo, axisStepMs]);
 
   const handleDeleteProfile = useCallback(() => {
     const name = activeProfileName;
@@ -1297,8 +1356,28 @@ export function DashboardDesigner({
       if (liveRows.length) return liveRows;
       return Array.isArray(liveBootstrapRows) ? liveBootstrapRows : [];
     }
-    if (hasHistoricalRange && historicalRangeKey === rangeKey && Array.isArray(historicalRows)) return historicalRows;
-    return localHistoricalRows;
+    // HISTORICAL IS A SNAPSHOT. 2026-09-03, reported: "when we set to
+    // historical, the charts should not update any more".
+    //
+    // The fallback below used to be localHistoricalRows - the LIVE stream
+    // filtered to the range - so whenever the fetched snapshot's key did not
+    // match (a slow fetch, a range still being typed, an end time at "now"),
+    // the charts quietly carried on following live data under a Historical
+    // badge. Collection and logging are untouched by any of this; only what
+    // the chart is allowed to draw changes.
+    if (hasHistoricalRange) {
+      return (historicalRangeKey === rangeKey && Array.isArray(historicalRows))
+        ? historicalRows
+        // The snapshot for THIS range has not arrived yet. Show nothing
+        // rather than the live stream: an empty chart says "loading", a
+        // moving one says "this is your history", and only one is true.
+        : [];
+    }
+    // Historical with BOTH dates cleared. Entering the mode seeds a window, so
+    // this only happens if the operator empties them deliberately - and an
+    // empty chart asking for a range beats one that silently starts trending
+    // live again under a Historical badge.
+    return [];
   }, [dashboardTimeMode, dataLogView, liveBootstrapRows, hasHistoricalRange, historicalRangeKey, rangeKey, historicalRows, localHistoricalRows]);
 
   useEffect(() => {
@@ -2429,7 +2508,7 @@ export function DashboardDesigner({
             <button
               type="button"
               className={`dashboard-pill ${dashboardTimeMode === "historical" ? "active" : ""}`}
-              onClick={() => setDashboardTimeMode("historical")}
+              onClick={enterHistoricalMode}
             >
               Historical
             </button>
@@ -2439,19 +2518,24 @@ export function DashboardDesigner({
               <button
                 type="button"
                 className="dashboard-pill"
-                onClick={() => panHistoricalWindow(1)}
+                onClick={() => panHistoricalWindow(1, { unit: true })}
                 title="Pan one window back (older)"
                 aria-label="Pan back"
                 style={{ padding: "4px 10px" }}
               >
                 ←
               </button>
-              <input type="datetime-local" value={dashboardFrom} onChange={(e) => setDashboardFrom(e.target.value)} />
-              <input type="datetime-local" value={dashboardTo} onChange={(e) => setDashboardTo(e.target.value)} />
+              {/* step=1 exposes SECONDS. Without it the control rounds to the
+                  minute, and a one-second arrow step could not be represented
+                  in the value at all - the window would not move. */}
+              <input type="datetime-local" step="1" value={dashboardFrom}
+                     onChange={(e) => setDashboardFrom(e.target.value)} />
+              <input type="datetime-local" step="1" value={dashboardTo}
+                     onChange={(e) => setDashboardTo(e.target.value)} />
               <button
                 type="button"
                 className="dashboard-pill"
-                onClick={() => panHistoricalWindow(-1)}
+                onClick={() => panHistoricalWindow(-1, { unit: true })}
                 title="Pan one window forward (newer)"
                 aria-label="Pan forward"
                 style={{ padding: "4px 10px" }}
@@ -2877,6 +2961,25 @@ export function DashboardDesigner({
                   Title
                   <input value={form.title} onChange={(e) => setForm((p) => ({ ...p, title: e.target.value }))} />
                 </label>
+                {/* The words a Fixed Text / Divider widget displays - for
+                    those two types this IS the widget's content, so it sits
+                    with the Title rather than at the bottom of the form.
+                    2026-10-07: it used to render inside the card headed
+                    "Series", several screens down past chart-only controls,
+                    which is not where anyone looks for the text of a text
+                    box. The field itself always worked. */}
+                {form.type === "fixed_text" || form.type === "divider" ? (
+                  <label className="dashboard-full-row">
+                    Text
+                    <input
+                      value={form.config.text ?? ""}
+                      onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, text: e.target.value } }))}
+                      placeholder={form.type === "divider"
+                        ? "Optional label shown on the divider"
+                        : "The text this widget displays"}
+                    />
+                  </label>
+                ) : null}
                 {/* Universal card-display controls — apply to every widget
                     type (charts, KPIs, dividers, fixed text, tables).
                     Lets the operator strip the card chrome so the body
@@ -3701,16 +3804,6 @@ export function DashboardDesigner({
                   </div>
                 ) : null}
 
-                {form.type === "fixed_text" || form.type === "divider" ? (
-                  <label className="dashboard-full-row">
-                    Text
-                    <input
-                      value={form.config.text}
-                      onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, text: e.target.value } }))}
-                    />
-                  </label>
-                ) : null}
-
                 {form.type === "image" ? (
                   <label className="dashboard-full-row">
                     Image URL
@@ -3815,8 +3908,10 @@ export function DashboardDesigner({
 
             <section className="dashboard-config-section">
               <h4>Profiles</h4>
+              {/* Operator 2026-10-02: the three-line explanations pushed the
+                  controls off the modal. One short line each. */}
               <p className="dashboard-config-hint">
-                Profiles save the current widgets, grid mode, columns and tag colors under a name. Switch between them at any time — loading a profile fully replaces the active dashboard.
+                Loading a profile replaces the active dashboard.
               </p>
               <div className="dashboard-profile-group">
                 <select
@@ -3956,7 +4051,7 @@ export function DashboardDesigner({
             <section className="dashboard-config-section">
               <h4>Export / Import (JSON)</h4>
               <p className="dashboard-config-hint">
-                Move a dashboard between TrustNode installations as a JSON file. Useful for templates, backups, or onboarding a new edge.
+                Move a dashboard between installations as a JSON file.
               </p>
               <div className="dashboard-config-actions">
                 <button
@@ -4018,7 +4113,7 @@ export function DashboardDesigner({
           <div className="modal-card" style={{ width: "min(420px, 92vw)" }}>
             <h3 style={{ marginTop: 0 }}>Profile name</h3>
             <p className="dashboard-config-hint">
-              Save the current dashboard layout (widgets, grid mode, columns, tag colors) under this name.
+              Saves widgets, grid mode, columns and tag colours.
             </p>
             <input
               autoFocus

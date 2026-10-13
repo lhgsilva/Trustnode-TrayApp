@@ -28,12 +28,13 @@ from __future__ import annotations
 import hmac
 import hashlib
 import json
+import os
 import logging
 import secrets
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request, Depends
+from fastapi import APIRouter, Body, HTTPException, Query, Request, Depends
 from pydantic import BaseModel
 
 from app.state import app_store
@@ -423,6 +424,58 @@ def _lite_capabilities(session: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+@router.get("/config")
+def get_lite_config(request: Request, tenant_id: str = "") -> dict:
+    """The Lite surface's own configuration, resolved from the PORTAL.
+
+    2026-10-13, owner's design: "webclient / lite version also in the future
+    can be moved/migrated to a different provider". Today /lite/config.json is
+    a static file pushed to the web root over SSH
+    (scripts/write_lite_config_to_vps.py), so moving the Lite backend means
+    hand-editing a file on every host that serves it - which is not a
+    migration path, it is a chore that gets forgotten.
+
+    This serves the same shape from cp_infrastructure_config, which the portal
+    already edits (Portal -> Infrastructure) per tenant with a global default.
+    nginx can then proxy /lite/config.json here; the static file stays as the
+    offline fallback for an edge with no control plane.
+
+    The anon key is deliberately included: it is a PUBLIC key (it is already
+    served in config.json by design, and Supabase RLS is what protects the
+    data). The service key is never exposed here.
+    """
+    endpoints: dict = {}
+    try:
+        from app.state import control_plane_store as _cp
+        endpoints = _cp.resolve_infrastructure_endpoints(
+            tenant_id=str(tenant_id or "").strip() or None) or {}
+    except Exception:
+        # No control plane reachable: fall through to the environment so a
+        # standalone edge still serves a usable Lite config.
+        endpoints = {}
+
+    def _pick(key: str, *env_names: str) -> str:
+        val = str(endpoints.get(key) or "").strip()
+        if val:
+            return val
+        for name in env_names:
+            v = str(os.environ.get(name) or "").strip()
+            if v:
+                return v
+        return ""
+
+    return {
+        "ok": True,
+        "source": "control_plane" if endpoints else "environment",
+        "supabase_url": _pick("supabase_url", "TRUSTNODE_SUPABASE_URL"),
+        "supabase_anon_key": str(os.environ.get("TRUSTNODE_SUPABASE_ANON_KEY") or "").strip(),
+        "cloud_api_url": _pick("cloud_api_url", "TRUSTNODE_CONTROL_PLANE_URL"),
+        "lite_url": _pick("lite_url"),
+        "web_client_url": _pick("web_client_url"),
+        "tenant_id": str(tenant_id or "").strip(),
+    }
+
+
 @router.get("/capabilities")
 def get_capabilities(request: Request, token: str = "") -> dict:
     """Feature flags for the Lite surface, derived from the licence and the
@@ -613,17 +666,92 @@ def get_lite_reports(request: Request, limit: int = 100, token: str = Query(defa
 
 @router.get("/reports/{generated_id}/file")
 def get_lite_report_file(generated_id: str, request: Request, inline: bool = True, token: str = Query(default="")):
-    _extract_session(request, token)
+    sess = _extract_session(request, token)
     from fastapi.responses import FileResponse
     from pathlib import Path as _P
     from app.state import reports_store
-    record = reports_store.get_generated(generated_id)
+    # Scoped by the SESSION's tenant, not by id alone. A generated id is a
+    # bare uuid in a URL; without this, one tenant's phone could fetch
+    # another's PDF from the same edge.
+    tenant_id = str(sess.get("tenant_id") or "default")
+    record = reports_store.get_generated(generated_id, tenant_id=tenant_id)
     if not record:
         raise HTTPException(status_code=404, detail="Report not found")
     path = _P(str(record.get("file_path") or ""))
-    if not path.exists():
-        raise HTTPException(status_code=410, detail="Report file is no longer on disk")
     disposition = "inline" if inline else "attachment"
     name = record.get("file_name") or path.name
+    if not path.exists():
+        # Not on THIS machine's disk. A phone on the LAN is talking to the
+        # edge that made the file, so it usually is; a browser on the cloud
+        # deployment never is. Serve the copy that was uploaded instead -
+        # this used to be a flat 410 and the web app could show no reports
+        # at all (2026-10-08).
+        from app.services.reports_cloud_uploader import fetch_pdf_from_storage
+        blob = fetch_pdf_from_storage(str(record.get("storage_path") or ""))
+        if blob:
+            from fastapi.responses import Response as _Resp
+            return _Resp(content=blob, media_type="application/pdf",
+                         headers={"Content-Disposition": f'{disposition}; filename="{name}"'})
+        raise HTTPException(
+            status_code=410,
+            detail="This report is not on this machine and has no cloud copy.")
     return FileResponse(str(path), media_type="application/pdf", filename=name,
                         headers={"Content-Disposition": f'{disposition}; filename="{name}"'})
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-29, operator: "from the web app from the cloud the reports are been
+# seen / downloaded and also can be generated using the templates. I am using
+# the webapp in the phone and is not available there."
+#
+# Lite could LIST reports and download a file, but it could not name a
+# template or make one, so the phone had nothing to generate FROM. These two
+# reads/writes mirror /api/reports/templates and
+# /api/reports/templates/{id}/generate, scoped to the session's tenant.
+# ---------------------------------------------------------------------------
+@router.get("/report-templates")
+def get_lite_report_templates(request: Request, token: str = Query(default="")) -> dict:
+    sess = _extract_session(request, token)
+    tenant_id = str(sess.get("tenant_id") or "default")
+    from app.state import reports_store
+    try:
+        rows = reports_store.list_templates(tenant_id=tenant_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500,
+                            detail=f"templates unavailable: {type(exc).__name__}: {exc}") from exc
+    # Only what a picker needs. The full definition is large and a phone has
+    # no use for it.
+    out = [{"id": r.get("id"), "name": r.get("name"),
+            "description": r.get("description") or "",
+            "updated_utc": r.get("updated_utc") or r.get("created_utc")}
+           for r in (rows or [])]
+    return {"ok": True, "rows": out, "source": "local_reports_store"}
+
+
+@router.post("/reports/generate")
+def post_lite_generate_report(request: Request, payload: dict = Body(default={}),
+                              token: str = Query(default="")) -> dict:
+    sess = _extract_session(request, token)
+    tenant_id = str(sess.get("tenant_id") or "default")
+    template_id = str((payload or {}).get("template_id") or "").strip()
+    if not template_id:
+        raise HTTPException(status_code=400, detail="template_id is required")
+    from app.state import reports_store
+    template = reports_store.get_template(template_id, tenant_id=tenant_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    try:
+        from app.services.report_renderer import render_template_to_pdf
+        path, byte_count, sha = render_template_to_pdf(template)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Render failed: {exc}") from exc
+    record = reports_store.insert_generated({
+        "template_id": template.get("id"),
+        "template_name": template.get("name"),
+        "triggered_by": "lite-manual",
+        "file_path": str(path),
+        "file_name": path.name,
+        "file_bytes": byte_count,
+        "file_sha256": sha,
+    })
+    return {"ok": True, "generated": record}

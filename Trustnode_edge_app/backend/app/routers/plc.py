@@ -657,6 +657,74 @@ def _discover_ab_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
                 seen: set[str] = set()
                 candidates: list[str] = []
 
+                # 2026-10-09, reported: a UDT made for a project - e.g.
+                # R1_TRUSTNODE_RESULTS with Work_Order, Check_List[10],
+                # Max_Temperature and the rest - showed up in the picker as
+                # ONE opaque row. Arrays were expanded (1096 of them) and
+                # struct MEMBERS never were, so the operator could not tick
+                # the member they actually wanted and had to type every
+                # path by hand into Manual Tag Entry.
+                #
+                # pycomm3 hands the members back under
+                # data_type["internal_tags"], keyed by member name, each
+                # with its own data_type and dimensions - so the same
+                # expansion the top level already does works recursively.
+                UDT_MAX_DEPTH = 3          # Base.Member.Sub is as deep as anyone reads
+                UDT_MAX_MEMBERS = 512      # per top-level tag, so one fat UDT cannot drown the list
+
+                #: AB models a STRING as a struct of LEN + DATA[82]. Expanding
+                #: that gives 83 useless rows per string and hides the members
+                #: that matter, so these are leaves.
+                _STRING_LIKE = {"STRING", "STRINGI"}
+
+                def _udt_members(td: dict) -> dict:
+                    """{member name: definition} for a struct, else {}."""
+                    dt = td.get("data_type")
+                    if isinstance(dt, dict):
+                        it = dt.get("internal_tags")
+                        if isinstance(it, dict):
+                            return it
+                    it = td.get("internal_tags")
+                    return it if isinstance(it, dict) else {}
+
+                def _type_name(td: dict) -> str:
+                    dt = td.get("data_type")
+                    if isinstance(dt, dict):
+                        return str(dt.get("name") or "").upper()
+                    return str(dt or td.get("data_type_name") or "").upper()
+
+                def _expand_struct(base: str, td: dict, depth: int = 0) -> list[str]:
+                    """Base.Member for every member, arrays included.
+
+                    Members whose names start with ZZZZZZZZZZ are Rockwell's
+                    internal padding - they are not something an operator
+                    ever wants to log.
+                    """
+                    if depth >= UDT_MAX_DEPTH:
+                        return []
+                    if _type_name(td) in _STRING_LIKE:
+                        return []
+                    out: list[str] = []
+                    for mname, mdef in (_udt_members(td) or {}).items():
+                        name = str(mname or "").strip()
+                        if not name or name.upper().startswith("ZZZZZZZZZZ"):
+                            continue
+                        if not isinstance(mdef, dict):
+                            continue
+                        path = "%s.%s" % (base, name)
+                        mdims = _array_dims(mdef)
+                        if mdims:
+                            out.extend(_enumerate_indexed_names(path, mdims))
+                        else:
+                            out.append(path)
+                            # Only a scalar member is worth descending into;
+                            # an array of structs would multiply out of hand
+                            # and the element path can be typed by hand.
+                            out.extend(_expand_struct(path, mdef, depth + 1))
+                        if len(out) >= UDT_MAX_MEMBERS:
+                            break
+                    return out[:UDT_MAX_MEMBERS]
+
                 def _is_struct(td: dict) -> bool:
                     tt = str(td.get("tag_type") or "").lower()
                     if tt == "struct":
@@ -690,6 +758,17 @@ def _discover_ab_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
                         seen.add(nm); candidates.append(nm)
                         if len(candidates) >= max_tags:
                             break
+                    # A SCALAR struct also offers its members. The bare name
+                    # was already emitted by _enumerate_indexed_names above
+                    # (dims is empty, so it returns [base]), and it stays -
+                    # reading the whole UDT at once is still legitimate.
+                    if is_struct and not dims and len(candidates) < max_tags:
+                        for nm in _expand_struct(base, td):
+                            if nm in seen:
+                                continue
+                            seen.add(nm); candidates.append(nm)
+                            if len(candidates) >= max_tags:
+                                break
                     if len(candidates) >= max_tags:
                         break
 
@@ -768,7 +847,13 @@ def _discover_ab_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
 
                 if good:
                     array_count = sum(1 for n in good if "[" in n and "]" in n)
-                    msg = f"Discovered {len(good)} valid AB tags from {path} (arrays expanded: {array_count})"
+                    member_count = sum(1 for n in good
+                                       if "." in n.split("]")[-1]
+                                       and not n.startswith("Program:"))
+                    msg = f"Discovered {len(good)} valid AB tags from {path} (arrays expanded: {array_count}"
+                    if member_count:
+                        msg += f"; UDT members: {member_count}"
+                    msg += ")"
                     if bad_count:
                         msg += f"; filtered {bad_count} unreadable tag(s)"
                     if partial:

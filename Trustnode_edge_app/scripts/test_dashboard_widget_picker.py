@@ -159,5 +159,37 @@ check("  power reads from the real supply tag",
       "lampState(latest.Master_Voltage" in ioblock)
 
 print()
+print("[the widget configuration keeps every field it collects]")
+# 2026-09-04: a consolidation that inlined the Series/Data Query and Axis
+# panels into the Configure tab was REVERTED - the splice deleted the
+# surrounding <section> and the Series card disappeared entirely, so the
+# operator could not configure a chart at all. The nested popups are back.
+#
+# What stays is the field assertion, which is the part that actually protects
+# the operator: a control that moves and quietly stops writing its field looks
+# exactly like the feature still working. This codebase has lost fields to
+# hand-written allowlists repeatedly.
+import re as _re                                          # noqa: E402
+DESIGNER = os.path.join(ROOT, "frontend", "src", "components", "Dashboard",
+                        "DashboardDesigner.jsx")
+_src = io.open(DESIGNER, encoding="utf-8", errors="replace").read()
+check("the Series card exists",
+      '<h4 className="wcfg-card-title">Series</h4>' in _src,
+      "it was deleted by a bad splice and the whole card vanished")
+check("  and so do Style and Chart",
+      _src.count('className="wcfg-card-title"') >= 3,
+      "%d cards" % _src.count('className="wcfg-card-title"'))
+_cfg = set(_re.findall(r"config:\s*\{\s*\.\.\.\s*p\.config,\s*([a-zA-Z_0-9]+)\s*:", _src))
+_cfg |= set(_re.findall(r"form\.config\?\.\s*([a-zA-Z_0-9]+)", _src))
+_cfg |= set(_re.findall(r"form\.config\.([a-zA-Z_0-9]+)", _src))
+check("every widget config field is still written", len(_cfg) >= 61,
+      "%d fields - a control that moved must not stop persisting" % len(_cfg))
+check("  including the series and axis ones",
+      {"series_extra", "chart_line_width", "query_group_interval",
+       "chart_value_format"} <= _cfg,
+      sorted({"series_extra", "chart_line_width", "query_group_interval",
+              "chart_value_format"} - _cfg) or "all present")
+
+print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))
 sys.exit(0 if not FAILS else 2)

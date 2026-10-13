@@ -155,11 +155,38 @@ const TABLE_HANDLERS = {
     // No /api/lite-local/logs endpoint yet — return empty.
     return { data: [], error: null };
   },
+  // 2026-09-29: these two were stubs. generated_reports returned [] with the
+  // note "reports queue is cloud-only", so the phone's Reporting page was
+  // permanently empty on a LAN link - reported as "reports are not available
+  // there". The edge has had them in its own reports_store all along.
+  //
+  // Rows are stamped with the scope's tenant_id because the view filters
+  // through scopedTo(pickedTenantId); the edge already scoped the query to
+  // the session's tenant, so this only satisfies the client-side gate.
   generated_reports: async () => {
-    // Reports queue is cloud-only; LAN slim Lite shows none for now.
-    return { data: [], error: null };
+    const sc = _scope() || {};
+    const tenant_id = String(sc.tenant_id || "default");
+    const res = await _localFetch("/api/lite-local/reports", { limit: 200 });
+    const rows = Array.isArray(res.data?.rows) ? res.data.rows : [];
+    return {
+      data: rows.map((r) => ({
+        ...r, tenant_id,
+        // No object storage on a LAN edge: the file comes straight from the
+        // edge, and the view uses this in place of a signed URL.
+        local_file_url: `/api/lite-local/reports/${encodeURIComponent(r.id)}/file`,
+      })),
+      error: res.error,
+    };
   },
   report_templates: async () => {
+    const sc = _scope() || {};
+    const tenant_id = String(sc.tenant_id || "default");
+    const res = await _localFetch("/api/lite-local/report-templates");
+    const rows = Array.isArray(res.data?.rows) ? res.data.rows : [];
+    if (rows.length || !res.error) {
+      return { data: rows.map((r) => ({ ...r, tenant_id })), error: res.error };
+    }
+    // Older edges have no /report-templates; bootstrap still carries them.
     const boot = await _localFetch("/api/lite-local/bootstrap");
     const r = boot.data?.data?.report_templates || { templates: [] };
     return { data: Array.isArray(r.templates) ? r.templates : [], error: boot.error };

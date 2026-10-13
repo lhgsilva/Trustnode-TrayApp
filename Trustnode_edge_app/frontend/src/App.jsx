@@ -27,6 +27,7 @@ import { defaultSelection as oeeDefaultSelection } from "./components/OEE/OeePer
 import { BatchOverviewV2Page, BatchDefinitionsV2Page, BatchAnalysisV2Page } from "./components/BatchManagement/BatchManagementV2";
 // Developer-admin: deployment endpoints (single source of truth for re-hosting).
 import InfrastructureEndpoints from "./components/ControlPlane/InfrastructureEndpoints";
+import ControlPlaneDatabase from "./components/ControlPlane/ControlPlaneDatabase";
 import RetentionPanel from "./components/Retention/RetentionPanel";
 // Remote Access page (plan 2026-08-21 §3.5) — replaces the LAN Sharing card.
 import { RemoteAccessPage } from "./components/RemoteAccess/RemoteAccessPage";
@@ -208,6 +209,7 @@ import {
   // 2026-09-02: renews the session token before it expires. Without it a
   // screen left open simply stopped working after four hours.
   scheduleSessionRefresh,
+  storedSessionBeyondRenewal,
   applyCollectionTriggers,
 } from "./api";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, ComposedChart, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
@@ -348,7 +350,115 @@ const DASHBOARD_TAG_COLORS_STORAGE_KEY = "trustnode_dashboard_tag_colors";
 const EMAIL_SETTINGS_STORAGE_KEY = "trustnode_email_settings";
 const DEFAULT_LOCAL_DB_BADGE_DISMISS_KEY = "trustnode_default_local_db_badge_dismissed";
 const EDGE_LINKED_STORAGE_KEY = "trustnode_edge_linked_local";
-const LOCAL_DB_ENGINES = new Set(["sqlite", "csv_file", "txt_file"]);
+const LOCAL_DB_ENGINES = new Set(["sqlite", "csv_file", "txt_file", "xlsx_file"]);
+// Engines that write a FILE rather than talk to a server. Kept in one place
+// so adding .xlsx did not mean hunting six separate inline comparisons.
+const FILE_SINK_ENGINES = new Set(["csv_file", "txt_file", "xlsx_file"]);
+const isFileEngine = (e) => FILE_SINK_ENGINES.has(String(e || ""));
+
+// ONE sink shape for every runtime that writes one. Hoisted out of
+// buildGatewayRuntimePayload on 2026-09-03 so power meters can send the
+// identical payload PLC gateways already send, instead of a second copy of
+// this field list quietly drifting from it.
+const toSink = (conn) => ({
+  id: conn.id || "",
+  name: conn.name || "",
+  engine: conn.engine,
+  host: conn.host || "",
+  port: Number(conn.port || 0),
+  database: conn.database || "",
+  username: conn.username || "",
+  password: conn.password || "",
+  sqlite_path: conn.sqlite_path || "",
+  file_path: conn.file_path || "",
+  legacy_url: conn.legacy_url || "",
+  legacy_api_token: conn.legacy_api_token || "",
+  source: conn.source || "",
+  site: conn.site || "",
+  area: conn.area || "",
+  equipment: conn.equipment || "",
+  schema: conn.schema || "public",
+  table: conn.table || "plc_readings",
+  tls: Boolean(conn.tls),
+  // CSV / TXT sinks can be scoped to specific tags + gateways so the
+  // operator can have ONE export file that captures, say, "all the
+  // OEE-relevant tags across every PLC". When empty, the sink keeps
+  // its legacy behaviour ("accept everything from every gateway it
+  // is attached to").
+  tag_filters: Array.isArray(conn.tag_filters)
+    ? conn.tag_filters.map((t) => String(t || "").trim()).filter(Boolean)
+    : [],
+  gateway_filters: Array.isArray(conn.gateway_filters)
+    ? conn.gateway_filters.map((g) => String(g || "").trim()).filter(Boolean)
+    : [],
+  // Custom CSV / TXT row template + optional header line. When
+  // csv_format is set, the backend uses it verbatim instead of
+  // the canonical column list. Lets the operator align the file
+  // with downstream tooling that expects a specific layout.
+  csv_format: String(conn.csv_format || ""),
+  csv_header: String(conn.csv_header || ""),
+  // The SECOND hand-written allowlist this value has to survive. The one
+  // above persists it; this one is what the running worker actually
+  // receives. A field added to only one of the two is saved and then
+  // ignored, which looks exactly like the feature not working.
+  export_interval_s: Number(conn.export_interval_s || 0) || 0,
+  rollover: String(conn.rollover || "none"),
+  // long = one row per reading; wide = one row per timestamp with a column
+  // per tag. A third allowlist would have dropped it, so it is listed here.
+  layout: String(conn.layout || "long"),
+  max_file_mb: Number(conn.max_file_mb || 0) || 0,
+});
+
+// Resolve the sinks a power meter should write to, and attach them to the
+// device the same way a PLC gateway receives them in its Start payload.
+//
+// 2026-09-03: the meter used to look its connections up itself, through
+// app_store.get_bootstrap() - which reads `config_documents`, the LEGACY
+// unscoped table. Database connections are saved to config_documents_scoped,
+// so the meter read a list last written in June that contained only "Local
+// SQLite". It could not see the operator's CSV export at all, and neither the
+// gateway_filters route NOR the older database_id route could ever have
+// worked. A PLC gateway has never had this problem because it does not read
+// config: the UI hands it resolved sinks. Meters now do the same.
+function powerConfigWithSinks(cfg, connections) {
+  if (!cfg || typeof cfg !== "object") return cfg;
+  const conns = Array.isArray(connections) ? connections : [];
+  const devices = Array.isArray(cfg.devices) ? cfg.devices : [];
+  if (!devices.length) return cfg;
+  return {
+    ...cfg,
+    devices: devices.map((d) => {
+      const deviceId = String(d?.id || "");
+      const chosen = [];
+      const seen = new Set();
+      const take = (conn) => {
+        const cid = String(conn?.id || "");
+        if (!conn || seen.has(cid)) return;
+        if (conn.enabled === false) return;
+        seen.add(cid);
+        chosen.push(toSink(conn));
+      };
+      // The connection this device names explicitly...
+      const named = conns.find((c) => String(c?.id || "") === String(d?.database_id || ""));
+      if (named) take(named);
+      // ...plus every file export whose scope covers this device.
+      //
+      // 2026-09-03: this required the device to be NAMED in gateway_filters.
+      // An EMPTY list means "all sources" everywhere else in the system -
+      // filter_rows treats it as accept-all - so an export left unscoped,
+      // which is the DEFAULT, attached to nothing. The TXT file stayed empty
+      // while its configuration looked entirely correct.
+      for (const conn of conns) {
+        if (!isFileEngine(String(conn?.engine || ""))) continue;
+        if (conn.use_gateway === false) continue;
+        const scope = Array.isArray(conn.gateway_filters) ? conn.gateway_filters : [];
+        if (!scope.length || scope.map(String).includes(deviceId)) take(conn);
+      }
+      return { ...d, sinks: chosen };
+    }),
+  };
+}
+
 const MAIN_LOCAL_SQLITE_FALLBACK_ID = "__main_local_sqlite__";
 const KNOWN_SUPABASE_DEFAULTS = {
   host: "aws-1-eu-west-1.pooler.supabase.com",
@@ -1579,13 +1689,36 @@ function sanitizeReportTemplates(rawTemplates) {
     }));
 }
 
+// What an operator should see for a database connection.
+//
+// 2026-10-02: "we should not show the detailed URL folder or db connection to
+// the users ... should be something like local or cloud without mentioning
+// the provider". A pooler hostname or a filesystem path in a dropdown is
+// noise to an operator and detail we would rather not put on a screen that
+// gets photographed. Display only - the stored id and name are untouched.
+function friendlyDbLabel(db) {
+  if (!db) return "";
+  const engine = String(db.engine || "").toLowerCase();
+  if (["csv_file", "txt_file", "xlsx_file"].includes(engine)) return "File export";
+  if (engine === "sqlite") return "Local database";
+  const host = String(db.host || "").toLowerCase();
+  const isLocal = !host || host === "localhost" || host.startsWith("127.")
+    || host.startsWith("192.168.") || host.startsWith("10.");
+  return isLocal ? "Local database" : "Cloud database";
+}
+
 function sanitizeScheduledReports(rawSchedules) {
   if (!Array.isArray(rawSchedules)) return [];
   return rawSchedules
     .filter((s) => s && typeof s === "object")
     .map((s, idx) => {
       const triggerMode = String(s.trigger_mode || "time").toLowerCase();
-      const mode = ["time", "tag", "both"].includes(triggerMode) ? triggerMode : "time";
+      // "cycle" MUST be listed here. This function is a hand-written allowlist:
+      // an unlisted mode is silently rewritten to "time" and the cycle fields
+      // below are dropped, so the feature would look configured and never run.
+      const mode = ["time", "tag", "both", "cycle"].includes(triggerMode) ? triggerMode : "time";
+      const stopLogic = String(s.stop_condition_logic || "all").toLowerCase() === "any" ? "any" : "all";
+      const stopConditions = Array.isArray(s.stop_conditions) ? s.stop_conditions : [];
       const logic = String(s.condition_logic || "all").toLowerCase();
       const conditionLogic = logic === "any" ? "any" : "all";
       const conditions = Array.isArray(s.tag_conditions)
@@ -1623,7 +1756,17 @@ function sanitizeScheduledReports(rawSchedules) {
         trigger_mode: mode,
         condition_logic: conditionLogic,
         tag_conditions: conditions,
+        stop_conditions: stopConditions,
+        stop_condition_logic: stopLogic,
+        id_tag: String(s.id_tag || ""),
+        segment_tag: String(s.segment_tag || ""),
+        segment_gateway: String(s.segment_gateway || ""),
+        file_name_pattern: String(s.file_name_pattern || ""),
         deliver_email: s.deliver_email !== false,
+        // 2026-10-11: a cycle must not re-open while its start condition is
+        // still true. Normalised here, not left to the spread, so a stored
+        // "false" string cannot read as true.
+        start_edge: s.start_edge !== false && String(s.start_edge) !== "false",
         enabled: s.enabled !== false,
         filters: normalizedFilters,
       };
@@ -3201,14 +3344,19 @@ function DirectoriesPage({ canEdit }) {
 
   return (
     <section className="card">
-      <h3 style={{ marginTop: 0 }}>Directories</h3>
-      <p className="muted">Pick where the app saves generated files. Defaults work for most installs; override per row if you need a shared network folder or a customer-specific path.</p>
+      {/* Operator 2026-10-02: this used a bare <h3> and a two-line paragraph,
+          so it read as a different app to every other page. Standard card
+          title, one line of help. */}
+      <h3 className="card-title">Directories</h3>
+      <p className="muted" style={{ margin: "0 0 4px", fontSize: 12 }}>
+        Where the app saves generated files. Override a row for a shared network folder.
+      </p>
       {folderPickerDesktopOnly || pickerNote ? (
         <div className="muted" style={{ fontSize: 12 }}>
           {pickerNote || `Folder picker and "Open": ${DESKTOP_ONLY_NOTE.toLowerCase()}. Type paths manually here.`}
         </div>
       ) : null}
-      <div className="table-scroll" style={{ marginTop: 12 }}>
+      <div className="table-scroll" style={{ marginTop: 8 }}>
         <div className="table directories-table">
           <div className="thead">
             <span>Folder</span>
@@ -3233,19 +3381,36 @@ function DirectoriesPage({ canEdit }) {
                   <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>{r.hint}</div>
                 </span>
                 <span>
+                  {/* r.honored === false means the writer for this kind of
+                      file resolves its own location, so a path typed here
+                      would be stored and never used. Show WHERE the files go
+                      and say the override is not wired, rather than taking a
+                      setting we would ignore (2026-10-02). */}
                   <input
                     style={{ width: "100%" }}
                     value={shownPath || ""}
                     onChange={(e) => setDraft((d) => ({ ...d, [r.key]: e.target.value }))}
-                    disabled={!canEdit}
+                    disabled={!canEdit || r.honored === false}
+                    readOnly={r.honored === false}
+                    title={r.honored === false
+                      ? "This is where these files go. Choosing a different folder for them is not wired up yet."
+                      : undefined}
                     placeholder={r.default_path}
                   />
-                  {r.is_overridden ? <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>default: {r.default_path}</div> : null}
+                  {r.honored === false ? (
+                    <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>
+                      location only — not yet changeable
+                    </div>
+                  ) : r.is_overridden ? (
+                    <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>default: {r.default_path}</div>
+                  ) : null}
                 </span>
                 <span>{statusBadge}</span>
                 <span className="row-actions" style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                   <button className="btn btn-secondary btn-sm" onClick={() => onOpen(r.key)} title="Open in file manager">Open</button>
-                  <button className="btn btn-secondary btn-sm" onClick={() => onPick(r.key)} disabled={!canEdit || folderPickerDesktopOnly} title={folderPickerDesktopOnly ? DESKTOP_ONLY_NOTE : "Pick a folder"}>Pick…</button>
+                  {r.honored === false ? null : (
+                    <button className="btn btn-secondary btn-sm" onClick={() => onPick(r.key)} disabled={!canEdit || folderPickerDesktopOnly} title={folderPickerDesktopOnly ? DESKTOP_ONLY_NOTE : "Pick a folder"}>Pick…</button>
+                  )}
                   {r.is_overridden ? (
                     <button className="btn btn-danger btn-sm" onClick={() => onReset(r.key)} disabled={!canEdit} title="Revert to default">Reset</button>
                   ) : null}
@@ -3837,10 +4002,25 @@ function AppShell() {
   // renews it well before expiry; this is the case where renewal itself was
   // refused, which is the only one the operator should ever have to see.
   const [sessionEnded, setSessionEnded] = useState(false);
+  // True once this run has had a signed-in user. It separates "the saved
+  // session was already dead when the app opened" (just show sign-in) from
+  // "the session died while I was working" (say so, offer Sign in again).
+  const hadLiveSessionRef = useRef(false);
 
   useEffect(() => {
-    scheduleSessionRefresh();
-    const onExpired = () => setSessionEnded(true);
+    // Nothing to renew if the saved session is already past saving; the
+    // restore effect clears it and the sign-in screen takes over.
+    if (!storedSessionBeyondRenewal()) scheduleSessionRefresh();
+    const onExpired = () => {
+      // "Your session has ended" is for a session that died WHILE the
+      // operator was working - they lose their place and want the banner's
+      // "Sign in again". On launch it is noise in front of a login screen.
+      if (!hadLiveSessionRef.current && storedSessionBeyondRenewal()) {
+        clearAuthToken();
+        return;
+      }
+      setSessionEnded(true);
+    };
     window.addEventListener("trustnode:session-expired", onExpired);
     return () => window.removeEventListener("trustnode:session-expired", onExpired);
   }, []);
@@ -3976,6 +4156,7 @@ function AppShell() {
     // IFM IO-Link (2026-08-24). Ignored entirely unless gateway_type is
     // "ifm_iolink"; defaults keep every existing gateway form unchanged.
     ifm_http_port: 80,
+    ifm_transport: "",
     ifm_use_https: false,
     ifm_verify_tls: false,
     ifm_username: "",
@@ -4098,6 +4279,11 @@ function AppShell() {
     upper_value: "",
     enabled: true
   });
+  // Has the operator actually picked tags? This cannot be inferred from the
+  // list being non-empty: unticking the last tag emptied the array, which
+  // flipped the list back to "all selected" and re-ticked every box. That is
+  // why the tags could not be unselected (reported 2026-09-29).
+  const [tagPickTouched, setTagPickTouched] = useState(false);
   const [dbForm, setDbForm] = useState({
     name: "",
     engine: "mysql",
@@ -4731,6 +4917,11 @@ function AppShell() {
     name: "",
     enabled: true,
     trigger_mode: "time",
+    stop_conditions: [],
+    stop_condition_logic: "all",
+    id_tag: "",
+    segment_tag: "",
+    file_name_pattern: "",
     recurrence: "daily",
     hour: "08",
     minute: "00",
@@ -5039,6 +5230,49 @@ function AppShell() {
     img.src = next;
   };
   const [devices, setDevices] = useState([]);
+
+  // Every source an export can be scoped to, not just PLC gateways.
+  //
+  // 2026-09-02, reported: the CSV connection's gateway chips and tag list were
+  // both empty. They were correct about gateway_configurations - the install
+  // had none - but its power meter was producing forty tags a second. A meter
+  // is configured under power_management_config, not as a gateway, so the
+  // export dialog could not see the only source there was, and "pick the
+  // gateways and tags you want to export" had nothing to offer.
+  //
+  // Declared next to the state it reads so it can never be referenced above
+  // its own definition (that TDZ mistake has put this page behind an error
+  // boundary before).
+  // NAMED apart from api.js's exportSources() on purpose: declaring a const
+  // with that name here SHADOWED the imported function, and the Data Export
+  // page - which is handed `exportSources` as an api callable - received this
+  // array instead and could not load its sources or filters (2026-09-02).
+  const exportScopeSources = useMemo(() => {
+    const out = (gatewayConfigs || []).map((g) => ({
+      id: g.id,
+      name: g.name || g.id,
+      kind: "gateway",
+      tags: (Array.isArray(g.tags) ? g.tags : [])
+        .map((t) => String(t?.tag_name || t?.name || "").trim())
+        .filter(Boolean),
+    }));
+    for (const d of (powerConfig?.devices || [])) {
+      const id = String(d?.id || "").trim();
+      if (!id) continue;
+      out.push({
+        id,
+        name: d?.name || id,
+        kind: "meter",
+        // The register map IS the meter's tag list. The _raw duplicates are
+        // the pre-scaling values and would double every row for no benefit.
+        tags: Object.keys(d?.registers || {})
+          .filter((k) => !String(k).endsWith("_raw"))
+          .sort(),
+      });
+    }
+    return out;
+  }, [gatewayConfigs, powerConfig]);
+
   const [showDeviceModal, setShowDeviceModal] = useState(false);
   const [editingDeviceId, setEditingDeviceId] = useState(null);
   const [deviceForm, setDeviceForm] = useState({
@@ -5107,6 +5341,10 @@ function AppShell() {
     return () => clearTimeout(t);
   }, []);
   const reconnectTimerRef = useRef(null);
+  //: Set when the live stream last failed to PARSE, so the banner it raises
+  //: can be taken down again by the next good packet instead of sitting
+  //: there for the rest of the session (2026-10-12).
+  const streamPayloadErrorRef = useRef(false);
   const fileSinkPickerRef = useRef(null);
   const footerRef = useRef(null);
   const historySeqRef = useRef(0);
@@ -5384,6 +5622,17 @@ function AppShell() {
                   message: `Could not reload configuration: ${String(err?.message || err)}` });
     }
   };
+
+  // The data-export page's API surface, built once. See the note at its
+  // mount site: as an inline literal this re-triggered the page's loader on
+  // every render of this component.
+  const dataExportApi = useMemo(() => ({
+    exportOptions,
+    exportSources,
+    exportPreview,
+    exportServerSide,
+    exportClientSide,
+  }), []);
 
   const applyAppStorePayload = (data) => {
     if (!data || typeof data !== "object") return;
@@ -6155,6 +6404,15 @@ function AppShell() {
     if (currentUser) return;
     let cancelled = false;
     const restoreAuthSession = async () => {
+      // A token that died while the app was closed is not an event worth
+      // reporting - it is just "sign in". Restoring the user from it is what
+      // produced a dashboard behind two red banners with every read failing
+      // (2026-10-09). Drop it here and the sign-in screen renders instead.
+      if (storedSessionBeyondRenewal()) {
+        clearAuthToken();
+        setCurrentUser(null);
+        return;
+      }
       try {
         const me = await getAuthMe();
         if (cancelled) return;
@@ -6174,6 +6432,7 @@ function AppShell() {
               : deriveModuleKeysFromPermissions(normalizePermissions(u.permissions || existingUser.permissions || {}, u.role || existingUser.role || "viewer"))),
         };
         setCurrentUser(matched);
+        hadLiveSessionRef.current = true;
         pageBootstrapGuardRef.current = true;
         if (!isPortalOnly) {
           // Always land on Dashboard on app boot regardless of where the
@@ -6215,6 +6474,7 @@ function AppShell() {
       modules: [],
     };
     setCurrentUser(readonlyUser);
+    hadLiveSessionRef.current = true;
     if (!users.length) setUsers([readonlyUser]);
   }, [isReadonlyCloudMode, currentUser, users.length]);
 
@@ -6722,6 +6982,30 @@ function AppShell() {
 
   useEffect(() => {
     let cancelled = false;
+    // RETRY UNTIL A READ SUCCEEDS (operator 2026-10-07: "startup needing to
+    // reload", "problems to load the templates", "problems with saving
+    // dashboard profiles").
+    //
+    // This effect used to run exactly ONCE. When the read failed - and at
+    // boot it often does, because the backend is still running deferred init
+    // against a multi-gigabyte store - the app kept React's initial empty
+    // state for the rest of the session. Three faults the operator sees as
+    // separate are all this one:
+    //   * the UI looks empty until you reload the window;
+    //   * report templates never arrive;
+    //   * nothing can be SAVED, because every saver is gated on
+    //     appStorePayloadEverHydratedRef (correctly - writing a document we
+    //     never read is what destroyed a rack of configuration on
+    //     2026-08-30), so dashboard profiles silently never persist.
+    // Reloading "fixed" it only because the second attempt met a warm
+    // backend.
+    //
+    // So: back off and keep trying until one read succeeds, then stop. The
+    // delay is capped at 15 s, which is well inside an operator's patience
+    // for a window they just opened and far cheaper than the full-bootstrap
+    // read it is waiting on.
+    let retryTimer = null;
+    let attempt = 0;
     const loadAppStore = async () => {
       try {
         const res = await getAppStoreBootstrap();
@@ -6764,8 +7048,18 @@ function AppShell() {
         if (!cancelled) {
           setConfigReadOk(false);
           setConfigReadError(String(err?.message || err || "unknown error"));
+          // ... and come back for it. 2s, 4s, 8s, then every 15s.
+          attempt += 1;
+          const delay = Math.min(15000, 2000 * Math.pow(2, attempt - 1));
+          retryTimer = setTimeout(() => {
+            if (!cancelled) loadAppStore();
+          }, delay);
         }
       } finally {
+        // Hydration is released either way: a backend that never answers must
+        // not leave the operator looking at a splash for ever. The SAVE lock
+        // is a separate flag (appStorePayloadEverHydratedRef) and stays shut
+        // until a read actually lands.
         if (!cancelled) setAppStoreHydrated(true);
       }
     };
@@ -6782,6 +7076,7 @@ function AppShell() {
     loadTenantCtx();
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
     };
   }, [isHostedWebClient]);
 
@@ -7413,12 +7708,39 @@ function AppShell() {
           : false;
       dashboardDomainPersistInFlightRef.current = true;
       try {
-        await saveAppStoreDomain("dashboard_configurations", payload, currentUser?.username || "system",
-                                 { allowEmpty: emptyIsIntentional });
+        const _res = await saveAppStoreDomain(
+          "dashboard_configurations", payload, currentUser?.username || "system",
+          { allowEmpty: emptyIsIntentional,
+            baseVersion: domainVersionsRef.current?.["dashboard_configurations"] });
+        // Adopt the version this write produced. Without this the SECOND
+        // consecutive save sends the version it read at boot, the server
+        // sees a newer one stored and refuses with 409 - so sending
+        // base_version without tracking the response would have turned one
+        // save per session into the only save per session. Same pattern as
+        // gateway_configurations / devices / database_configurations.
+        const _v = Number(_res?.result?.version);
+        if (Number.isFinite(_v)) {
+          domainVersionsRef.current = {
+            ...domainVersionsRef.current, "dashboard_configurations": _v };
+        }
         dashboardDomainLastPersistSignatureRef.current = signature;
         if (emptyIsIntentional) dashboardUserEmptiedRef.current = false;
-      } catch (_) {
-        // Keep UI responsive; bootstrap save loop remains fallback persistence path.
+      } catch (err) {
+        // SAY IT. This used to swallow the error with "bootstrap save loop
+        // remains fallback persistence path" - and that fallback no longer
+        // writes this domain, so a failed save meant the operator's
+        // dashboard profile was gone on the next start with nothing on
+        // screen to suggest it had not been saved (operator 2026-10-07:
+        // "problems with saving dashboard profiles").
+        //
+        // The signature is deliberately NOT recorded here, so the next
+        // change retries instead of believing this payload is stored.
+        addAppLog({ level: "error", category: "config",
+                    message: `Dashboard not saved: ${String(err?.message || err)}` });
+        setError(`Dashboard could not be saved: ${String(err?.message || err)}`);
+        // A 409 means this page is holding a stale version. Re-read so the
+        // next attempt is informed rather than refused again.
+        if (String(err?.message || "").includes("409")) reloadAppStoreConfig();
       } finally {
         dashboardDomainPersistInFlightRef.current = false;
       }
@@ -7742,7 +8064,10 @@ function AppShell() {
     if (powerConfigSaveTimerRef.current) clearTimeout(powerConfigSaveTimerRef.current);
     powerConfigSaveTimerRef.current = setTimeout(async () => {
       if (powerConfigPersistInFlightRef.current) return;
-      const payload = powerConfig && typeof powerConfig === "object" ? powerConfig : {};
+      const basePayload = powerConfig && typeof powerConfig === "object" ? powerConfig : {};
+      // Attach the resolved sinks before saving, so the running meter receives
+      // them instead of looking them up in a table it cannot see.
+      const payload = powerConfigWithSinks(basePayload, dbConnectionsRef.current);
       const signature = JSON.stringify(payload);
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       // Bug A guard: empty object before hydration is React initial state.
@@ -7790,7 +8115,10 @@ function AppShell() {
     return () => {
       if (powerConfigSaveTimerRef.current) clearTimeout(powerConfigSaveTimerRef.current);
     };
-  }, [appStoreHydrated, isHostedWebClient, currentUser, powerConfig]);
+  // dbConnections is a dependency because the saved payload now CARRIES the
+  // resolved sinks: editing a CSV export's scope or rate has to reach the
+  // meter, and it only does so when this re-runs.
+  }, [appStoreHydrated, isHostedWebClient, currentUser, powerConfig, dbConnections]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -8208,6 +8536,19 @@ function AppShell() {
           return;
         } catch (e) {
           if (cancelled) return;
+          // An ENDED SESSION is not a slow backend. Retrying a dead token six
+          // times and then reporting "Backend startup is delayed" is what the
+          // operator saw on every restart - the backend was up in 4.7 s, and
+          // the only way out was a reload. Say what is actually wrong and
+          // offer the way back.
+          if (e && e.sessionExpired) {
+            setSessionEnded(true);
+            setConfig({ ...FALLBACK_PLC_CONFIG });
+            setStatus({});
+            setBootState("degraded");
+            setError("");
+            return;
+          }
           failedAttempts += 1;
           setBootState("waiting_backend");
           setError(`Waiting for backend... ${String(e)}`);
@@ -8258,8 +8599,42 @@ function AppShell() {
         addAppLog({ level: "info", category: "connectivity", message: "WebSocket stream connected" });
       };
       ws.onmessage = (event) => {
+        // 2026-10-12, reported: a permanent "Invalid stream payload" banner
+        // with no way to dismiss it, while the dashboard kept updating.
+        //
+        // The try below used to start HERE and run for ~285 lines, wrapping
+        // the parse together with every alarm rule, trigger-state update and
+        // setState in the handler. So any ordinary JS fault in that code -
+        // a property read on an undefined rule, say - was reported as a bad
+        // payload, which is a lie: the payload parsed fine. And nothing ever
+        // cleared it, so one bad packet (or one bug) blamed the stream for
+        // the rest of the session.
+        //
+        // Parse alone decides whether the payload is valid.
+        let data;
         try {
-          const data = JSON.parse(event.data);
+          data = JSON.parse(event.data);
+        } catch (err) {
+          streamPayloadErrorRef.current = true;
+          setError("Invalid stream payload");
+          // Log WHAT could not be parsed. Without this the banner names a
+          // fault and destroys the only evidence of it, which is why this
+          // one went undiagnosed: `JSON.parse` failing on every packet and
+          // a JS fault in the handler looked identical (2026-10-12).
+          addAppLog({
+            level: "error",
+            category: "connectivity",
+            message: `Live stream payload did not parse: ${String(err?.message || err)} | starts: ${String(event?.data ?? "").slice(0, 200)}`
+          });
+          return;
+        }
+        // It parsed, so the banner above is no longer true. Only clear the
+        // one WE raised - an unrelated error must not be wiped by traffic.
+        if (streamPayloadErrorRef.current) {
+          streamPayloadErrorRef.current = false;
+          setError("");
+        }
+        try {
           if (data.status) setStatus(data.status);
           if (data.type === "error") {
             const gatewayId = String(data.gateway_id || "");
@@ -8542,8 +8917,16 @@ function AppShell() {
               }
             }
           }
-        } catch {
-          setError("Invalid stream payload");
+        } catch (err) {
+          // A fault in the handler, not in the payload. Log it as such -
+          // with the real message, so it is diagnosable - and leave the
+          // banner alone: the stream is healthy and the next packet will
+          // be processed normally.
+          addAppLog({
+            level: "error",
+            category: "connectivity",
+            message: `Live stream handler failed: ${String(err?.message || err)}`
+          });
         }
       };
       ws.onclose = () => {
@@ -9690,9 +10073,23 @@ function AppShell() {
       "power_overview",
       "power_configuration",
     ]);
-    if (!POWER_RELEVANT_PAGES.has(activePage)) {
-      return () => { stopped = true; };
-    }
+    // 2026-09-03, reported: "gateway status is not updating properly when it
+    // is paused or back running - it should be instant"; and it must be right
+    // "for the footer, gateway page and meter configuration".
+    //
+    // A meter's paused/running state comes from THIS poll, and it used to run
+    // on the two Power pages alone. Everywhere else the gateway row and the
+    // footer showed whatever was last fetched - so a meter that had resumed
+    // minutes ago still read COLLECTION PAUSED, and the footer, which is on
+    // every page, disagreed with the row above it.
+    //
+    // The Gateway page shows meter rows, so it polls at the same 1 s as the
+    // Power pages. Every other page still polls, slowly, because the footer
+    // is always visible - a stale badge there is what made the app look
+    // stuck. The original CPU concern was the 1 s cadence, not the request.
+    const METER_STATE_PAGES = new Set(["gateway_configuration"]);
+    const wantsFastPower = POWER_RELEVANT_PAGES.has(activePage)
+      || METER_STATE_PAGES.has(activePage);
     // Gate on module entitlement: non-admin users without the
     // power_overview module never reach Power pages anyway (the
     // sidebar hides them), but check explicitly to defend against
@@ -9703,7 +10100,7 @@ function AppShell() {
     // Idle (no meter connected) bumps cadence to ~5x the base
     // interval. Power-relevant pages run at 1 s base; nothing else
     // ever reaches this code now.
-    const basePollMs = 1000;
+    const basePollMs = wantsFastPower ? 1000 : 5000;
     pollPower();
     let idleSkipCounter = 0;
     const timer = setInterval(() => {
@@ -10015,6 +10412,26 @@ function AppShell() {
       );
     } catch (_) {}
   }, [powerViewMode, powerPeriod, powerInterval, powerAggregation, powerFilterMeterId, powerHistoricalFrom, powerHistoricalTo]);
+
+  // A CHANGE THE OPERATOR MADE IS NOT A BACKGROUND POLL.
+  //
+  // 2026-09-04, reported: "every time the unit is changed in the chart
+  // configuration or in the filters and interval selection it takes forever to
+  // update, and should be simple and fast for data analysis".
+  //
+  // The series fetch lives inside the 1 Hz poll behind an adaptive throttle -
+  // max(meter interval, 2x the last fetch cost), or 30 s when idle. That is
+  // right for a background refresh and wrong for a deliberate action: changing
+  // the unit only updated a ref, so the new selection waited for the next
+  // allowed fetch. Every endpoint the page uses answers in under 0.1 s
+  // (measured), so the wait was the throttle, not the data.
+  //
+  // Clearing the stamp makes the very next tick fetch, which is at most one
+  // poll interval away.
+  useEffect(() => {
+    powerHistoryLastFetchMsRef.current = 0;
+  }, [powerMainMetric, powerPeriod, powerInterval, powerAggregation,
+      powerFilterMeterId, powerViewMode]);
 
   // Time-of-use tariff resolver. Operator 2026-06-15: Overview cost
   // calculations should consume the configured tariffs, not a single
@@ -10334,6 +10751,12 @@ function AppShell() {
     } else {
       floor = auto[0];
     }
+    // The AREA's baseValue is this floor, not 0 (see the <Area> elements).
+    // 2026-09-04, reported: "it is using area chart wrong, it is being filled
+    // above the line and not below". Recharts fills between the line and its
+    // baseline; this meter reads NEGATIVE active power, so a baseline of 0
+    // sits ABOVE the trace and the fill ran upwards. Filling to the floor -
+    // which already includes zero - puts it under the line either way.
     return [floor, Number.isFinite(yMax) ? yMax : auto[1]];
   }, [powerMainChartData, powerChartSettings, powerMainChartType]);
   const powerMainXAxisTicks = useMemo(() => {
@@ -13342,7 +13765,7 @@ const getGatewayHealth = (gateway) => {
     const engine = String(dbConn.engine || "").toLowerCase();
     if (engine === "legacy_http") return String(dbConn.legacy_url || "-");
     if (engine === "sqlite") return String(dbConn.sqlite_path || "./data/trustnode_edge.db");
-    if (engine === "csv_file" || engine === "txt_file") return String(dbConn.file_path || "-");
+    if (isFileEngine(engine)) return String(dbConn.file_path || "-");
     return `${String(dbConn.host || "-")}:${String(dbConn.port || "-")}`;
   };
 
@@ -13570,9 +13993,13 @@ const getGatewayHealth = (gateway) => {
     if (gateway?.power_meter === true || String(gateway?.gateway_type || "") === "modbus_tcp_meter") {
       const did = String(gateway?.id || "");
       const st = powerDeviceStatuses?.[did] || {};
-      const baseSink = "Local SQLite (default)";
+      // "Local database", not the engine - the footer is read by operators,
+      // and a pooler hostname or a .db path there told them nothing
+      // (2026-10-02).
+      const baseSink = "Local database";
       const extraSinkId = String((powerConfig?.devices || []).find((d) => String(d?.id || "") === did)?.database_id || "");
-      const extraDb = extraSinkId ? (dbConnections.find((c) => String(c.id || "") === extraSinkId)?.name || "") : "";
+      const extraHit = extraSinkId ? dbConnections.find((c) => String(c.id || "") === extraSinkId) : null;
+      const extraDb = extraHit ? friendlyDbLabel(extraHit) : "";
       // Operator 2026-06-15: the footer used to label every error as
       // "ERROR" (DB write status), even when the failure was the
       // device's Modbus connection (no data to write). Discriminate:
@@ -13676,7 +14103,7 @@ const getGatewayHealth = (gateway) => {
     const total = dbConnections.length;
     const online = dbConnections.filter((d) => d.connection_ok).length;
     const offline = total - online;
-    const local = dbConnections.filter((d) => ["sqlite", "csv_file", "txt_file"].includes(String(d.engine || ""))).length;
+    const local = dbConnections.filter((d) => ["sqlite", "csv_file", "txt_file", "xlsx_file"].includes(String(d.engine || ""))).length;
     const cloud = dbConnections.filter((d) => ["postgresql", "mysql", "mssql", "influxdb", "legacy_http"].includes(String(d.engine || ""))).length;
     return { total, online, offline, local, cloud };
   }, [dbConnections]);
@@ -14075,12 +14502,22 @@ const getGatewayHealth = (gateway) => {
    * and will resume by itself the moment the condition is met.
    */
   const gatewayCollectionPaused = useMemo(() => {
+    // 2026-09-03, reported: "status shows paused on gateway window, but
+    // running on footer". This looked at PLC runtime statuses ALONE. An
+    // install whose only source is a power meter therefore had a footer that
+    // could never say Collection Paused - while anyGatewayRunning DID count
+    // meters, so the footer confidently said Running about the very gateway
+    // the page above it was showing as paused. One state, two readers, two
+    // answers.
     const blocked = Object.values(gatewayRuntimeStatuses || {})
       .filter((rt) => rt && rt.running === true && rt.collection_blocked === true);
-    if (!blocked.length) return null;
-    const reason = String(blocked[0]?.collection_block_reason || "").trim();
-    return { count: blocked.length, reason };
-  }, [gatewayRuntimeStatuses]);
+    const metersBlocked = Object.values(powerDeviceStatuses || {})
+      .filter((st) => st && st.enabled !== false && st.collection_blocked === true);
+    const all = [...blocked, ...metersBlocked];
+    if (!all.length) return null;
+    const reason = String(all[0]?.collection_block_reason || "").trim();
+    return { count: all.length, reason };
+  }, [gatewayRuntimeStatuses, powerDeviceStatuses]);
 
   // Keep dashboard/content layout stable when gateway footer is expanded.
   // Footer behaves as an overlay and should not reflow page content.
@@ -15152,51 +15589,13 @@ const getGatewayHealth = (gateway) => {
           table: "plc_readings",
         };
     }
-    const toSink = (conn) => ({
-      id: conn.id || "",
-      name: conn.name || "",
-      engine: conn.engine,
-      host: conn.host || "",
-      port: Number(conn.port || 0),
-      database: conn.database || "",
-      username: conn.username || "",
-      password: conn.password || "",
-      sqlite_path: conn.sqlite_path || "",
-      file_path: conn.file_path || "",
-      legacy_url: conn.legacy_url || "",
-      legacy_api_token: conn.legacy_api_token || "",
-      source: conn.source || "",
-      site: conn.site || "",
-      area: conn.area || "",
-      equipment: conn.equipment || "",
-      schema: conn.schema || "public",
-      table: conn.table || "plc_readings",
-      tls: Boolean(conn.tls),
-      // CSV / TXT sinks can be scoped to specific tags + gateways so the
-      // operator can have ONE export file that captures, say, "all the
-      // OEE-relevant tags across every PLC". When empty, the sink keeps
-      // its legacy behaviour ("accept everything from every gateway it
-      // is attached to").
-      tag_filters: Array.isArray(conn.tag_filters)
-        ? conn.tag_filters.map((t) => String(t || "").trim()).filter(Boolean)
-        : [],
-      gateway_filters: Array.isArray(conn.gateway_filters)
-        ? conn.gateway_filters.map((g) => String(g || "").trim()).filter(Boolean)
-        : [],
-      // Custom CSV / TXT row template + optional header line. When
-      // csv_format is set, the backend uses it verbatim instead of
-      // the canonical column list. Lets the operator align the file
-      // with downstream tooling that expects a specific layout.
-      csv_format: String(conn.csv_format || ""),
-      csv_header: String(conn.csv_header || ""),
-    });
     const primarySink = toSink(db);
     const parallelSinks = dbConnectionsRef.current
       .filter((conn) => conn && conn.id !== db.id)
       .filter((conn) => conn.enabled !== false && conn.use_gateway !== false)
       .filter((conn) => {
         const engine = String(conn.engine || "").toLowerCase();
-        return engine === "csv_file" || engine === "txt_file" || engine === "sqlite";
+        return isFileEngine(engine) || engine === "sqlite";
       })
       .map((conn) => toSink(conn));
     return {
@@ -16695,6 +17094,10 @@ const getGatewayHealth = (gateway) => {
           ? device.opc_node_ids.join(";")
           : device.opc_node_ids_text || device.opc_node_id || DEFAULT_OPC_NODE_ID,
       ifm_http_port: Number(device.ifm_http_port || 80),
+      // Bring the socket choice back into the form, or editing a saved
+      // fieldbus block would show no transport selector at all.
+      ifm_transport: String(device.ifm_transport
+        || (device.gateway_type === "ifm_iolink" ? "iot" : "")),
       notes: device.notes || ""
     });
     setDeviceTestResult(
@@ -17098,6 +17501,10 @@ const getGatewayHealth = (gateway) => {
         gateway_type: deviceForm.gateway_type,
         plc_ip: deviceForm.plc_ip.trim(),
         ifm_http_port: Number(deviceForm.ifm_http_port || 80),
+      // Which socket this ifm block is cabled to. Without it a
+      // fieldbus block is indistinguishable from any other
+      // EtherNet/IP device and the selector cannot come back.
+      ifm_transport: String(deviceForm.ifm_transport || ""),
         opc_url: deviceForm.opc_url.trim(),
         opc_node_id: deviceForm.opc_node_id.trim(),
         opc_node_ids: parseOpcNodeIds(deviceForm.opc_node_ids_text),
@@ -17170,9 +17577,41 @@ const getGatewayHealth = (gateway) => {
     setShowDeviceModal(false);
   };
 
+  // When a device picker opens the connection dialog to create a file export,
+  // this remembers who asked, so the new connection is selected for them on
+  // save. Requested 2026-09-02: "when selecting a new one, open a new popup
+  // window to also configure the CSV/TXT file to be exported" - creating it
+  // and then making the operator go back and pick it would be two steps for
+  // what reads as one.
+  const pendingSinkAssignRef = useRef(null);
+
+  // Defaults for a brand-new file export, so the popup opens ready to save
+  // instead of empty. The name is derived from the device it will serve.
+  const newFileSinkDefaults = (kind, label) => {
+    const ext = kind === "xlsx_file" ? ".xlsx" : kind === "txt_file" ? ".txt" : ".csv";
+    const safe = String(label || "export").replace(/[^A-Za-z0-9_-]+/g, "_");
+    return {
+      name: `${label || "Export"} ${ext.slice(1).toUpperCase()}`,
+      engine: kind,
+      file_path: `./data/${safe}${ext}`,
+      // A file export is a mirror, never the primary store.
+      // The REAL field names. These were use_for_gateway_data / use_for_app_config
+      // / use_for_backup, which exist nowhere - so a connection created from a
+      // device picker carried no role, and Save refused with "Select at least
+      // one role: Gateway, App, or Backup" with no obvious cause.
+      use_gateway: true,
+      use_app: false,
+      use_backup: true,
+      // Sensible rate so a 1 s source does not fill the file immediately.
+      export_interval_s: kind === "xlsx_file" ? 60 : 10,
+      rollover: kind === "xlsx_file" ? "daily" : "none",
+    };
+  };
+
   const openAddDbConnection = (scope = "gateway", overrides = null) => {
     if (!canEditPage("database")) return;
     setEditingDbId(null);
+    setTagPickTouched(false);   // a fresh dialog has made no choice yet
     setDbModalPresetScope(scope);
     const useGateway = scope === "gateway";
     const useApp = scope === "app";
@@ -17210,6 +17649,9 @@ const getGatewayHealth = (gateway) => {
   const openEditDbConnection = (conn) => {
     if (!canEditPage("database")) return;
     setEditingDbId(conn.id);
+    // An EXISTING connection already carries its choice in tag_filters, so
+    // the flag starts false and the saved list decides.
+    setTagPickTouched(false);
     setDbModalPresetScope("gateway");
     setDbForm({
       name: conn.name || "",
@@ -17262,7 +17704,7 @@ const getGatewayHealth = (gateway) => {
     setDbTestResult(null);
     const isLegacy = dbForm.engine === "legacy_http";
     const isSqlite = dbForm.engine === "sqlite";
-    const isFileSink = dbForm.engine === "csv_file" || dbForm.engine === "txt_file";
+    const isFileSink = isFileEngine(dbForm.engine);
     const host = dbForm.host.trim();
     const port = Number(dbForm.port);
     const normalizedUsername = normalizeSupabaseDirectUsername(
@@ -17348,7 +17790,7 @@ const getGatewayHealth = (gateway) => {
     const name = dbForm.name.trim();
     const isLegacy = dbForm.engine === "legacy_http";
     const isSqlite = dbForm.engine === "sqlite";
-    const isFileSink = dbForm.engine === "csv_file" || dbForm.engine === "txt_file";
+    const isFileSink = isFileEngine(dbForm.engine);
     const host = dbForm.host.trim();
     const port = Number(dbForm.port);
     const normalizedUsername = normalizeSupabaseDirectUsername(
@@ -17457,6 +17899,15 @@ const getGatewayHealth = (gateway) => {
         gateway_filters: Array.isArray(dbForm.gateway_filters)
           ? dbForm.gateway_filters.map((s) => String(s || "").trim()).filter(Boolean)
           : [],
+        // This object is a hand-written allowlist: a field missing here is
+        // dropped on save without a word, however carefully the dialog
+        // collected it. That has cost this codebase a day more than once,
+        // so the export rate and the workbook rollover are listed here the
+        // moment they exist.
+        export_interval_s: Number(dbForm.export_interval_s || 0) || 0,
+        rollover: String(dbForm.rollover || "none"),
+        layout: String(dbForm.layout || "long"),
+        max_file_mb: Number(dbForm.max_file_mb || 0) || 0,
         csv_format: String(dbForm.csv_format || ""),
         csv_header: String(dbForm.csv_header || ""),
         connection_ok: true,
@@ -17479,6 +17930,13 @@ const getGatewayHealth = (gateway) => {
           appStoreLastPersistSignatureRef.current = "";
         }
         setShowDbModal(false);
+        // Hand the new connection back to the picker that asked for it.
+        if (pendingSinkAssignRef.current === "power_device") {
+          setPowerDeviceForm((prev) => ({ ...(prev || {}), database_id: next.id }));
+        } else if (pendingSinkAssignRef.current === "gateway") {
+          setGatewayForm((prev) => ({ ...(prev || {}), database_id: next.id }));
+        }
+        pendingSinkAssignRef.current = null;
       } catch (err) {
         setDbConnections(prevConns);
         setDbTestResult({ ok: false, message: `Save failed: ${String(err)}` });
@@ -17489,8 +17947,7 @@ const getGatewayHealth = (gateway) => {
       !isLegacy &&
       (dbForm.engine === "postgresql" ||
         dbForm.engine === "sqlite" ||
-        dbForm.engine === "csv_file" ||
-        dbForm.engine === "txt_file");
+        isFileEngine(dbForm.engine));
     if (!needsProvision) {
       finalizeSave();
       return;
@@ -18194,6 +18651,18 @@ const getGatewayHealth = (gateway) => {
         name: "TXT Mirror",
         engine: "txt_file",
         file_path: "./data/trustnode_backup.txt",
+      });
+    } else if (mode === "xlsx") {
+      openAddDbConnection("backup", {
+        ...base,
+        name: "Excel Mirror",
+        engine: "xlsx_file",
+        file_path: "./data/trustnode_backup.xlsx",
+        // A workbook is rewritten on every save, so it rolls over daily and
+        // samples once a minute by default. Left at "every cycle" a 1 s
+        // gateway would rewrite the whole file 60 times a minute.
+        rollover: "daily",
+        export_interval_s: 60,
       });
     } else if (mode === "postgresql") {
       openAddDbConnection("backup", {
@@ -19438,6 +19907,11 @@ const getGatewayHealth = (gateway) => {
       name: "",
       enabled: true,
       trigger_mode: "time",
+      stop_conditions: [],
+      stop_condition_logic: "all",
+      id_tag: "",
+      segment_tag: "",
+      file_name_pattern: "",
       recurrence: "daily",
       hour: "08",
       minute: "00",
@@ -19532,14 +20006,17 @@ const getGatewayHealth = (gateway) => {
     }
   };
 
-  const addScheduleTagCondition = () => {
+  // 2026-09-29: these take the FIELD they edit, so a cycle schedule's STOP
+  // conditions reuse the same editor as its start conditions. Duplicating the
+  // block would have given two editors to keep in step.
+  const addScheduleTagCondition = (field = "tag_conditions") => {
     const defaultGateway = String(allGatewayOptions?.[0]?.id || "");
     const gatewayTags = Array.isArray(triggerTagsByGateway?.[defaultGateway]) ? triggerTagsByGateway[defaultGateway] : [];
     const defaultTag = String(gatewayTags?.[0] || "");
     setScheduleForm((prev) => ({
       ...prev,
-      tag_conditions: [
-        ...(Array.isArray(prev.tag_conditions) ? prev.tag_conditions : []),
+      [field]: [
+        ...(Array.isArray(prev[field]) ? prev[field] : []),
         {
           id: crypto.randomUUID(),
           gateway_id: defaultGateway,
@@ -19552,19 +20029,19 @@ const getGatewayHealth = (gateway) => {
     }));
   };
 
-  const updateScheduleTagCondition = (conditionId, patch) => {
+  const updateScheduleTagCondition = (conditionId, patch, field = "tag_conditions") => {
     setScheduleForm((prev) => ({
       ...prev,
-      tag_conditions: (Array.isArray(prev.tag_conditions) ? prev.tag_conditions : []).map((c) =>
+      [field]: (Array.isArray(prev[field]) ? prev[field] : []).map((c) =>
         String(c.id) === String(conditionId) ? { ...c, ...patch } : c
       ),
     }));
   };
 
-  const removeScheduleTagCondition = (conditionId) => {
+  const removeScheduleTagCondition = (conditionId, field = "tag_conditions") => {
     setScheduleForm((prev) => ({
       ...prev,
-      tag_conditions: (Array.isArray(prev.tag_conditions) ? prev.tag_conditions : []).filter((c) => String(c.id) !== String(conditionId)),
+      [field]: (Array.isArray(prev[field]) ? prev[field] : []).filter((c) => String(c.id) !== String(conditionId)),
     }));
   };
 
@@ -21456,6 +21933,7 @@ const getGatewayHealth = (gateway) => {
             toggleTheme={toggleTheme}
             onLoginSuccess={(user) => {
               setCurrentUser(user);
+              hadLiveSessionRef.current = true;
               setSessionEnded(false);
               // The new token has a life; start counting it down now rather
               // than discovering it ran out through failing pollers.
@@ -22019,7 +22497,19 @@ const getGatewayHealth = (gateway) => {
               </div>
             </div>
           ) : null}
-          {!isPortalOnly && error ? <div className="error">{error}</div> : null}
+          {!isPortalOnly && error ? (
+            <div className="error">
+              <span>{error}</span>
+              {/* 2026-10-12: "no way to dismiss this message". Every other
+                  banner on this page can be closed; this one could not, so
+                  a stale error covered the top of the app indefinitely. */}
+              <button type="button" className="banner-dismiss"
+                      title="Dismiss" aria-label="Dismiss"
+                      onClick={() => { streamPayloadErrorRef.current = false; setError(""); }}>
+                ×
+              </button>
+            </div>
+          ) : null}
           {/* Zombie-gateway banner. Operator request 2026-06-12:
               "the gateway stops, but still says it is running". We
               ONLY surface this for gateways that have been "running"
@@ -22485,7 +22975,49 @@ const getGatewayHealth = (gateway) => {
                   cloudEdge: edgeFilter,
                   preferCloud: preferCloudReads,
                 });
-                return Array.isArray(res?.rows) ? res.rows : [];
+                const raw = Array.isArray(res?.rows) ? res.rows : [];
+                // A ROW LIMIT IS NOT A TIME WINDOW.
+                //
+                // 2026-09-03, reported: historical "is not showing the data
+                // filtered by the historian range". /historian/range returns
+                // the NEWEST `limit` rows inside the window. A meter writing
+                // 80 rows/s fills 12 000 rows in about two and a half
+                // minutes, so asking for an hour returned its last two
+                // minutes - measured: a 30 min and a 60 min request both came
+                // back covering 18:40:49..18:42:58. The dates were honoured;
+                // the window simply could not fit.
+                //
+                // Hitting the cap is the signal. Re-ask for the SAME window
+                // bucketed in SQL, which returns points spread across the
+                // whole span (measured: 60 min -> 94 points, 0.43 s) instead
+                // of a dense slice of its tail. Same fix, same helper, as the
+                // Power Overview needed on 2026-08-26.
+                if (raw.length < limit) return raw;
+                const fromMs = Date.parse(fromUtc || "");
+                const toMs = Date.parse(toUtc || "");
+                const spanMs = (Number.isFinite(fromMs) && Number.isFinite(toMs))
+                  ? Math.max(0, toMs - fromMs) : 0;
+                // Only minute/hour/day exist; anything else silently becomes
+                // minute, which would put ONE point on a 60 s window.
+                const bucket = spanMs > 5 * 24 * 3600 * 1000 ? "day"
+                  : spanMs > 3 * 3600 * 1000 ? "hour" : "minute";
+                try {
+                  const agg = await getAppStoreHistorianAgg({
+                    bucket,
+                    fromUtc,
+                    toUtc,
+                    limit: 50000,
+                    cloudEdge: edgeFilter,
+                  });
+                  const aggRows = Array.isArray(agg?.rows) ? agg.rows : [];
+                  if (!aggRows.length) return raw;
+                  // The bucketed shape is the raw shape except that the tag
+                  // lives under `tag`. Rename it rather than teaching every
+                  // widget a second field name.
+                  return aggRows.map((r) => ({ ...r, tag_name: r.tag_name || r.tag }));
+                } catch (_) {
+                  return raw;   // bucketing failed: a truncated view beats none
+                }
               }}
               fetchWidgetRows={async ({ fromUtc, toUtc, limit = 2000, offset = 0, gateway = "", tag = "", timeoutMs, maxAttempts }) => {
                 const preferCloudReads = Boolean(isHostedWebClient && endpointMode === "cloud");
@@ -22964,7 +23496,7 @@ const getGatewayHealth = (gateway) => {
                             {powerChartSettings.main.show_total !== false ? (
                               <Area
                                 yAxisId="left"
-                                baseValue={0}
+                                baseValue={powerMainYDomain[0]}
                                 type={powerChartSettings.main.interpolation || "stepAfter"}
                                 dataKey="total"
                                 name="Total"
@@ -22988,6 +23520,7 @@ const getGatewayHealth = (gateway) => {
                                   stroke={(powerChartSettings.main.series_colors || {})[String(sr.key)] || getSeriesColor(idx)}
                                   fill={(powerChartSettings.main.series_colors || {})[String(sr.key)] || getSeriesColor(idx)}
                                   fillOpacity={0.1}
+                                  baseValue={powerMainYDomain[0]}
                                   strokeWidth={1.6}
                                   dot={false}
                                   isAnimationActive={false}
@@ -23968,8 +24501,9 @@ const getGatewayHealth = (gateway) => {
                       live (registers, wiring, CT/VT ratios, etc.). */}
                   {(Array.isArray(powerConfig?.devices) ? powerConfig.devices : []).map((d) => {
                     const did = String(d?.id || "");
-                    const dbName = (dbConnections.find((db) => String(db.id || "") === String(d?.database_id || ""))?.name)
-                      || "Local SQLite (default)";
+                    const dbName = friendlyDbLabel(
+                      dbConnections.find((db) => String(db.id || "") === String(d?.database_id || ""))
+                    ) || "Local database";
                     const st = powerDeviceStatuses?.[did] || {};
                     // Operator 2026-06-15: this row used to flip to
                     // RUNNING whenever d.enabled was true, regardless
@@ -23990,10 +24524,15 @@ const getGatewayHealth = (gateway) => {
                     const meterPaused = Boolean(enabledByOp && !hasError
                       && st?.collection_blocked);
                     const meterPauseReason = String(st?.collection_block_reason || "").trim();
+                    // An export that cannot be written. 2026-09-29: setting a
+                    // new file location silently stopped the logging, because
+                    // the failure was swallowed and never shown anywhere.
+                    const meterSinkError = String(st?.sink_error || "").trim();
                     const statusKey = !enabledByOp ? "warning" : hasError ? "offline"
-                      : meterPaused ? "warning" : "online";
+                      : meterPaused || meterSinkError ? "warning" : "online";
                     const statusText = !enabledByOp ? "STOPPED" : hasError ? "ERROR"
-                      : meterPaused ? "COLLECTION PAUSED" : "RUNNING";
+                      : meterPaused ? "COLLECTION PAUSED"
+                      : meterSinkError ? "EXPORT FAILING" : "RUNNING";
                     const tags = Object.keys(d?.registers || {}).filter((k) => !String(k).endsWith("_raw"));
                     return (
                       <div key={`gw-power-row-${did}`} className="trow">
@@ -24005,7 +24544,7 @@ const getGatewayHealth = (gateway) => {
                         <span>{`${configuredIntervalMs} ms`}</span>
                         <span>
                           <div className={`status-pill status-${statusKey}`}
-                               title={meterPauseReason || undefined}>{statusText}</div>
+                               title={meterPauseReason || meterSinkError || undefined}>{statusText}</div>
                           <div className="muted status-sub">{String(st?.last_error || "").slice(0, 40)}</div>
                         </span>
                         <span className="tags-cell">
@@ -24070,10 +24609,10 @@ const getGatewayHealth = (gateway) => {
                     // a friendly name. The gateway IS writing to the backend's local
                     // SQLite — show that, not a confusing dash.
                     const dbName = (() => {
+                      // "Local" / "Cloud", never a path or a pooler hostname.
                       const hit = dbConnections.find((db) => db.id === g.database_id);
-                      if (hit?.name) return hit.name;
-                      if (String(g.database_id || "") === "local-sqlite-default") return "Local SQLite";
-                      if (g.database_id) return "Local SQLite";  // fallback used by Start path
+                      if (hit) return friendlyDbLabel(hit);
+                      if (g.database_id) return "Local database";
                       return "-";
                     })();
                     const deviceName = devices.find((d) => d.id === g.device_id)?.name || "-";
@@ -24465,15 +25004,25 @@ const getGatewayHealth = (gateway) => {
                     </button>
                   </div>
                 </div>
-                <label className="remember-row" style={{ marginTop: 2 }}>
-                  <input
-                    type="checkbox"
-                    checked={dolibarrMirrorEnabled}
-                    onChange={(e) => setDolibarrMirrorEnabled(e.target.checked)}
-                    disabled={!isAdminDatabaseUser || !dolibarrCandidates.length}
-                  />
-                  <span className="remember-label">Enable Dolibarr mirror output</span>
-                </label>
+                {/* Operator 2026-10-02: "remove the legacy connectors from this
+                    page". The Dolibarr mirror is a legacy HTTP sink that no
+                    current install uses, and a permanently-disabled checkbox
+                    just raises questions. It is HIDDEN rather than deleted:
+                    the routing code behind it is validated and still shipping,
+                    so an install that really has a legacy_http connection
+                    keeps the control it needs to turn the mirror off. A fresh
+                    install never sees it. */}
+                {dolibarrCandidates.length ? (
+                  <label className="remember-row" style={{ marginTop: 2 }}>
+                    <input
+                      type="checkbox"
+                      checked={dolibarrMirrorEnabled}
+                      onChange={(e) => setDolibarrMirrorEnabled(e.target.checked)}
+                      disabled={!isAdminDatabaseUser}
+                    />
+                    <span className="remember-label">Enable Dolibarr mirror output (legacy)</span>
+                  </label>
+                ) : null}
                 {databaseInspector?.data_sync?.last_data_error ? (
                   <div className="error" style={{ marginTop: 8 }}>
                     {String(databaseInspector.data_sync.last_data_error)}
@@ -24692,12 +25241,12 @@ const getGatewayHealth = (gateway) => {
                     <div key={`overview-${c.id}`} className="trow">
                       <span className="db-cell" title={c.name}>{c.name}</span>
                       <span className="db-cell">{c.engine}</span>
-                      <span className="db-cell db-url-cell" title={c.engine === "legacy_http" ? c.legacy_url : c.engine === "sqlite" ? c.sqlite_path || "./data/trustnode_edge.db" : c.engine === "csv_file" || c.engine === "txt_file" ? c.file_path || "-" : `${c.host}:${c.port}`}>
+                      <span className="db-cell db-url-cell" title={c.engine === "legacy_http" ? c.legacy_url : c.engine === "sqlite" ? c.sqlite_path || "./data/trustnode_edge.db" : isFileEngine(c.engine) ? c.file_path || "-" : `${c.host}:${c.port}`}>
                         {c.engine === "legacy_http"
                           ? c.legacy_url
                           : c.engine === "sqlite"
                             ? c.sqlite_path || "./data/trustnode_edge.db"
-                            : c.engine === "csv_file" || c.engine === "txt_file"
+                            : isFileEngine(c.engine)
                               ? c.file_path || "-"
                               : `${c.host}:${c.port}`}
                       </span>
@@ -26017,7 +26566,10 @@ const getGatewayHealth = (gateway) => {
                       onChange={(e) => setEmailSettings((p) => ({ ...p, transport: e.target.value === "php_http" ? "php_http" : "smtp" }))}
                     >
                       <option value="smtp">SMTP</option>
-                      <option value="php_http">Dolibarr PHP API (Token Header)</option>
+                      {/* Kept selectable only where it is already in use. */}
+                      {emailSettings.transport === "php_http" ? (
+                        <option value="php_http">Dolibarr PHP API (legacy)</option>
+                      ) : null}
                     </select>
                   </label>
                 </div>
@@ -26274,118 +26826,7 @@ const getGatewayHealth = (gateway) => {
                   if (n?.type === "error") setError(String(n.message || ""));
                 }}
               />
-              <details className="legacy-scheduled-reports-fallback">
-                <summary>Legacy: old schedule editor (read-only)</summary>
-              <section className="page-tools">
-                <button className="btn btn-primary icon-text-btn" onClick={openScheduleCreate} disabled={!canEditPage("scheduled_reports")}>
-                  <AddIcon />
-                  <span>Add Schedule</span>
-                </button>
-              </section>
-              <section className="card card-fill">
-                <div className="table scheduled-table">
-                  <div className="thead">
-                    <span>Name</span><span>Trigger</span><span>Template</span><span>Format</span><span>Email</span><span>Last Run</span><span>Status</span><span>Actions</span>
-                  </div>
-                  {scheduledReports.map((s) => (
-                    <div key={s.id} className="trow">
-                      <span>{s.name}</span>
-                      <span>
-                        {String(s.trigger_mode || "time").toUpperCase()}
-                        {String(s.trigger_mode || "time") !== "tag"
-                          ? ` | ${s.recurrence} ${String(s.hour || "00").padStart(2, "0")}:${String(s.minute || "00").padStart(2, "0")}`
-                          : ""}
-                      </span>
-                      <span>{safeReportTemplates.find((t) => String(t.id) === String(s.template_id || ""))?.name || "-"}</span>
-                      <span>{String(s.format || "csv").toUpperCase()}</span>
-                      <span title={s.recipients}>
-                        {s.deliver_email === false ? "Disabled" : (s.recipients || emailSettings.report_recipients || "-")}
-                      </span>
-                      <span>{s.last_run_utc || "-"}</span>
-                      <span>
-                        <span className={`status-pill ${s.enabled ? "status-online" : "status-offline"}`}>{s.enabled ? "ENABLED" : "DISABLED"}</span>
-                      </span>
-                      <span className="row-actions">
-                        <button className="icon-btn table-action-btn icon-btn-start" onClick={() => runScheduledReportNow(s)} title="Run now"><StartIcon /></button>
-                        <button className="icon-btn table-action-btn" onClick={() => openEditScheduledReport(s)} title="Edit"><EditIcon /></button>
-                        <button className="icon-btn table-action-btn danger" onClick={() => removeScheduledReport(s.id)} title="Delete"><DeleteIcon /></button>
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </section>
-              <section className="card card-fill">
-                <h4 className="card-title">Generated Reports</h4>
-                <div className="scheduled-report-filter-row">
-                  <label>
-                    Search
-                    <input
-                      value={scheduledReportFilter.search}
-                      onChange={(e) => setScheduledReportFilter((p) => ({ ...p, search: e.target.value }))}
-                      placeholder="Name, summary, schedule..."
-                    />
-                  </label>
-                  <label>
-                    Format
-                    <select
-                      value={scheduledReportFilter.format}
-                      onChange={(e) => setScheduledReportFilter((p) => ({ ...p, format: e.target.value }))}
-                    >
-                      <option value="all">All</option>
-                      <option value="pdf">PDF</option>
-                      <option value="csv">CSV</option>
-                      <option value="txt">TXT</option>
-                    </select>
-                  </label>
-                  <label>
-                    Schedule
-                    <select
-                      value={scheduledReportFilter.schedule_id}
-                      onChange={(e) => setScheduledReportFilter((p) => ({ ...p, schedule_id: e.target.value }))}
-                    >
-                      <option value="all">All</option>
-                      {scheduledReports.map((row) => (
-                        <option key={`sf-${row.id}`} value={row.id}>{row.name}</option>
-                      ))}
-                    </select>
-                  </label>
-                </div>
-                <div className="table reporting-docs-table">
-                  <div className="thead">
-                    <span>Created</span><span>Source</span><span>Summary</span><span>Actions</span>
-                  </div>
-                  {safeReportDocuments
-                    .filter((doc) => {
-                      const search = String(scheduledReportFilter.search || "").trim().toLowerCase();
-                      const format = String(scheduledReportFilter.format || "all");
-                      const scheduleId = String(scheduledReportFilter.schedule_id || "all");
-                      if (format !== "all" && String(doc.format || "").toLowerCase() !== format) return false;
-                      if (scheduleId !== "all" && String(doc.schedule_id || "") !== scheduleId) return false;
-                      if (!search) return true;
-                      const sourceText = [
-                        String(doc.schedule_name || ""),
-                        String(doc.summary || ""),
-                        String(doc.generated_by || ""),
-                        String(doc.format || ""),
-                      ].join(" ").toLowerCase();
-                      return sourceText.includes(search);
-                    })
-                    .map((doc) => (
-                      <div key={`scheduled-doc-${doc.id}`} className="trow">
-                        <span>{doc.created_utc ? fmtTs(doc.created_utc) : "-"}</span>
-                        <span>{doc.schedule_name || (doc.triggered_by === "scheduler" ? "Scheduler" : "Manual")}</span>
-                        <span className="db-cell" title={doc.summary}>{doc.summary}</span>
-                        <span className="row-actions">
-                          <button className="icon-btn table-action-btn" onClick={() => openReportPreview(doc)} title="Preview"><PreviewIcon /></button>
-                          <button className="icon-btn table-action-btn" onClick={() => downloadReportPdf(doc)} title="Download PDF"><PdfIcon /></button>
-                          <button className="icon-btn table-action-btn" onClick={() => downloadReportCsv(doc)} title="Download Data"><CsvIcon /></button>
-                          <button className="icon-btn table-action-btn danger" onClick={() => removeReportDocument(doc.id)} title="Delete"><DeleteIcon /></button>
-                        </span>
-                      </div>
-                    ))}
-                </div>
-              </section>
-              </details>
+              
             </>
           ) : null}
 
@@ -27112,13 +27553,11 @@ const getGatewayHealth = (gateway) => {
 
           {activePage === "data_export" ? (
             <DataExportPage
-              api={{
-                exportOptions,
-                exportSources,
-                exportPreview,
-                exportServerSide,
-                exportClientSide,
-              }}
+              // Stable identity. An inline object literal here is a NEW prop
+              // on every App render, and the page keyed its data-loading
+              // effect on it - so the pickers re-fetched continuously and
+              // never settled (2026-10-08).
+              api={dataExportApi}
               // Local edge streams from SQLite; a cloud client pages it here.
               // The operator's rule, 2026-08-31.
               isCloudClient={Boolean(isHostedWebClient && endpointMode === "cloud")}
@@ -28342,7 +28781,13 @@ const getGatewayHealth = (gateway) => {
                   ) : null}
 
                   {cpPortalPage === "infrastructure" ? (
-                    <InfrastructureEndpoints tenantOptions={cpTenants} defaultTenant={getControlPlaneTenantScope?.() || ""} />
+                    <>
+                      <InfrastructureEndpoints tenantOptions={cpTenants} defaultTenant={getControlPlaneTenantScope?.() || ""} />
+                      {/* Where the portal itself keeps customers, licences
+                          and users. Sits beside the endpoints because both
+                          answer "where does this deployment live" (2026-10-13). */}
+                      <ControlPlaneDatabase />
+                    </>
                   ) : null}
 
                   {cpPortalPage === "interface" ? (
@@ -28938,235 +29383,7 @@ const getGatewayHealth = (gateway) => {
                   if (n?.type === "error") setError(String(n.message || ""));
                 }}
               />
-              <details className="legacy-reporting-fallback">
-                <summary>Legacy: ad-hoc filter-based reports</summary>
-              <div className="reporting-workspace reporting-workspace-40-60">
-                <div className="reporting-left">
-                  <section className="card">
-                    <h4 className="card-title">Report Filters</h4>
-                    <div className="reporting-filter-grid">
-                      <label>
-                        From
-                        <input type="datetime-local" value={reportFilters.from} onChange={(e) => setReportFilters((p) => ({ ...p, from: e.target.value }))} />
-                      </label>
-                      <label>
-                        To
-                        <input type="datetime-local" value={reportFilters.to} onChange={(e) => setReportFilters((p) => ({ ...p, to: e.target.value }))} />
-                      </label>
-                      <label className="reporting-max-rows">
-                        Max Rows
-                        <input type="number" min="200" step="200" value={reportFilters.max_rows} onChange={(e) => setReportFilters((p) => ({ ...p, max_rows: Number(e.target.value || 3000) }))} />
-                      </label>
-                      <label>
-                        Batch/Source
-                        <input value={reportFilters.batch} onChange={(e) => setReportFilters((p) => ({ ...p, batch: e.target.value }))} placeholder="Filter by batch/source" />
-                      </label>
-                      <label>
-                        Interval
-                        <select value={reportFilters.aggregation_interval || "raw"} onChange={(e) => setReportFilters((p) => ({ ...p, aggregation_interval: e.target.value }))}>
-                          <option value="none">None</option>
-                          <option value="raw">Raw</option>
-                          <option value="second">Second</option>
-                          <option value="minute">Minute</option>
-                          <option value="hour">Hour</option>
-                          <option value="day">Day</option>
-                        </select>
-                      </label>
-                      <label>
-                        Aggregation
-                        <select value={reportFilters.aggregation_method || "none"} onChange={(e) => setReportFilters((p) => ({ ...p, aggregation_method: e.target.value }))}>
-                          <option value="none">None</option>
-                          <option value="last">LAST</option>
-                          <option value="avg">AVG</option>
-                          <option value="sum">SUM</option>
-                          <option value="min">MIN</option>
-                          <option value="max">MAX</option>
-                        </select>
-                      </label>
-                    </div>
-                    <div className="reporting-select-row reporting-select-row-flat">
-                      <div className="report-check-group gateway-col">
-                        <div className="report-check-title">Gateways</div>
-                        <div className="report-check-list">
-                          {reportFilterOptions.gateways.map((g) => (
-                            <label key={`gw-${g.id}`} className="report-check-item gateway-check-item">
-                              <input type="checkbox" checked={isSelected(reportFilters.selected_gateway_ids, g.id)} onChange={() => toggleFilterSelection("selected_gateway_ids", g.id)} />
-                              <span>{g.name}</span>
-                            </label>
-                          ))}
-                        </div>
-                      </div>
-                      <div className="report-check-group tags-col">
-                        <div className="report-check-title">Tags + Axis + Color</div>
-                        <div className="report-check-list">
-                          {reportFilterOptions.tags.map((v) => (
-                            <div key={`tag-${v}`} className="report-check-item tag-check-item">
-                              <input type="checkbox" checked={isSelected(reportFilters.selected_tags, v)} onChange={() => toggleFilterSelection("selected_tags", v)} />
-                              <span>{formatTagForDisplay(v)}</span>
-                              <select value={getReportTagAxis(v)} onChange={(e) => setReportTagAxis(v, e.target.value)} title="Chart Y axis">
-                                <option value="left">Y-Left</option>
-                                <option value="right">Y-Right</option>
-                              </select>
-                              <input type="color" value={getReportTagColor(v, reportFilterOptions.tags.indexOf(v))} onChange={(e) => setReportTagColor(v, e.target.value)} title="Series color" />
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-                    <div className="reporting-actions-wide-row">
-                      <button className="btn btn-primary" onClick={() => loadReportingData()}>Load Data</button>
-                      <button className="btn btn-danger" onClick={() => createReportDocument("pdf")}>Generate PDF</button>
-                      <button className="btn btn-success" onClick={() => createReportDocument("csv")}>Generate CSV</button>
-                    </div>
-                  </section>
-
-                  <section className="card">
-                    <h4 className="card-title">Report Templates</h4>
-                    <div className="report-template-grid">
-                      <label>
-                        Template
-                        <select
-                          value={selectedReportTemplateId}
-                          onChange={(e) => {
-                            const nextId = String(e.target.value || "");
-                            setSelectedReportTemplateId(nextId);
-                            const nextTpl = safeReportTemplates.find((t) => String(t.id) === nextId);
-                            if (nextTpl) {
-                              setReportTemplateForm({
-                                name: String(nextTpl.name || ""),
-                                description: String(nextTpl.description || ""),
-                              });
-                            }
-                          }}
-                        >
-                          <option value="">Create New Template</option>
-                          {safeReportTemplates.map((tpl) => (
-                            <option key={tpl.id} value={tpl.id}>{tpl.name}</option>
-                          ))}
-                        </select>
-                      </label>
-                      <label>
-                        Template Name
-                        <input
-                          value={reportTemplateForm.name}
-                          onChange={(e) => setReportTemplateForm((p) => ({ ...p, name: e.target.value }))}
-                          placeholder="e.g. Daily Energy Summary"
-                        />
-                      </label>
-                      <label className="report-template-description">
-                        Description
-                        <input
-                          value={reportTemplateForm.description}
-                          onChange={(e) => setReportTemplateForm((p) => ({ ...p, description: e.target.value }))}
-                          placeholder="Optional description"
-                        />
-                      </label>
-                    </div>
-                    <div className="row report-template-actions">
-                      <button className="btn btn-primary" onClick={saveReportTemplate}>
-                        {selectedReportTemplateId ? "Update Template" : "Save Template"}
-                      </button>
-                      <button
-                        className="btn btn-success"
-                        onClick={() => {
-                          if (!activeTemplate) return;
-                          loadReportTemplateIntoFilters(activeTemplate);
-                        }}
-                        disabled={!activeTemplate}
-                      >
-                        Load Template
-                      </button>
-                      <button className="btn btn-primary" onClick={createNewTemplateDraft}>
-                        New
-                      </button>
-                      <button
-                        className="btn btn-danger"
-                        onClick={() => removeReportTemplate(selectedReportTemplateId)}
-                        disabled={!selectedReportTemplateId}
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </section>
-
-                  <section className="card card-fill">
-                    <h4 className="card-title">Generated Reports</h4>
-                    <div className="table-scroll fill-scroll">
-                      <div className="table reporting-docs-table">
-                        <div className="thead">
-                          <span>Created</span><span>By</span><span>Summary</span><span>Actions</span>
-                        </div>
-                        {safeReportDocuments.map((doc) => (
-                          <div key={doc.id} className="trow">
-                            <span>{doc.created_utc ? fmtTs(doc.created_utc) : "-"}</span>
-                            <span>{doc.generated_by || "-"}</span>
-                            <span className="db-cell" title={doc.summary}>{doc.summary}</span>
-                            <span className="row-actions">
-                              <button className="icon-btn table-action-btn" onClick={() => openReportPreview(doc)} title="Preview"><PreviewIcon /></button>
-                              <button className="icon-btn table-action-btn" onClick={() => downloadReportPdf(doc)} title="Download PDF"><PdfIcon /></button>
-                              <button className="icon-btn table-action-btn" onClick={() => downloadReportCsv(doc)} title="Download Data"><CsvIcon /></button>
-                              <button className="icon-btn table-action-btn danger" onClick={() => removeReportDocument(doc.id)} title="Delete"><DeleteIcon /></button>
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </section>
-                </div>
-
-                <div className="reporting-right">
-                  <section className="card reporting-main-card reporting-chart-card">
-                    <div className="row trend-header-row">
-                      <h4 className="card-title">Chart</h4>
-                      <button className="btn btn-primary btn-sm" type="button" onClick={toggleReportChartType}>
-                        {reportChartType === "bar" ? "Line" : "Bar"}
-                      </button>
-                    </div>
-                    <div className="muted report-summary">{reportSummaryText || "No data loaded yet. Apply filters and click Load Data."}</div>
-                    <div className="muted report-summary">{reportLoadedAt ? `Loaded: ${fmtTs(reportLoadedAt)} (${displayTimeZone})` : "-"}</div>
-                    <div className="chart-wrap reporting-chart-wrap">
-                      <ResponsiveContainer width="100%" height={300}>
-                        <ComposedChart data={reportingChartData} margin={{ top: 16, right: 26, left: 22, bottom: 26 }}>
-                          <XAxis dataKey="ts" />
-                          <YAxis yAxisId="left" width={64} domain={["auto", "auto"]} label={{ value: reportingAxisUnits.left || "Value", angle: -90, position: "insideLeft", offset: -4 }} />
-                          <YAxis yAxisId="right" orientation="right" width={64} domain={["auto", "auto"]} label={{ value: reportingAxisUnits.right || "", angle: 90, position: "insideRight", offset: -4 }} />
-                          <Tooltip />
-                          {reportSelectedTags.slice(0, 12).map((tag, idx) => {
-                            const color = getReportTagColor(tag, idx);
-                            if (reportChartType === "bar") {
-                              return (
-                                <Bar key={`rt-bar-${tag}`} isAnimationActive={false} yAxisId={getReportTagAxis(tag)} dataKey={tag} fill={color} fillOpacity={0.8} maxBarSize={18} />
-                              );
-                            }
-                            return (
-                              <Line key={`rt-line-${tag}`} isAnimationActive={false} type="linear" yAxisId={getReportTagAxis(tag)} dataKey={tag} stroke={color} strokeWidth={2} dot={false} />
-                            );
-                          })}
-                        </ComposedChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </section>
-
-                  <section className="card card-fill reporting-series-card">
-                    <h4 className="card-title">Data Series</h4>
-                    <div className="table-scroll fill-scroll reporting-table-side">
-                      <div className="table historian-table reporting-pivot-table">
-                        <div className="thead" style={{ gridTemplateColumns: `1.4fr repeat(${Math.max(1, reportSelectedTags.length)}, minmax(120px, 1fr))` }}>
-                          <span>Timestamp</span>
-                          {reportSelectedTags.map((t) => <span key={`rh-${t}`}>{formatTagForDisplay(t)}</span>)}
-                        </div>
-                        {reportPivotRows.map((row, idx) => (
-                          <div key={`rp-${idx}`} className="trow" style={{ gridTemplateColumns: `1.4fr repeat(${Math.max(1, reportSelectedTags.length)}, minmax(120px, 1fr))` }}>
-                            <span>{fmtTs(row.ts)}</span>
-                            {reportSelectedTags.map((t) => <span key={`rv-${idx}-${t}`}>{formatStandardValue(row[t], 3)}</span>)}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </section>
-                </div>
-              </div>
-              </details>
+              
             </div>
           ) : null}
           </div>
@@ -29221,13 +29438,24 @@ const getGatewayHealth = (gateway) => {
                   statusLabel = "Checking…";
                   statusClass = "status-warning";
                 } else {
-                  statusLabel = !health.ok && health.label
-                    && health.label !== "Stopped" && health.label !== "Running"
-                    ? health.label
-                    : (running ? "Running" : "Stopped");
-                  statusClass = !health.ok && statusLabel !== "Running" && statusLabel !== "Stopped"
+                  // A worker that is up but has not completed a reading cycle
+                  // yet is STARTING, not Running. The table above says exactly
+                  // that, and this footer used to say "Running" for the same
+                  // gateway at the same moment - one screen, two answers.
+                  // Same resolver the table above uses, so both read one source.
+                  const footerRt = resolveGatewayRuntimeStatus(g);
+                  const footerStarting = Boolean(running && footerRt?.starting);
+                  statusLabel = footerStarting
+                    ? "Starting…"
+                    : (!health.ok && health.label
+                       && health.label !== "Stopped" && health.label !== "Running"
+                       ? health.label
+                       : (running ? "Running" : "Stopped"));
+                  statusClass = footerStarting
                     ? "status-warning"
-                    : (running ? "status-online" : "status-offline");
+                    : (!health.ok && statusLabel !== "Running" && statusLabel !== "Stopped"
+                       ? "status-warning"
+                       : (running ? "status-online" : "status-offline"));
                 }
                 // Compute once per row to avoid calling the function twice
                 // (which was recording two samples per render into the rate ring).
@@ -30044,11 +30272,33 @@ const getGatewayHealth = (gateway) => {
                 Database Connection
                 <select
                   value={gatewayForm.database_id}
-                  onChange={(e) => setGatewayForm({ ...gatewayForm, database_id: e.target.value })}
+                  onChange={(e) => {
+                    const picked = String(e.target.value || "");
+                    // A gateway can export to a file INSTEAD of a database,
+                    // and creating that file is offered right here rather
+                    // than on another page.
+                    if (picked.startsWith("__new_")) {
+                      const kind = picked === "__new_txt__" ? "txt_file"
+                        : picked === "__new_xlsx__" ? "xlsx_file" : "csv_file";
+                      pendingSinkAssignRef.current = "gateway";
+                      openAddDbConnection("backup", {
+                        ...newFileSinkDefaults(kind, gatewayForm.name || "Gateway"),
+                        gateway_filters: [String(gatewayForm.id || "")].filter(Boolean),
+                        tag_filters: [],
+                      });
+                      return;
+                    }
+                    setGatewayForm({ ...gatewayForm, database_id: picked });
+                  }}
                   disabled={!canEditPage("gateway_configuration")}
-                  title="Where the gateway will log historian readings. Local SQLite is always available; external engines (Postgres / MySQL / file sinks) appear once configured on the Database page."
+                  title="Where the gateway will log historian readings. Local SQLite is always available; external engines (Postgres / MySQL / file exports) appear once configured on the Database page."
                 >
                   <option value="">Select database…</option>
+                  <optgroup label="Create a new file export">
+                    <option value="__new_csv__">New CSV file…</option>
+                    <option value="__new_txt__">New TXT file…</option>
+                    <option value="__new_xlsx__">New Excel workbook…</option>
+                  </optgroup>
                   {(() => {
                     // Operator 2026-06-25: ALWAYS include Local SQLite
                     // as an option. When bootstrap hasn't delivered a
@@ -30074,11 +30324,10 @@ const getGatewayHealth = (gateway) => {
                     // Group by engine so the picker scales when many DBs exist
                     // (Local SQLite at top, then engines, then file sinks).
                     const groups = [
-                      { label: "Local SQLite (recommended)", engines: ["sqlite"] },
-                      { label: "PostgreSQL", engines: ["postgres", "postgresql"] },
-                      { label: "MySQL / MariaDB", engines: ["mysql", "mariadb"] },
-                      { label: "SQL Server", engines: ["mssql", "sqlserver"] },
-                      { label: "File sinks (CSV / TXT)", engines: ["csv_file", "txt_file"] },
+                      { label: "Local", engines: ["sqlite"] },
+                      { label: "Cloud", engines: ["postgres", "postgresql", "mysql",
+                                                  "mariadb", "mssql", "sqlserver"] },
+                      { label: "File exports", engines: ["csv_file", "txt_file", "xlsx_file"] },
                     ];
                     const used = new Set();
                     const nodes = [];
@@ -30089,8 +30338,14 @@ const getGatewayHealth = (gateway) => {
                         <optgroup key={g.label} label={g.label}>
                           {rows.map((db) => {
                             used.add(String(db.id || ""));
-                            const tail = db.sqlite_path ? ` — ${db.sqlite_path}` : db.host ? ` — ${db.host}${db.port ? `:${db.port}` : ""}` : "";
-                            return <option key={db.id} value={db.id}>{db.name}{tail}</option>;
+                            // No path, no hostname: "local" or "cloud" is what
+                            // the operator needs, and the rest is detail we do
+                            // not want on screen.
+                            return (
+                              <option key={db.id} value={db.id}>
+                                {db.name} — {friendlyDbLabel(db)}
+                              </option>
+                            );
                           })}
                         </optgroup>
                       );
@@ -30911,21 +31166,32 @@ const getGatewayHealth = (gateway) => {
                   disabled={!canEditPage("devices")}
                 />
               </label>
-              {deviceForm.gateway_type === "ifm_iolink" ? (
+              {/* ONE sequence for both transports. 2026-09-04, reported: "the
+                  sequence to set both fieldbus and IoT is not the same, very
+                  difficult for the users to see when it is working or not".
+                  Choosing Fieldbus switched the device to gateway_type
+                  ethernet_ip, and this selector only rendered for ifm_iolink -
+                  so it VANISHED, there was no way back, and nothing said the
+                  device was still an ifm block. The selector also had
+                  value="iot" hard-coded, so it never showed the real state. */}
+              {(deviceForm.gateway_type === "ifm_iolink"
+                || (deviceForm.gateway_type === "ethernet_ip"
+                    && String(deviceForm.ifm_transport || "") === "fieldbus")) ? (
                 <label>
                   Connected via
                   <select
-                    value="iot"
+                    value={deviceForm.gateway_type === "ifm_iolink" ? "iot" : "fieldbus"}
                     onChange={(e) => {
-                      if (e.target.value !== "fieldbus") return;
-                      // Fieldbus is EtherNet/IP on 44818, which is a different
-                      // driver - not an ifm setting. Switching the type here
-                      // is what stops the block being configured for a port
-                      // it does not serve.
+                      // Fieldbus is EtherNet/IP on 44818 - a different driver,
+                      // not an ifm setting - so the TYPE changes with it. The
+                      // ifm_transport marker is what keeps this an ifm block
+                      // either way, and what lets the operator switch back.
+                      const toFieldbus = e.target.value === "fieldbus";
                       setDeviceForm({
                         ...deviceForm,
-                        gateway_type: "ethernet_ip",
-                        ifm_http_port: 0,
+                        gateway_type: toFieldbus ? "ethernet_ip" : "ifm_iolink",
+                        ifm_transport: toFieldbus ? "fieldbus" : "iot",
+                        ifm_http_port: toFieldbus ? 0 : (Number(deviceForm.ifm_http_port) || 80),
                       });
                     }}
                     disabled={!canEditPage("devices")}
@@ -30936,7 +31202,8 @@ const getGatewayHealth = (gateway) => {
                   <small className="hint">
                     Which socket the block is cabled to. A block on its fieldbus
                     socket serves no IoT Core, so it must be read over
-                    EtherNet/IP instead.
+                    EtherNet/IP instead. Switching back and forth is safe - the
+                    block stays an ifm device either way.
                   </small>
                 </label>
               ) : null}
@@ -31171,9 +31438,10 @@ const getGatewayHealth = (gateway) => {
             <div className="trigger-form-grid">
               <label>
                 Cloud Type
+                {/* Legacy HTTP is no longer offered for NEW connections
+                    (operator 2026-10-02). Existing ones keep working. */}
                 <select value={cloudDbPickerType} onChange={(e) => setCloudDbPickerType(e.target.value)} disabled={!isAdminDatabaseUser}>
                   <option value="supabase">Supabase (PostgreSQL)</option>
-                  <option value="dolibarr">Dolibarr (Legacy HTTP)</option>
                 </select>
               </label>
             </div>
@@ -31304,6 +31572,7 @@ const getGatewayHealth = (gateway) => {
                       <option value="sqlite">SQLite</option>
                       <option value="csv_file">CSV File</option>
                       <option value="txt_file">TXT File</option>
+                      <option value="xlsx_file">Excel Workbook (.xlsx)</option>
                       <option value="legacy_http">Legacy Trustnode API</option>
                     </select>
                   </label>
@@ -31430,7 +31699,7 @@ const getGatewayHealth = (gateway) => {
                     </div>
                   </section>
                 </>
-              ) : dbForm.engine === "csv_file" || dbForm.engine === "txt_file" ? (
+              ) : isFileEngine(dbForm.engine) ? (
                 <>
                   <section className="db-group">
                     <div className="db-group-title">File Sink</div>
@@ -31505,6 +31774,85 @@ const getGatewayHealth = (gateway) => {
                             : "Click the folder icon to choose a directory — the file name is generated from this connection's name and extension. You can still edit the final path before saving."}
                         </small>
                       </label>
+                      <label>
+                        Export rate
+                        <select
+                          value={String(dbForm.export_interval_s ?? 0)}
+                          onChange={(e) => setDbForm({ ...dbForm, export_interval_s: Number(e.target.value) })}
+                          disabled={!canEditPage("database")}
+                        >
+                          <option value="0">Every reading (no throttle)</option>
+                          <option value="1">Every 1 second</option>
+                          <option value="5">Every 5 seconds</option>
+                          <option value="10">Every 10 seconds</option>
+                          <option value="30">Every 30 seconds</option>
+                          <option value="60">Every minute</option>
+                          <option value="300">Every 5 minutes</option>
+                          <option value="900">Every 15 minutes</option>
+                          <option value="3600">Every hour</option>
+                        </select>
+                        <small className="muted">
+                          Writes the latest value of each tag once per period. A 1 s
+                          source with 40 tags left unthrottled writes 40 rows a second —
+                          about 3.5 million a day. This is a sample, not an average.
+                        </small>
+                      </label>
+                      <label>
+                        Row layout
+                        <select
+                          value={String(dbForm.layout || "long")}
+                          onChange={(e) => setDbForm({ ...dbForm, layout: e.target.value })}
+                          disabled={!canEditPage("database")}
+                        >
+                          <option value="long">One row per reading</option>
+                          <option value="wide">One row per timestamp, a column per tag</option>
+                        </select>
+                        <small className="muted">
+                          Wide puts the timestamp first and each tag in its own column,
+                          so one row holds every value from that moment. Tick the tags
+                          above to fix the column order; otherwise the tags present are
+                          used, sorted. A tag that arrives later does not fit the
+                          existing header, so the file is rotated and a new one started.
+                        </small>
+                      </label>
+                      <label>
+                        Start a new file
+                        <select
+                          value={String(dbForm.rollover
+                            || (dbForm.engine === "xlsx_file" ? "daily" : "none"))}
+                          onChange={(e) => setDbForm({ ...dbForm, rollover: e.target.value })}
+                          disabled={!canEditPage("database")}
+                        >
+                          <option value="none">Never — one single file</option>
+                          <option value="hourly">Every hour</option>
+                          <option value="daily">Every day</option>
+                          <option value="weekly">Every week</option>
+                          <option value="monthly">Every month</option>
+                          <option value="size">When it reaches a size</option>
+                        </select>
+                        <small className="muted">
+                          {dbForm.engine === "xlsx_file"
+                            ? "An .xlsx cannot be appended to — each write rewrites the whole workbook, so rolling over keeps every file small and limits what a failed save could damage."
+                            : "Keeps each file small enough to open. The finished file keeps its period in the name; the newest one is always the plain path above."}
+                        </small>
+                      </label>
+                      {String(dbForm.rollover || "") === "size" ? (
+                        <label>
+                          Maximum file size (MB)
+                          <input
+                            type="number"
+                            min="1"
+                            value={Number(dbForm.max_file_mb || 0) || ""}
+                            onChange={(e) => setDbForm({ ...dbForm, max_file_mb: Number(e.target.value) || 0 })}
+                            placeholder="50"
+                            disabled={!canEditPage("database")}
+                          />
+                          <small className="muted">
+                            The file is renamed aside with a timestamp once it passes this,
+                            and a fresh one starts. Nothing is deleted.
+                          </small>
+                        </label>
+                      ) : null}
                     </div>
                   </section>
                   {/* Tag + gateway scoping. Lets the operator point ONE
@@ -31525,7 +31873,12 @@ const getGatewayHealth = (gateway) => {
                       <label className="db-span-2">
                         Restrict to these gateways (optional)
                         <div className="db-tag-chip-grid">
-                          {gatewayConfigs.map((g) => {
+                          {exportScopeSources.length === 0 ? (
+                            <div className="muted" style={{ padding: 8 }}>
+                              No gateways or meters configured yet.
+                            </div>
+                          ) : null}
+                          {exportScopeSources.map((g) => {
                             const active = Array.isArray(dbForm.gateway_filters)
                               && dbForm.gateway_filters.includes(g.id);
                             return (
@@ -31542,6 +31895,7 @@ const getGatewayHealth = (gateway) => {
                                 disabled={!canEditPage("database")}
                               >
                                 {g.name || g.id}
+                                {g.kind === "meter" ? " (meter)" : ""}
                               </button>
                             );
                           })}
@@ -31559,12 +31913,10 @@ const getGatewayHealth = (gateway) => {
                           const allowedGws = (Array.isArray(dbForm.gateway_filters) && dbForm.gateway_filters.length)
                             ? new Set(dbForm.gateway_filters)
                             : null;
-                          const seen = new Map(); // tag -> [gateway names]
-                          for (const g of gatewayConfigs) {
+                          const seen = new Map(); // tag -> [source names]
+                          for (const g of exportScopeSources) {
                             if (allowedGws && !allowedGws.has(g.id)) continue;
-                            const tags = Array.isArray(g.tags) ? g.tags : [];
-                            for (const t of tags) {
-                              const name = String(t?.tag_name || t?.name || "").trim();
+                            for (const name of (g.tags || [])) {
                               if (!name) continue;
                               if (!seen.has(name)) seen.set(name, []);
                               seen.get(name).push(g.name || g.id);
@@ -31581,19 +31933,20 @@ const getGatewayHealth = (gateway) => {
                           const rows = [...seen.entries()].sort((a, b) => a[0].localeCompare(b[0]));
                           if (rows.length === 0) {
                             return <div className="muted" style={{ padding: 8 }}>
-                              No tags found — add tags to your gateway configurations first.
+                              No tags found — add tags to a gateway, or registers to a power meter, first.
                             </div>;
                           }
                           // If the operator has NEVER saved any filter, treat
                           // the list as "all selected" (legacy behaviour kept
                           // intact). The first interaction explicitly picks a
                           // subset which is then stored.
-                          const explicit = savedFilters.length > 0;
+                          const explicit = tagPickTouched || savedFilters.length > 0;
                           const isChecked = (tag) => explicit ? savedFilters.includes(tag) : true;
                           const toggle = (tag) => {
                             const cur = explicit ? [...savedFilters] : rows.map(([n]) => n);
                             const idx = cur.indexOf(tag);
                             if (idx === -1) cur.push(tag); else cur.splice(idx, 1);
+                            setTagPickTouched(true);
                             setDbForm({ ...dbForm, tag_filters: cur });
                           };
                           const allChecked = rows.every(([n]) => isChecked(n));
@@ -31601,15 +31954,19 @@ const getGatewayHealth = (gateway) => {
                             <>
                               <div className="row" style={{ gap: 6, margin: "4px 0 6px" }}>
                                 <button type="button" className="btn btn-sm btn-secondary"
-                                  onClick={() => setDbForm({ ...dbForm, tag_filters: rows.map(([n]) => n) })}
+                                  onClick={() => { setTagPickTouched(true);
+                                    setDbForm({ ...dbForm, tag_filters: rows.map(([n]) => n) }); }}
                                   disabled={!canEditPage("database")}>Select all</button>
                                 <button type="button" className="btn btn-sm btn-secondary"
-                                  onClick={() => setDbForm({ ...dbForm, tag_filters: [] })}
-                                  disabled={!canEditPage("database")}>Clear (= export every tag)</button>
+                                  onClick={() => { setTagPickTouched(true);
+                                    setDbForm({ ...dbForm, tag_filters: [] }); }}
+                                  disabled={!canEditPage("database")}>Unselect all</button>
                                 <span className="muted" style={{ marginLeft: 8 }}>
-                                  {explicit
-                                    ? `${savedFilters.length} of ${rows.length} selected`
-                                    : `${rows.length} tag${rows.length === 1 ? "" : "s"} discovered — all included by default`}
+                                  {!explicit
+                                    ? `${rows.length} tag${rows.length === 1 ? "" : "s"} discovered — all included by default`
+                                    : savedFilters.length === 0
+                                      ? "none ticked — every tag is exported. Tick some to narrow it."
+                                      : `${savedFilters.length} of ${rows.length} selected`}
                                 </span>
                               </div>
                               <div className="db-tag-checkbox-grid">
@@ -32314,6 +32671,11 @@ const getGatewayHealth = (gateway) => {
                 <label><span>Device ID</span><input value={powerDeviceForm.id} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, id: e.target.value })} /></label>
                 <label><span>Name</span><input value={powerDeviceForm.name} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, name: e.target.value })} /></label>
                 <label className="pwr-check"><input type="checkbox" checked={Boolean(powerDeviceForm.enabled)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, enabled: e.target.checked })} /><span>Enabled (start polling)</span></label>
+                {/* 2026-09-04: this meter reads -27 W at power factor -0.45 -
+                    wired backwards, not exporting. Integrating negative power
+                    gave a negative total kWh and a negative cost, so the Usage
+                    chart and Tariff panel had nothing to draw. */}
+                <label className="pwr-check"><input type="checkbox" checked={Boolean(powerDeviceForm.reverse_direction)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, reverse_direction: e.target.checked })} /><span>Reverse direction (meter wired backwards)</span></label>
                 <label><span>Description</span><input value={powerDeviceForm.description} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, description: e.target.value })} placeholder="optional note" /></label>
               </div>
             </div>
@@ -32331,17 +32693,41 @@ const getGatewayHealth = (gateway) => {
                 <span>Database Connection (optional)</span>
                 <select
                   value={powerDeviceForm.database_id || ""}
-                  onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, database_id: e.target.value })}
+                  onChange={(e) => {
+                    const picked = String(e.target.value || "");
+                    // Creating a file export is offered right here, because
+                    // "export this meter to a CSV" is one intention, not a
+                    // trip to the Databases page and back.
+                    if (picked.startsWith("__new_")) {
+                      const kind = picked === "__new_txt__" ? "txt_file"
+                        : picked === "__new_xlsx__" ? "xlsx_file" : "csv_file";
+                      pendingSinkAssignRef.current = "power_device";
+                      openAddDbConnection("backup", {
+                        ...newFileSinkDefaults(kind, powerDeviceForm.name || powerDeviceForm.id || "Meter"),
+                        // Pre-scope it to THIS meter, which is what the
+                        // operator meant by opening it from here.
+                        gateway_filters: [String(powerDeviceForm.id || "")].filter(Boolean),
+                        tag_filters: [],
+                      });
+                      return;
+                    }
+                    setPowerDeviceForm({ ...powerDeviceForm, database_id: picked });
+                  }}
                   title="Local SQLite historian always stores meter readings. Pick an extra connection to mirror the data to a file or external DB, just like a PLC gateway."
                 >
                   <option value="">Local SQLite (default — always written)</option>
+                  <optgroup label="Create a new file export">
+                    <option value="__new_csv__">New CSV file…</option>
+                    <option value="__new_txt__">New TXT file…</option>
+                    <option value="__new_xlsx__">New Excel workbook…</option>
+                  </optgroup>
                   {(() => {
                     const groups = [
                       { label: "PostgreSQL", engines: ["postgres", "postgresql"] },
                       { label: "MySQL / MariaDB", engines: ["mysql", "mariadb"] },
                       { label: "SQL Server", engines: ["mssql", "sqlserver"] },
                       { label: "Local SQLite (extra)", engines: ["sqlite"] },
-                      { label: "File sinks (CSV / TXT)", engines: ["csv_file", "txt_file"] },
+                      { label: "File exports (CSV / TXT / Excel)", engines: ["csv_file", "txt_file", "xlsx_file"] },
                     ];
                     const used = new Set();
                     const nodes = [];
@@ -33338,8 +33724,67 @@ const getGatewayHealth = (gateway) => {
                   <option value="time">Time</option>
                   <option value="tag">Tag Value</option>
                   <option value="both">Time + Tag Value</option>
+                  <option value="cycle">Cycle — start tag to stop tag</option>
                 </select>
+                {scheduleForm.trigger_mode === "cycle" ? (
+                  <small className="hint">
+                    One report per cycle, covering exactly the time between the start
+                    and stop conditions. Tag Value fires while its condition is true;
+                    a cycle fires once, when it ends.
+                  </small>
+                ) : null}
               </label>
+              {scheduleForm.trigger_mode === "cycle" ? (
+                <>
+                  <label>
+                    Test / cycle tag (optional)
+                    <select
+                      value={String(scheduleForm.segment_tag || "")}
+                      onChange={(e) => setScheduleForm((p) => ({ ...p, segment_tag: e.target.value }))}
+                    >
+                      <option value="">One segment for the whole run</option>
+                      {(Array.isArray(triggerTagsByGateway?.[
+                        String((scheduleForm.tag_conditions || [])[0]?.gateway_id || "")])
+                        ? triggerTagsByGateway[String((scheduleForm.tag_conditions || [])[0]?.gateway_id || "")]
+                        : []).map((t) => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                    <small className="hint">
+                      Divides the run into segments: every time this tag's value changes,
+                      the previous test or cycle closes and the next one opens. Report
+                      sections can then each cover a different one.
+                    </small>
+                  </label>
+                  <label>
+                    Report ID tag (optional)
+                    <select
+                      value={String(scheduleForm.id_tag || "")}
+                      onChange={(e) => setScheduleForm((p) => ({ ...p, id_tag: e.target.value }))}
+                    >
+                      <option value="">No ID tag</option>
+                      {(Array.isArray(triggerTagsByGateway?.[
+                        String((scheduleForm.tag_conditions || [])[0]?.gateway_id || "")]) 
+                        ? triggerTagsByGateway[String((scheduleForm.tag_conditions || [])[0]?.gateway_id || "")]
+                        : []).map((t) => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                    <small className="hint">
+                      Read when the cycle STARTS — a batch or serial number read at the
+                      end may already belong to the next part. It names the report.
+                    </small>
+                  </label>
+                  <label>
+                    File name pattern (optional)
+                    <input
+                      value={String(scheduleForm.file_name_pattern || "")}
+                      placeholder="{template}_{id}_{date}_{time}"
+                      onChange={(e) => setScheduleForm((p) => ({ ...p, file_name_pattern: e.target.value }))}
+                    />
+                    <small className="hint">
+                      Placeholders: {"{template} {id} {start} {end} {date} {time}"}.
+                      Leave empty to keep the generated id as the file name.
+                    </small>
+                  </label>
+                </>
+              ) : null}
               <label>
                 Recurrence
                 <select
@@ -33386,7 +33831,7 @@ const getGatewayHealth = (gateway) => {
                   <input type="number" min="1" max="31" value={scheduleForm.day_of_month} onChange={(e) => setScheduleForm((p) => ({ ...p, day_of_month: e.target.value }))} />
                 </label>
               ) : null}
-              {(String(scheduleForm.trigger_mode || "time") === "tag" || String(scheduleForm.trigger_mode || "time") === "both") ? (
+              {["tag", "both", "cycle"].includes(String(scheduleForm.trigger_mode || "time")) ? (
                 <>
                   <label>
                     Condition Logic
@@ -33397,7 +33842,8 @@ const getGatewayHealth = (gateway) => {
                   </label>
                   <div className="trigger-form-full-width">
                     <div className="row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                      <strong>Tag Trigger Conditions</strong>
+                      <strong>{scheduleForm.trigger_mode === "cycle"
+                        ? "Cycle START Conditions" : "Tag Trigger Conditions"}</strong>
                       <button className="btn btn-primary btn-sm" type="button" onClick={addScheduleTagCondition}>
                         Add Condition
                       </button>
@@ -33459,6 +33905,68 @@ const getGatewayHealth = (gateway) => {
                       })}
                     </div>
                   </div>
+                  {/* A cycle needs a STOP as well as a start. Same editor, other
+                      field - so the two cannot drift apart. */}
+                  {scheduleForm.trigger_mode === "cycle" ? (
+                    <div className="trigger-form-full-width">
+                      <div className="row" style={{ justifyContent: "space-between", alignItems: "center", margin: "12px 0 8px" }}>
+                        <strong>Cycle STOP Conditions</strong>
+                        <button className="btn btn-primary btn-sm" type="button"
+                          onClick={() => addScheduleTagCondition("stop_conditions")}>
+                          Add Stop Condition
+                        </button>
+                      </div>
+                      <label>
+                        Stop condition logic
+                        <select value={scheduleForm.stop_condition_logic || "all"}
+                          onChange={(e) => setScheduleForm((p) => ({ ...p, stop_condition_logic: e.target.value }))}>
+                          <option value="all">All must be true (AND)</option>
+                          <option value="any">Any can be true (OR)</option>
+                        </select>
+                      </label>
+                      <small className="hint">
+                        Leave empty and the cycle ends when the START condition stops
+                        being true.
+                      </small>
+                      <div className="scheduled-conditions-stack">
+                        {(Array.isArray(scheduleForm.stop_conditions) ? scheduleForm.stop_conditions : []).map((cond) => {
+                          const stopGw = String(cond.gateway_id || "");
+                          const stopTags = Array.isArray(triggerTagsByGateway?.[stopGw]) ? triggerTagsByGateway[stopGw] : [];
+                          return (
+                            <div key={cond.id} className="scheduled-condition-row">
+                              <select value={stopGw}
+                                onChange={(e) => updateScheduleTagCondition(cond.id, { gateway_id: String(e.target.value || ""), tag_name: "" }, "stop_conditions")}>
+                                {(allGatewayOptions || []).map((g) => (
+                                  <option key={g.id} value={g.id}>{g.name || g.id}</option>
+                                ))}
+                              </select>
+                              <select value={String(cond.tag_name || "")}
+                                onChange={(e) => updateScheduleTagCondition(cond.id, { tag_name: String(e.target.value || "") }, "stop_conditions")}>
+                                <option value="">Select a tag…</option>
+                                {stopTags.map((t) => <option key={t} value={t}>{t}</option>)}
+                              </select>
+                              <select value={String(cond.operator || ">=")}
+                                onChange={(e) => updateScheduleTagCondition(cond.id, { operator: e.target.value }, "stop_conditions")}>
+                                <option value=">=">&ge;</option>
+                                <option value="<=">&le;</option>
+                                <option value="==">=</option>
+                                <option value="!=">&ne;</option>
+                                <option value=">">&gt;</option>
+                                <option value="<">&lt;</option>
+                              </select>
+                              <input value={String(cond.value ?? "")} placeholder="Threshold"
+                                onChange={(e) => updateScheduleTagCondition(cond.id, { value: e.target.value }, "stop_conditions")} />
+                              <button className="icon-btn table-action-btn danger" type="button"
+                                title="Delete stop condition"
+                                onClick={() => removeScheduleTagCondition(cond.id, "stop_conditions")}>
+                                <DeleteIcon />
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : null}
                 </>
               ) : null}
               <label>

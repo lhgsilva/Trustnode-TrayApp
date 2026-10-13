@@ -608,10 +608,17 @@ function computeWidgetTextScale(widget, minPx, maxPx) {
   // backward compat with saved widgets. We multiply them together when
   // both are set so a divider with body_text_scale=1.5 inside a chart
   // template that also bumped text_font_scale=1.2 ends up at 1.8.
-  const bodyScale = Number(widget?.config?.body_text_scale);
-  const legacyScale = Number(widget?.config?.text_font_scale);
-  const scale = (Number.isFinite(bodyScale) ? bodyScale : 1)
-    * (Number.isFinite(legacyScale) ? legacyScale : 1);
+  // > 0, not merely finite. The editor stores these RAW while the operator
+  // types (clamped on blur), so a half-cleared field arrives here as "" -
+  // and Number("") is 0, which IS finite. That multiplied the scale to zero
+  // and rendered the widget's text at the 8px floor: present, correct, and
+  // unreadable. Treat anything non-positive as "not set" (2026-10-07).
+  const asScale = (raw) => {
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : 1;
+  };
+  const scale = asScale(widget?.config?.body_text_scale)
+    * asScale(widget?.config?.text_font_scale);
   const w = Number(widget?.w || 4);
   const h = Number(widget?.h || 3);
   const areaFactor = Math.max(0.75, Math.min(1.65, Math.sqrt(Math.max(1, (w * h) / 12))));

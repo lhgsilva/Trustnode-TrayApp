@@ -308,7 +308,85 @@ resumed = wait_for_rows(mark2 + 1, timeout_s=30.0)
 check("with no trigger, everything is collected again", resumed > mark2,
       "%d -> %d" % (mark2, resumed))
 
-call("POST", "/api/plc/gateways/stop", tok, {"gateway_id": GW})
+print()
+print("[paused freezes EVERYTHING - historian and charts]")
+# 2026-09-03, after watching it run: "when is not running the charts and
+# historian should be paused".
+#
+# A 2026-09-02 version did the opposite: it kept publishing live values while
+# withholding the historian write, so the charts scrolled on underneath a
+# COLLECTION PAUSED badge. That reads as the badge lying, not as a feature.
+# One meaning of paused - the row is withheld from everything - and the WS
+# stream still carries collection_block_reason so the UI can say WHY.
+def live_ts_for_tag():
+    _, body = call("GET", "/api/app-store/live?limit=2000", tok)
+    for r in ((body or {}).get("rows") or []):
+        if str(r.get("gateway_id")) == GW and str(r.get("tag")) == TAG:
+            return str(r.get("ts") or "")
+    return ""
+
+set_register(10)                       # below the threshold -> paused
+call("PUT", "/api/app-store/domain", tok, {
+    "domain": "triggers_limits", "actor": "test",
+    "payload": {"collection_triggers": [
+        {"gateway_id": GW, "tag_name": TAG, "operator": ">=", "value": 50,
+         "trigger_type": "continuous", "enabled": True, "kind": "tag"}],
+        "collection_trigger_mode": "any", "trigger_rules": []}})
+time.sleep(5)
+paused_rows, paused_live = row_count(), live_ts_for_tag()
+time.sleep(8)
+check("while paused the historian does NOT grow",
+      row_count() == paused_rows,
+      "%d row(s) leaked" % (row_count() - paused_rows))
+check("  and the live value does NOT move either",
+      live_ts_for_tag() == paused_live,
+      "%s -> %s : a chart that keeps scrolling under a PAUSED badge reads as "
+      "the badge being wrong" % (paused_live or "(none)", live_ts_for_tag() or "(none)"))
+
+set_register(75)                       # condition true again
+resumed_to = wait_for_rows(paused_rows + 1, timeout_s=30.0)
+check("  and BOTH resume when the condition is met", resumed_to > paused_rows,
+      "%d -> %d" % (paused_rows, resumed_to))
+
+call("PUT", "/api/app-store/domain", tok, {
+    "domain": "triggers_limits", "actor": "test",
+    "payload": {"collection_triggers": [], "collection_trigger_mode": "any",
+                "trigger_rules": []}})
+time.sleep(4)
+
+print("[a STOPPED gateway writes nothing at all]")
+# The operator's invariant, stated 2026-09-02: "the historian db also should
+# not log data if the gateway is stopped, or trigger condition not made".
+# Asserted here rather than assumed: a stopped gateway that keeps writing is
+# the same class of fault as a trigger that does not gate, and it would be
+# invisible in exactly the same way.
+#
+# Proven in this order deliberately - rows must be FLOWING first, or "no new
+# rows" passes for the wrong reason.
+set_register(75)                      # condition true, so only Stop can pause
+call("PUT", "/api/app-store/domain", tok, {
+    "domain": "triggers_limits", "actor": "test",
+    "payload": {"collection_triggers": [], "collection_trigger_mode": "any",
+                "trigger_rules": []}})
+flowing_from = row_count()
+flowing = wait_for_rows(flowing_from + 1, timeout_s=30.0)
+check("rows are flowing before the stop", flowing > flowing_from,
+      "%d -> %d" % (flowing_from, flowing))
+
+st, _ = call("POST", "/api/plc/gateways/stop", tok, {"gateway_id": GW})
+time.sleep(5)                          # let any in-flight cycle finish
+stopped_at = row_count()
+time.sleep(8)
+after_stop = row_count()
+check("a STOPPED gateway writes nothing", after_stop == stopped_at,
+      "%d row(s) written after Stop" % (after_stop - stopped_at))
+
+st, out2 = call("POST", "/api/plc/gateways/start", tok,
+                {"gateway_id": GW, "config": config})
+resumed = wait_for_rows(after_stop + 1, timeout_s=40.0)
+check("  and starts writing again when restarted", resumed > after_stop,
+      "%d -> %d" % (after_stop, resumed))
+
 print()
 print("[the energy meter obeys the same rule]")
 # 2026-09-02, reported after the first fix shipped: "the energy meter trigger
@@ -398,6 +476,34 @@ check("  and back to FALSE pauses it again",
 check("a rule for EM1 does NOT pause a different gateway",
       mgr.collection_allowed_now("gw-other")[0],
       "one verdict for the whole site paused machines the rule never named")
+
+print()
+print("[the paused state reaches the API the UI reads]")
+# 2026-09-02, found on the live install: the meter WAS correctly paused - zero
+# rows in 18 s with the condition false - but /api/power/status carried no
+# collection_blocked, so the Meters row still said RUNNING. A working gate is
+# indistinguishable from a dead meter if the operator cannot see it, and that
+# is why this was reported as "the trigger still is not working".
+#
+# The flag had been added to the per-cycle metrics dict; the API builds its
+# device status from a SEPARATE hand-written key list. Same allowlist trap as
+# the Start payload, twice in one day.
+pm_src = _io.open(os.path.join(ROOT, "backend", "app", "services",
+                               "power_manager.py"), encoding="utf-8",
+                  errors="replace").read()
+api_block = pm_src[pm_src.index('"writer_dropped_rows": int(metrics.get('):]
+api_block = api_block[:1400]
+check("the API's device status carries collection_blocked",
+      "collection_blocked" in api_block,
+      "the UI reads this dict; a field anywhere else never reaches it")
+check("  and the reason with it",
+      "collection_block_reason" in api_block)
+check("the paused flag is per DEVICE, not one shared string",
+      "_blocked_by_device" in pm_src,
+      "one flag would report one meter's pause on every meter")
+check("  it is cleared when that device resumes",
+      "_blocked_by_device.pop(" in pm_src,
+      "a flag that only ever gets set stays stuck on PAUSED for ever")
 
 print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))

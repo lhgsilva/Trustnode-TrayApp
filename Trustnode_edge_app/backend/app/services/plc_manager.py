@@ -16,6 +16,7 @@ from urllib.parse import quote_plus
 # for EVERY stop / error / restart from inside the worker.
 _GW_LOG = logging.getLogger("trustnode.gateway")
 
+from app.services import file_sinks as _file_sinks
 from app.models import GatewayConfig, GatewayReading, GatewayStatus
 from app.opcua_utils import resolve_requested_nodes, split_requested_identifiers
 from app.tenant import normalize_tenant_id
@@ -761,6 +762,13 @@ class GatewayWorker:
                     collection_allowed, block_reason = self._is_collection_allowed(readings)
                 self.collection_blocked = not collection_allowed
                 self.collection_block_reason = block_reason
+                # PAUSED MEANS NOTHING MOVES. 2026-09-03: "when is not
+                # running the charts and historian should be paused". A brief
+                # 2026-09-02 version published live values while withholding
+                # the historian write, so charts scrolled on under a
+                # COLLECTION PAUSED badge. The emit_event below still carries
+                # collection_block_reason, so the UI can say WHY it stopped -
+                # it just carries no new values.
                 _t_tel0 = time.monotonic()
                 if collection_allowed:
                     # Durable local commit is the definition of successful collection.
@@ -848,7 +856,14 @@ class GatewayWorker:
                         "edge_record_id": persisted_edge_record_id,
                         "collection_block_reason": self.collection_block_reason,
                         "status": self.get_status().model_dump(),
-                        "readings": [r.model_dump() for r in readings],
+                        # PAUSED MEANS NOTHING MOVES (2026-09-03). The event
+                        # itself still goes out - the UI needs the status and
+                        # the block reason to explain the pause - but it
+                        # carries NO readings, so a live chart stops where the
+                        # pause began instead of scrolling on underneath a
+                        # COLLECTION PAUSED badge.
+                        "readings": ([r.model_dump() for r in readings]
+                                     if collection_allowed else []),
                     }
                 )
                 _emit_ms = (time.monotonic() - _t_emit0) * 1000.0
@@ -3040,11 +3055,28 @@ class GatewayWorker:
             # the parallel sinks are best-effort mirrors.
             if self._sink_breaker_skip(sink_id):
                 continue
+            # 2026-09-02: a file sink can carry an export RATE. Without one
+            # it writes every cycle, which at a 1 s interval is a file nobody
+            # can open. The throttle keeps the LATEST value per tag and
+            # releases one row per tag per interval - a sample, not an
+            # average, because an average hides the spike the operator opened
+            # the file to find. Rate 0 (the default) passes everything
+            # through, so existing sinks are untouched.
+            sink_readings = readings
+            if sink_engine in ("csv_file", "txt_file", "xlsx_file"):
+                sink_readings = _file_sinks.due_rows(
+                    str(sink.get("id") or sink_label), sink, readings,
+                    key_of=lambda r: (self.gateway_id,
+                                      str(getattr(r, "tag_name", "") or "")))
+                if not sink_readings:
+                    continue
             try:
                 if sink_engine == "csv_file":
-                    self._persist_csv_file_for_sink(sink, readings)
+                    self._persist_csv_file_for_sink(sink, sink_readings)
                 elif sink_engine == "txt_file":
-                    self._persist_txt_file_for_sink(sink, readings)
+                    self._persist_txt_file_for_sink(sink, sink_readings)
+                elif sink_engine == "xlsx_file":
+                    self._persist_xlsx_file_for_sink(sink, sink_readings)
                 elif sink_engine == "sqlite":
                     if self._is_builtin_local_sqlite_sink(sink):
                         # Same rule as the primary path: the built-in Local SQLite
@@ -3393,6 +3425,46 @@ class GatewayWorker:
                 "ts_local", "ts_utc", "tag_name", "value", "value_text",
                 "quality", "quality_label", "source", "site", "area", "equipment",
             ))
+
+    def _persist_xlsx_file_for_sink(self, sink: Dict[str, Any], readings: List[GatewayReading]) -> bool:
+        """Append this cycle to the sink's Excel workbook.
+
+        Same scoping as the CSV sink. The workbook ROLLS OVER (hourly/daily/
+        monthly) because .xlsx is a zip and cannot be appended to - every
+        write rewrites the file - so a single ever-growing workbook would get
+        slower and could lose the whole history to one bad save. Rollover plus
+        the export rate keeps each rewrite small.
+        """
+        filtered = self._filter_readings_for_sink(sink, readings)
+        if not filtered:
+            return True
+        sink_label = str((sink or {}).get("name") or (sink or {}).get("id") or "xlsx_file")
+        try:
+            file_path = self._resolve_output_file_path(
+                (sink or {}).get("file_path") or "", "trustnode_log.xlsx")
+            rows = [
+                {
+                    "ts_utc": r.ts_utc,
+                    "gateway_id": self.gateway_id,
+                    "gateway_name": str(getattr(self.config, "name", "") or ""),
+                    "tag_name": r.tag_name,
+                    "value": r.value,
+                    "quality": r.quality,
+                    "quality_label": r.quality_label,
+                    "source": r.source,
+                }
+                for r in filtered
+            ]
+            _file_sinks.write_xlsx(file_path, rows,
+                                   str((sink or {}).get("rollover") or "daily"),
+                                   _utc_str_to_local_iso,
+                                   max_file_mb=(sink or {}).get("max_file_mb") or 0)
+            return True
+        except Exception as exc:
+            self._mark_db_write_error(
+                f"XLSX sink '{sink_label}' write failed: {type(exc).__name__}: {exc}"
+            )
+            return False
 
     def _persist_csv_file_for_sink(self, sink: Dict[str, Any], readings: List[GatewayReading]) -> bool:
         import csv

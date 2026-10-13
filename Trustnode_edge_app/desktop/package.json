@@ -25,7 +25,8 @@
     "concurrently": "^9.2.1",
     "cross-env": "^7.0.3",
     "electron": "^31.7.7",
-    "electron-builder": "^24.13.3"
+    "electron-builder": "^24.13.3",
+    "rcedit": "^5.0.2"
   },
   "build": {
     "appId": "com.trustnode.edge",

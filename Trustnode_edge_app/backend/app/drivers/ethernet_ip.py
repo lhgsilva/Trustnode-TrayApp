@@ -211,6 +211,24 @@ class EipSignal:
     scale: float = 1.0
     offset: float = 0.0
     unit: str = ""
+    # 2026-09-06: a BIT FIELD, in the IODD sense - `bit_offset` counts from the
+    # least significant bit of the whole assembly and `bit_length` is the
+    # field's width. Set bit_length and this path is used instead of
+    # byte_offset/kind.
+    #
+    # Why: an IO-Link sensor packs values that do not sit on byte boundaries.
+    # The SM9400 flow meter puts a 14-bit temperature and two output bits in
+    # ONE word - the temperature needs (word >> 2), which no combination of
+    # byte_offset, type, scale and offset can express. Faking it with
+    # scale=0.025 is right only while both outputs are off, and inverts the
+    # sign of any negative reading.
+    #
+    # The decoding itself is NOT reimplemented here: it is the same function
+    # the IoT path uses, which is pinned by a test against ifm's own worked
+    # example. Two implementations of a bit field is how they drift.
+    bit_offset: int = 0
+    bit_length: int = 0
+    signed: bool = False
 
     @staticmethod
     def from_dict(raw: Dict[str, Any]) -> "EipSignal":
@@ -222,11 +240,29 @@ class EipSignal:
             scale=float(raw.get("scale") if raw.get("scale") is not None else 1.0),
             offset=float(raw.get("offset") or 0.0),
             unit=str(raw.get("unit") or ""),
+            bit_offset=max(0, int(raw.get("bit_offset") or 0)),
+            bit_length=max(0, int(raw.get("bit_length") or 0)),
+            signed=bool(raw.get("signed")),
         )
 
 
 def decode_signal(data: bytes, sig: EipSignal) -> float | bool:
     """Read one signal out of an assembly buffer."""
+    if sig.bit_length > 0:
+        # Bit-field mapping. Delegated to the IoT path's decoder so both
+        # transports read an IO-Link record identically - the same sensor on
+        # the fieldbus socket and on the IoT socket must not give two answers.
+        from app.drivers.ifm_iolink import IfmField, decode_field
+        fld = IfmField(
+            name=sig.name, port=0,
+            bit_offset=sig.bit_offset, bit_length=sig.bit_length,
+            kind=("bool" if sig.bit_length == 1
+                  else "float32" if (sig.kind or "").upper() in ("REAL", "FLOAT32")
+                  else "int" if sig.signed else "uint"),
+            scale=sig.scale, offset=sig.offset, unit=sig.unit,
+        )
+        return decode_field(data.hex(), fld)
+
     kind = (sig.kind or "INT").upper()
     if kind not in CIP_TYPES:
         raise AssemblyDecodeError(f"signal '{sig.name}': unknown type {sig.kind!r}")

@@ -333,5 +333,21 @@ check("  ifm_datapoints is sent",
       "without it the ifm driver silently falls back to scanning by tag name")
 
 print()
+print("[one gateway, one status]")
+# 2026-10-02, reported: the table showed "STARTING..." while the footer
+# showed "Running" for the SAME gateway at the same moment. They answered
+# different questions - "is it running?" versus "is it running AND has it
+# read anything?" - with similar words, on one screen.
+_APP = io.open(os.path.join(ROOT, "frontend", "src", "App.jsx"),
+               encoding="utf-8", errors="replace").read()
+_footer = _APP.split("gateway-footer-title", 1)[-1][:6000]
+check("the footer uses the same runtime resolver as the table",
+      "resolveGatewayRuntimeStatus(g)" in _footer,
+      "it derived its pill from isGatewayRunning alone")
+check("  and shows Starting when the worker has not read yet",
+      "footerStarting" in _footer and "Starting" in _footer,
+      "one screen must not give two answers for one gateway")
+
+print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))
 sys.exit(0 if not FAILS else 2)

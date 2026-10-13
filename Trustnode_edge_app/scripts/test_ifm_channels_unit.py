@@ -128,5 +128,57 @@ check("  all of them name the right port",
       all("port[3]" in c for c in cands), cands[:2])
 
 print()
+print()
+print("[a sensor's record, described the way its datasheet describes it]")
+# 2026-09-06, asked: how a sensor on an ifm block exposes its values, and
+# whether the software can convert them "only using the scale and offset".
+# It cannot: the SM9400 flow meter packs a 14-bit temperature and TWO output
+# bits into one word, so the temperature needs (word >> 2). Faking that with
+# scale=0.025 is correct only while both outputs are off, and inverts the sign
+# of any negative reading.
+#
+# These are the operator's OWN words off the block: Port8_PDIN_W1..W4 =
+# 18488, 41312, 0, 1336.
+from app.drivers.ethernet_ip import EipSignal, decode_signal   # noqa: E402
+
+REC = bytes.fromhex("4838A16000000538")
+
+
+def _sig(**kw):
+    return EipSignal.from_dict(kw)
+
+
+check("a float32 spanning two words",
+      abs(decode_signal(REC, _sig(name="tot", bit_offset=32, bit_length=32,
+                                  kind="REAL")) - 189061.5) < 0.01,
+      "no multiplier turns 18488 into 189061.5")
+check("a 16-bit signed value with a gradient",
+      decode_signal(REC, _sig(name="flow", bit_offset=16, bit_length=16,
+                              signed=True, scale=0.1)) == 0.0)
+check("a 14-BIT field sharing a word with two flags",
+      abs(decode_signal(REC, _sig(name="temp", bit_offset=2, bit_length=14,
+                                  signed=True, scale=0.1)) - 33.4) < 0.001,
+      "this is the one scale-and-offset cannot express")
+check("  and each output bit on its own",
+      decode_signal(REC, _sig(name="o2", bit_offset=1, bit_length=1)) is False
+      and decode_signal(REC, _sig(name="o1", bit_offset=0, bit_length=1)) is False)
+
+# The failure mode the bit field exists to prevent.
+HOT = bytes.fromhex("00000000" "0000" "053B")     # same 33.4 C, both outputs ON
+check("outputs turning ON does not disturb the temperature",
+      abs(decode_signal(HOT, _sig(name="t", bit_offset=2, bit_length=14,
+                                  signed=True, scale=0.1)) - 33.4) < 0.001,
+      "a scale-only workaround would read 33.475 here")
+NEG = bytes.fromhex("00000000" "0000" "FF38")     # -50 counts in the top 14 bits
+check("a NEGATIVE reading keeps its sign",
+      abs(decode_signal(NEG, _sig(name="t", bit_offset=2, bit_length=14,
+                                  signed=True, scale=0.1)) - (-5.0)) < 0.001,
+      "an unsigned read of the same word gives +1633.4")
+
+check("the byte/type path still behaves as before",
+      decode_signal(REC, _sig(name="x", byte_offset=4, kind="INT", scale=0.1)) == 0.0,
+      "existing signals must not change meaning")
+
+print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))
 sys.exit(0 if not FAILS else 2)

@@ -129,6 +129,79 @@ print('compile-check OK')
         throw "Backend boot self-test FAILED (exit code: $LASTEXITCODE). /api/health did not come up in time - do not ship this build."
     }
 
+    # Operator 2026-10-07 (UPGRADE BOOT FIX): the probe above sets
+    # TRUSTNODE_APP_STORE_PATH, which takes the first branch of
+    # _resolve_db_path() - so it has never exercised the path an UPGRADE
+    # takes, where a legacy ~\.trustnode_edge store exists and
+    # %ProgramData% does not. That is exactly where the build that "failed
+    # to start on a computer with an older version" went wrong: the whole
+    # legacy database was copied before anything could answer /api/health.
+    #
+    # This pass drives the packaged EXE the way the desktop shell does -
+    # no store-path override - with HOME and PROGRAMDATA pointed at scratch
+    # directories holding a real (empty) SQLite file, and fails the build if
+    # first health takes longer than the shell would wait.
+    Write-Host "Running upgrade-shape boot self-test..."
+    $upg = Join-Path $env:TEMP ("tn-upgrade-probe-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
+    $upgHome = Join-Path $upg "home"
+    $upgPd = Join-Path $upg "programdata"
+    $legacyDir = Join-Path $upgHome ".trustnode_edge\data"
+    New-Item -ItemType Directory -Force $legacyDir | Out-Null
+    New-Item -ItemType Directory -Force $upgPd | Out-Null
+    # A VALID SQLite file with real pages in it. sqlite3.connect() alone
+    # leaves a ZERO-byte file, and a 0 MB store is not "over the cap" - the
+    # first run of this probe copied it and failed itself. ~2 MB against a
+    # 1 MB cap exercises the adopt-in-place decision.
+    $legacyDb = Join-Path $legacyDir "trustnode_app_store.db"
+    & python -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('CREATE TABLE pad(x TEXT)'); c.executemany('INSERT INTO pad VALUES (?)', [('x'*200,)]*12000); c.commit(); c.close()" $legacyDb
+    if (-not (Test-Path $legacyDb)) { throw "upgrade probe: could not seed a legacy store" }
+    $legacyMb = [math]::Round((Get-Item $legacyDb).Length / 1MB, 2)
+    if ($legacyMb -lt 1.5) { throw "upgrade probe: seeded store is only $legacyMb MB - it must exceed the cap below or this proves nothing" }
+    Write-Host "[upgrade-probe] seeded a $legacyMb MB legacy store"
+
+    $probePort = 8793
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exePath
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["USERPROFILE"] = $upgHome
+    $psi.EnvironmentVariables["PROGRAMDATA"] = $upgPd
+    $psi.EnvironmentVariables["TRUSTNODE_PORT"] = "$probePort"
+    $psi.EnvironmentVariables["TRUSTNODE_SKIP_DOTENV"] = "1"
+    $psi.EnvironmentVariables["TRUSTNODE_DISABLE_CONFIG_PUSH"] = "1"
+    $psi.EnvironmentVariables["TRUSTNODE_BOOT_INTEGRITY_CHECK"] = "never"
+    # A 1 MB cap against the ~2 MB store seeded above, so this exercises the
+    # adopt-in-place decision rather than a copy.
+    $psi.EnvironmentVariables["TRUSTNODE_MIGRATE_MAX_MB"] = "1"
+    foreach ($k in @("TRUSTNODE_DATA_DIR", "TRUSTNODE_APP_STORE_PATH")) {
+        $psi.EnvironmentVariables.Remove($k) | Out-Null
+    }
+    $upgProc = [System.Diagnostics.Process]::Start($psi)
+    $budget = 60
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $healthy = $false
+    while ($sw.Elapsed.TotalSeconds -lt $budget) {
+        Start-Sleep -Milliseconds 1000
+        if ($upgProc.HasExited) { break }
+        try {
+            $r = Invoke-WebRequest "http://127.0.0.1:$probePort/api/health" -TimeoutSec 3 -UseBasicParsing
+            if ($r.StatusCode -eq 200) { $healthy = $true; break }
+        } catch { }
+    }
+    $elapsed = [int]$sw.Elapsed.TotalSeconds
+    if (-not $upgProc.HasExited) { try { $upgProc.Kill() } catch { } }
+    Start-Sleep -Milliseconds 500
+    $copied = Test-Path (Join-Path $upgPd "TrustNode\edge\trustnode_app_store.db")
+    Remove-Item -Recurse -Force $upg -ErrorAction SilentlyContinue
+    if (-not $healthy) {
+        throw "Upgrade-shape boot self-test FAILED: /api/health did not answer within ${budget}s with a legacy store present. This is the shape that failed on a customer machine - do not ship this build."
+    }
+    if ($copied) {
+        throw "Upgrade-shape boot self-test FAILED: the legacy store was COPIED into ProgramData despite being over the migration cap. That copy is what delayed startup past the launcher's budget."
+    }
+    Write-Host "[upgrade-probe] PASS: /api/health 200 after ${elapsed}s, legacy store adopted in place"
+
     Write-Host "Backend bundle created: $(Join-Path $backendRoot 'dist\trustnode-service')"
 }
 finally {

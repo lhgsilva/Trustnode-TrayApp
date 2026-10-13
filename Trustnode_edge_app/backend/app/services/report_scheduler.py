@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+logger = logging.getLogger("trustnode.reports")
 from typing import Any, Callable
 
 from app.tenant import set_current_tenant
@@ -47,6 +50,23 @@ def _compare(value: float, operator: str, threshold: float, threshold2: float | 
         lo, hi = sorted([threshold, threshold2])
         return lo <= value <= hi
     return False
+
+
+def _cycle_file_name(schedule: dict[str, Any], template: dict[str, Any],
+                     window: tuple[str, str] | None, report_id: str) -> str:
+    """The operator's naming pattern, resolved. Empty keeps the uuid name."""
+    from app.services.report_renderer import resolve_output_target
+    # ONE resolver for both boxes. "Save to" used to win outright and discard
+    # "File name", and a folder in Save to was then treated as the file
+    # itself - so every run overwrote one PDF (2026-10-07).
+    return resolve_output_target(
+        str((schedule or {}).get("output_path") or "").strip(),
+        str((schedule or {}).get("file_name_pattern") or "").strip(),
+        template_name=str((template or {}).get("name") or ""),
+        report_id=report_id,
+        started=(window or ("", ""))[0],
+        ended=(window or ("", ""))[1],
+    )
 
 
 def _evaluate_tag_conditions(
@@ -154,17 +174,47 @@ class ReportRunner:
         *,
         triggered_by: str = "manual",
         email_settings: dict[str, Any] | None = None,
+        window: tuple[str, str] | None = None,
+        segments: list[dict[str, Any]] | None = None,
+        report_id: str = "",
     ) -> dict[str, Any]:
         tenant_id = (schedule.get("tenant_id") or "default").strip() or "default"
         set_current_tenant(tenant_id)
-        template = self.store.get_template(schedule.get("template_id") or "", tenant_id=tenant_id)
+        # One trigger may produce SEVERAL reports. 2026-10-01: "we should have
+        # an option to export two different or more reports inside of the same
+        # start and end trigger, maybe two different templates". template_ids
+        # is the list; template_id remains the single-template shape every
+        # existing schedule already has.
+        wanted = [str(t).strip() for t in (schedule.get("template_ids") or [])
+                  if str(t or "").strip()]
+        if not wanted:
+            wanted = [str(schedule.get("template_id") or "").strip()]
+        results = []
+        for tpl_id in wanted:
+            out = self._run_one(schedule, tpl_id, tenant_id, triggered_by,
+                                email_settings, window, segments, report_id)
+            results.append(out)
+        if len(results) == 1:
+            return results[0]
+        return {"ok": all(r.get("ok") for r in results), "reports": results,
+                "generated": (results[0] or {}).get("generated")}
+
+    def _run_one(self, schedule, template_id, tenant_id, triggered_by,
+                 email_settings, window, segments, report_id):
+        template = self.store.get_template(template_id, tenant_id=tenant_id)
         if not template:
             return {
                 "ok": False,
-                "error": f"Template {schedule.get('template_id')!r} not found",
+                "error": f"Template {template_id!r} not found",
             }
         try:
-            path, byte_count, sha = self.render(template)
+            # A cycle report covers the window between its start and stop
+            # conditions, and is named from the identifier captured at the
+            # start. Both are optional: without them this renders exactly as
+            # before.
+            path, byte_count, sha = self.render(
+                template, window=window, segments=segments,
+                file_name=_cycle_file_name(schedule, template, window, report_id))
         except Exception as exc:
             return {"ok": False, "error": f"PDF render failed: {exc}"}
 
@@ -335,6 +385,7 @@ class ReportScheduler:
         email_settings_lookup: Callable[[], dict[str, Any] | None] | None = None,
         is_any_gateway_running: Callable[[], bool] | None = None,
         tick_seconds: int = 15,
+        history_lookup: Callable[[str, str, str, str], list] | None = None,
     ) -> None:
         self.runner = runner
         self.store = reports_store
@@ -344,6 +395,17 @@ class ReportScheduler:
         # Optional — schedules without `require_gateway_running` ignore this.
         self.is_any_gateway_running = is_any_gateway_running or (lambda: True)
         self.tick_seconds = max(5, int(tick_seconds))
+        # Readings recorded BETWEEN ticks. Without this the cycle conditions
+        # are only ever sampled at the instant the daemon happens to wake, so
+        # a PLC coil that pulses high for one scan is invisible - which is why
+        # toggling the inputs produced no report at all. Optional: with no
+        # history the evaluator falls back to the live value, as before.
+        self.history_lookup = history_lookup
+        self._last_seen: dict[str, str] = {}
+        #: Schedules whose cycle closed while the START condition was still
+        #: true. They stay blocked until it is observed FALSE - see
+        #: _consider_cycle (2026-10-11).
+        self._await_low: dict[str, bool] = {}
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         # Debounce: per-schedule "last fire minute" so we don't fire twice when
@@ -392,6 +454,300 @@ class ReportScheduler:
             except Exception:
                 continue
 
+    def _conditions_hit(self, conditions: list, logic: str, since: str,
+                        now_stamp: str) -> tuple[bool, str]:
+        """Were the conditions satisfied at any point since `since`?
+
+        Returns (hit, when). `when` is the reading's OWN timestamp, so a cycle
+        is stamped with the moment the bit actually changed rather than the
+        moment the daemon happened to wake - the window is then accurate to
+        the PLC, not to the 15 s tick.
+
+        Falls back to the live value when no history is available, which is
+        what the unit tests and any caller without a historian rely on.
+        """
+        conds = [c for c in (conditions or []) if isinstance(c, dict)]
+        if not conds:
+            return False, ""
+        if not self.history_lookup or not since:
+            ok, _ = _evaluate_tag_conditions(conds, logic, self.live_lookup)
+            return ok, now_stamp
+
+        firsts: list[str] = []
+        for c in conds:
+            gw = str(c.get("gateway_id") or "").strip()
+            tag = str(c.get("tag_name") or c.get("tag") or "").strip()
+            if not tag:
+                continue
+            try:
+                rows = self.history_lookup(gw, tag, since, now_stamp) or []
+            except Exception:
+                rows = []
+            hit_at = ""
+            for ts, value in rows:
+                try:
+                    num = float(value)
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    threshold = float(c.get("value"))
+                except (TypeError, ValueError):
+                    continue
+                second = c.get("value2")
+                try:
+                    second = float(second) if second not in (None, "") else None
+                except (TypeError, ValueError):
+                    second = None
+                if _compare(num, str(c.get("operator") or ">="), threshold, second):
+                    hit_at = str(ts)
+                    break
+            if not hit_at:
+                if str(logic or "all").strip().lower() == "all":
+                    return False, ""          # one unmet condition ends it
+                continue
+            firsts.append(hit_at)
+        if not firsts:
+            return False, ""
+        # ALL -> satisfied once the LAST of them came true; ANY -> the first.
+        when = max(firsts) if str(logic or "all").strip().lower() == "all" else min(firsts)
+        return True, when
+
+    def _start_true_now(self, schedule: dict[str, Any]) -> bool:
+        """Is the start condition set satisfied by the LIVE values?
+
+        _conditions_hit answers "at any point since the last tick", which is
+        the right question for catching a short pulse and the wrong one for
+        "has the bit dropped yet".
+        """
+        conds = [c for c in (schedule.get("tag_conditions") or [])
+                 if isinstance(c, dict)]
+        if not conds:
+            return False
+        try:
+            ok, _ = _evaluate_tag_conditions(
+                conds, schedule.get("condition_logic") or "all", self.live_lookup)
+        except Exception:
+            # Unreadable: assume it is still high rather than firing a report
+            # we cannot justify.
+            return True
+        return bool(ok)
+
+    def _consider_cycle(self, schedule: dict[str, Any], now_utc: datetime) -> None:
+        """Open a cycle on the start condition, close and report on the stop.
+
+        The open cycle lives in the schedule row (`cycle_started_utc`), so a
+        restart part-way through still closes against the real start time
+        instead of inventing one.
+        """
+        sched_id = str(schedule.get("id") or "")
+        stamp = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+        started = str(schedule.get("cycle_started_utc") or "").strip()
+
+        since = self._last_seen.get(sched_id) or ""
+        self._last_seen[sched_id] = stamp
+        start_ok, start_at = self._conditions_hit(
+            schedule.get("tag_conditions") or [],
+            schedule.get("condition_logic") or "all", since, stamp)
+
+        if not started:
+            # 2026-10-11, reported: "when a condifition is start rigger =1 but
+            # this keep on until is off". The cycle closed (its stop condition
+            # fired, or a stop-less cycle saw the start go false for one
+            # reading) while the start bit was STILL high, so the very next
+            # 15 s tick found a satisfying reading in history and opened
+            # another cycle - one physical run generating a report every
+            # quarter minute until the operator noticed.
+            #
+            # Rising edge: once a cycle has closed, the start set must be seen
+            # FALSE before it can open another. Set start_edge=false on the
+            # schedule for the old level-triggered behaviour.
+            if self._await_low.get(sched_id):
+                if self._start_true_now(schedule):
+                    return
+                self._await_low.pop(sched_id, None)
+                # The bit has only just dropped, so nothing read during this
+                # tick can be the next rising edge. Wait for the next one.
+                return
+            if not start_ok:
+                return
+            # Stamp the cycle with the READING's time, not the tick's.
+            stamp = start_at or stamp
+            # Capture the identifier NOW: a serial or batch number read at the
+            # end of a cycle may already have moved on to the next part.
+            report_id = ""
+            id_tag = str(schedule.get("id_tag") or "").strip()
+            if id_tag:
+                # live_lookup is (gateway, tag) - the same contract the
+                # condition evaluator uses. An id tag may name its gateway
+                # explicitly, or come from the same gateway as the start
+                # condition.
+                id_gateway = str(schedule.get("id_gateway") or "").strip()
+                if not id_gateway:
+                    first = (schedule.get("tag_conditions") or [{}])[0]
+                    id_gateway = str((first or {}).get("gateway_id") or "").strip()
+                try:
+                    value = self.live_lookup(id_gateway, id_tag)
+                    report_id = "" if value is None else str(value).strip()
+                except Exception:
+                    report_id = ""
+            # A new run starts with no segments; the first read of the
+            # segment tag opens the first one on the next tick.
+            self.store.set_cycle_state(sched_id, stamp, report_id, segments_json="[]")
+            logger.info("report cycle opened: schedule=%s at %s id=%r",
+                     sched_id, stamp, report_id)
+            return
+
+        # While the cycle is open, watch the segment tag. Each new value closes
+        # the previous sub-period and opens the next - that is what turns "the
+        # second test repeated N times" into N windows the report can address.
+        segments = self._track_segment(schedule, sched_id, started, stamp)
+
+        stop_conditions = schedule.get("stop_conditions") or []
+        if not stop_conditions:
+            # No stop condition means the START condition going false closes it.
+            stop_ok, stop_at = (not start_ok), stamp
+        else:
+            stop_ok, stop_at = self._conditions_hit(
+                stop_conditions, schedule.get("stop_condition_logic") or "all",
+                since, stamp)
+        if not stop_ok:
+            return
+        # Close on the reading's own timestamp, so the window is the cycle.
+        stamp = stop_at or stamp
+
+        segments = self._close_segments(segments, stamp)
+        # Arm the rising-edge guard unless the schedule opted out.
+        if schedule.get("start_edge") is not False:
+            self._await_low[sched_id] = True
+        logger.info("report cycle closed: schedule=%s %s..%s (%d segment(s))",
+                    sched_id, started, stamp, len(segments))
+        self.store.set_cycle_state(sched_id, "", "", segments_json="[]")
+        email_settings = None
+        try:
+            email_settings = self.email_settings_lookup()
+        except Exception:
+            email_settings = None
+        result = self.runner.run(
+            schedule, triggered_by="cycle", email_settings=email_settings,
+            window=(started, stamp),
+            segments=segments,
+            report_id=str(schedule.get("cycle_report_id") or ""))
+        try:
+            self.store.mark_schedule_run(
+                schedule_id=sched_id, last_run_utc=stamp,
+                status="success" if result.get("ok") else "error",
+                error=None if result.get("ok") else str(result.get("error") or ""),
+                next_run_utc=None)
+        except Exception:
+            pass
+
+    def _segment_streams(self, schedule: dict[str, Any]) -> list[dict[str, str]]:
+        """The tags that divide a run, one stream each.
+
+        A TCU functional test has three levels at once - which test is running,
+        which cycle of it, and which phase within that cycle - so one tag is
+        not enough. `segment_tags` is a list of {name, tag, gateway}; the older
+        single `segment_tag` is still honoured as one stream.
+        """
+        out: list[dict[str, str]] = []
+        for item in (schedule.get("segment_tags") or []):
+            if not isinstance(item, dict):
+                continue
+            tag = str(item.get("tag") or item.get("tag_name") or "").strip()
+            if not tag:
+                continue
+            out.append({
+                "name": str(item.get("name") or "segment").strip() or "segment",
+                "tag": tag,
+                "gateway": str(item.get("gateway") or item.get("gateway_id") or "").strip(),
+            })
+        legacy = str(schedule.get("segment_tag") or "").strip()
+        if legacy and not any(x["tag"] == legacy for x in out):
+            out.append({
+                "name": str(schedule.get("segment_name") or "segment").strip() or "segment",
+                "tag": legacy,
+                "gateway": str(schedule.get("segment_gateway") or "").strip(),
+            })
+        return out
+
+    def _track_segment(self, schedule: dict[str, Any], sched_id: str,
+                       started: str, stamp: str) -> list[dict[str, Any]]:
+        """Divide the open run into sub-periods by watching tag values.
+
+        Each stream is independent: a phase change closes the phase segment
+        without disturbing the cycle or the test around it. Returns the segment
+        list as it now stands; the open entry of each stream has no to_utc yet.
+
+        Driven by a value CHANGE rather than by a second pair of conditions:
+        the process already carries Test_Step / Cycle_Number / Phase_Name, and
+        "the second one is repeated based on the number of cycles defined in
+        the process" is exactly those tags counting on.
+        """
+        segments = list(schedule.get("cycle_segments") or [])
+        streams = self._segment_streams(schedule)
+        if not streams:
+            # No segment tag: the whole run is one segment, so a summary table
+            # still has a row and nothing else behaves differently.
+            if not segments:
+                segments = [{"stream": "run", "name": "run", "label": "Run",
+                             "value": "run", "index": 1,
+                             "from_utc": started, "to_utc": ""}]
+                self._save_segments(schedule, sched_id, started, segments)
+            return segments
+
+        default_gateway = str(
+            ((schedule.get("tag_conditions") or [{}])[0] or {}).get("gateway_id") or "").strip()
+        changed = False
+        for st in streams:
+            try:
+                raw = self.live_lookup(st["gateway"] or default_gateway, st["tag"])
+            except Exception:
+                raw = None
+            if raw is None:
+                continue
+            value = str(raw).strip()
+            # The open segment OF THIS STREAM only.
+            current = None
+            for sg in reversed(segments):
+                if str(sg.get("stream") or "") == st["name"]:
+                    current = sg
+                    break
+            if current is not None and str(current.get("value") or "") == value:
+                continue                      # same sub-period, nothing to do
+            if current is not None and not current.get("to_utc"):
+                current["to_utc"] = stamp
+            index = 1 + sum(1 for sg in segments
+                            if str(sg.get("stream") or "") == st["name"]
+                            and str(sg.get("value") or "") == value)
+            segments.append({
+                "stream": st["name"], "name": st["name"],
+                "label": value or st["name"], "value": value, "index": index,
+                "from_utc": stamp if current is not None else started,
+                "to_utc": "",
+            })
+            changed = True
+            logger.info("report segment opened: schedule=%s %s/%s=%s (#%d) at %s",
+                        sched_id, st["name"], st["tag"], value, index, stamp)
+        if changed:
+            self._save_segments(schedule, sched_id, started, segments)
+        return segments
+
+    def _save_segments(self, schedule: dict[str, Any], sched_id: str,
+                       started: str, segments: list[dict[str, Any]]) -> None:
+        self.store.set_cycle_state(
+            sched_id, started, str(schedule.get("cycle_report_id") or ""),
+            segments_json=json.dumps(segments))
+
+    @staticmethod
+    def _close_segments(segments: list[dict[str, Any]], stamp: str) -> list[dict[str, Any]]:
+        """Seal the open segment against the cycle's end."""
+        # Every stream has its own open segment; all of them end with the run.
+        out = [dict(sg) for sg in (segments or [])]
+        for sg in out:
+            if not sg.get("to_utc"):
+                sg["to_utc"] = stamp
+        return out
+
     def _consider_schedule(self, schedule: dict[str, Any], now_utc: datetime) -> None:
         sched_id = str(schedule.get("id") or "")
         mode = (schedule.get("trigger_mode") or "time").strip().lower()
@@ -411,6 +767,18 @@ class ReportScheduler:
                 self.live_lookup,
             )
             tag_hit = ok
+
+        # CYCLE: start condition opens a window, stop condition closes it and
+        # produces one report covering exactly that window. Requested
+        # 2026-09-29: "everytime we have a new start and end time a new report
+        # is generated automatically".
+        #
+        # Edge-driven, not level-driven: a level test fires every minute the
+        # condition stays true, which on a cycle that runs for an hour is sixty
+        # identical reports.
+        if mode == "cycle":
+            self._consider_cycle(schedule, now_utc)
+            return
 
         if mode == "time":
             fire = time_hit

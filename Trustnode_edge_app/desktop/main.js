@@ -920,7 +920,25 @@ async function startBackend() {
     logBackend(`STDERR ${String(chunk).trim()}`);
   });
 
+  // Capture THIS child, so its exit cannot be mistaken for the current one.
+  //
+  // 2026-09-03: the handler used the shared `backendProc` variable, so when a
+  // previous backend's exit event arrived AFTER a new one had been spawned, it
+  // set backendExited, nulled the live child and ran the crash path - against
+  // a process that was perfectly healthy. Observed on the operator's machine:
+  // "Backend spawned pid=32644 / Backend exited with code 1 / BACKEND CRASHED
+  // / Respawning" while 32644 was alive and serving port 8000. The respawn
+  // produced a SECOND backend, and the two fought over the power meter's
+  // single Modbus TCP connection - which is what "Device Fails at startup,
+  // and I have to start it manually" actually was.
+  const thisProc = backendProc;
   backendProc.on("exit", (code) => {
+    if (backendProc && backendProc !== thisProc) {
+      // A superseded child exiting is expected and is NOT a crash.
+      logBackend(`Ignoring exit (code=${code ?? "null"}) from superseded backend `
+        + `pid=${thisProc?.pid ?? "?"}; current pid=${backendProc?.pid ?? "?"} is live`);
+      return;
+    }
     backendExited = true;
     backendExitCode = code ?? null;
     logBackend(`Backend exited with code ${code ?? "null"}`);
@@ -1730,7 +1748,20 @@ function createTray() {
   tray.setToolTip(APP_DISPLAY_NAME);
   rebuildTrayMenu();
   tray.on("double-click", () => {
-    if (mainWindow) mainWindow.show();
+    // Same recovery as second-instance: the tray icon is the other thing an
+    // operator reaches for when the window has vanished, so it must be able to
+    // bring one back rather than silently doing nothing.
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      try {
+        createWindow();
+      } catch (err) {
+        bootLog(`tray window recreate failed: ${err && err.message || err}`);
+      }
+      return;
+    }
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
   });
   // Refresh sharing state when the menu is about to be shown so URLs /
   // IPs stay current.
@@ -2088,7 +2119,22 @@ app.whenReady().then(() => bootSequence().catch((err) => {
 }));
 
 app.on("second-instance", () => {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
+  // 2026-09-03, reported: "front end collapsed and not showing the windows of
+  // the app anymore". This used to `return` when the window object was gone.
+  // window-all-closed deliberately keeps the app alive, so a DESTROYED window
+  // left a running app with no UI at all - and the second launch only said
+  // "Trustnode is already running" and quit. There was no way back short of
+  // killing the process. Recreate it instead: relaunching the app is the most
+  // obvious thing an operator does when nothing is on screen, and it should
+  // work.
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    try {
+      createWindow();
+    } catch (err) {
+      bootLog(`second-instance window recreate failed: ${err && err.message || err}`);
+    }
+    return;
+  }
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();

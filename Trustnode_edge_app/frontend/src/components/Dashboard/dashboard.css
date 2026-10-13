@@ -42,6 +42,52 @@
   padding: 0 10px;
 }
 
+/* ============================================ one height for the toolbar
+   Operator 2026-10-02: "the icons are not the same height". They were not.
+   The icon buttons were a fixed 32 px, the datetime inputs 32 px, the Live /
+   Historical pills had no height at all (8 px of padding plus whatever the
+   font measured, about 35 px) and the profile chip about 22 px - four
+   different heights on one row, none of them aligned.
+
+   Every control on this row is now 32 px and centres its own content, so
+   adding a control cannot reintroduce the stagger. Height is set here, NOT
+   in each control's own rule, because that is what drifted. */
+.dashboard-designer-tools .dashboard-toolbar-icon-btn,
+.dashboard-designer-tools .dashboard-pill,
+.dashboard-designer-tools .dashboard-active-profile-chip,
+.dashboard-designer-tools .dashboard-range-controls input,
+.dashboard-designer-tools select,
+.dashboard-designer-tools .btn {
+  height: 32px;
+  min-height: 32px;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+}
+/* With the height fixed, vertical padding only fights it. */
+.dashboard-designer-tools .dashboard-pill {
+  padding: 0 14px;
+  justify-content: center;
+}
+.dashboard-designer-tools .dashboard-active-profile-chip {
+  padding: 0 10px;
+}
+/* The meta readouts are text, not controls: align them to the same centre
+   line rather than stretching them to 32 px. */
+.dashboard-designer-tools .dashboard-grid-meta {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+}
+/* 2026-10-02: the row sat on the default .page-tools band of air. The canvas
+   below it is the point of the page - give the toolbar only what it needs. */
+.dashboard-designer-tools {
+  gap: 10px;
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
 .dashboard-toolbar-icon-btn {
   width: 32px;
   height: 32px;

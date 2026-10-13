@@ -132,9 +132,9 @@ export default function DiagnosticsPage({ canRefresh = true }) {
 
   // Our share of what is actually in use, not of the whole machine - "we are
   // 4% of a box that is 95% busy" is the number an operator needs.
-  const ourCpuShare = Number(cpu.percent || 0) > 0
+  const ourCpuShare = (cpu.percent != null && Number(cpu.percent) > 0)
     ? (Number(totals.cpu_percent || 0) / Number(cpu.percent)) * 100
-    : 0;
+    : null;
   const ourMemShare = Number(mem.total_bytes || 0) > 0
     ? (Number(totals.rss_bytes || 0) / Number(mem.total_bytes)) * 100
     : 0;
@@ -203,9 +203,16 @@ export default function DiagnosticsPage({ canRefresh = true }) {
       <section className="card">
         <h3 style={{ marginTop: 0 }}>This computer</h3>
         <div className="diag-stat-grid">
-          <Stat label="CPU" value={`${Number(cpu.percent || 0).toFixed(0)}%`}
-            percent={cpu.percent} tone={toneFor(cpu.percent)}
-            sub={`${cpu.cores_logical || 0} logical cores · ${cpu.cores_physical || 0} physical`} />
+          {/* A null percent means the backend has no baseline yet (first
+              snapshot after a restart). Say so - "0%" on a pegged box is
+              what made this page look broken. */}
+          <Stat label="CPU"
+            value={cpu.percent == null ? "measuring…" : `${Number(cpu.percent).toFixed(0)}%`}
+            percent={cpu.percent == null ? undefined : cpu.percent}
+            tone={toneFor(cpu.percent)}
+            sub={cpu.cores_logical
+              ? `${cpu.cores_logical} logical cores · ${cpu.cores_physical || 0} physical`
+              : "core count unavailable"} />
           <Stat label="Memory" value={`${Number(mem.percent || 0).toFixed(0)}%`}
             percent={mem.percent} tone={toneFor(mem.percent, 80, 92)}
             sub={`${bytes(mem.used_bytes)} used of ${bytes(mem.total_bytes)} · ${bytes(mem.available_bytes)} free`} />
@@ -223,7 +230,9 @@ export default function DiagnosticsPage({ canRefresh = true }) {
         <div className="diag-stat-grid">
           <Stat label="CPU used by TrustNode" value={`${Number(totals.cpu_percent || 0).toFixed(1)}%`}
             percent={totals.cpu_percent} tone={toneFor(totals.cpu_percent, 40, 70)}
-            sub={`${ourCpuShare.toFixed(0)}% of everything this machine is doing`} />
+            sub={ourCpuShare == null
+              ? "share of the machine available on the next refresh"
+              : `${ourCpuShare.toFixed(0)}% of everything this machine is doing`} />
           <Stat label="Memory used by TrustNode" value={bytes(totals.rss_bytes)}
             percent={ourMemShare} tone={toneFor(ourMemShare, 30, 50)}
             sub={`${ourMemShare.toFixed(1)}% of ${bytes(mem.total_bytes)} installed`} />

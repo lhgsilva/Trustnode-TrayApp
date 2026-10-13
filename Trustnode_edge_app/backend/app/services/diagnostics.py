@@ -84,7 +84,14 @@ def _machine() -> dict[str, Any]:
     vm = _safe(psutil.virtual_memory)
     # Busy fraction between this call and the last one. Blocking for an
     # interval instead would hold a threadpool slot for that whole time.
-    cpu = 0.0
+    # None, not 0.0, until there IS a previous call to measure against. The
+    # first snapshot after a restart has no baseline, so it reported a
+    # confident "0%" on a box that was in fact pegged - the operator opened
+    # Diagnostics, saw zeros everywhere and read it as "nothing is loading"
+    # (2026-10-02). "We have not measured yet" and "idle" must not look the
+    # same. The next poll, 2 s later, has a baseline and shows the real
+    # number.
+    cpu = None
     times = _safe(psutil.cpu_times)
     if times is not None:
         total = float(sum(times))
@@ -99,6 +106,11 @@ def _machine() -> dict[str, Any]:
             cpu = max(0.0, min(100.0, 100.0 * d_busy / d_total))
         _CPU_PREV["total"] = total
         _CPU_PREV["busy"] = busy
+    # psutil keeps its OWN baseline for this call, so the first snapshot after
+    # a restart reads eight zeros and every later one is a real delta against
+    # the previous snapshot. Do NOT call it twice in one snapshot "to prime
+    # it": the second call deltas against the first microseconds earlier and
+    # returns zeros forever (tried 2026-10-02).
     per_cpu = _safe(lambda: psutil.cpu_percent(interval=None, percpu=True), []) or []
 
     data_dir = os.environ.get("TRUSTNODE_DATA_DIR") or os.path.expanduser("~/.trustnode_edge/data")
@@ -119,7 +131,9 @@ def _machine() -> dict[str, Any]:
     return {
         "available": True,
         "cpu": {
-            "percent": round(float(cpu or 0.0), 1),
+            # null while unmeasured - the UI renders that as "measuring",
+            # never as 0%.
+            "percent": (None if cpu is None else round(float(cpu), 1)),
             "cores_logical": _safe(lambda: psutil.cpu_count(logical=True), 0),
             "cores_physical": _safe(lambda: psutil.cpu_count(logical=False), 0),
             "per_core": [round(float(x), 1) for x in per_cpu],

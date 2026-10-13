@@ -1354,6 +1354,25 @@ body {
   text-overflow: ellipsis;
 }
 /* Layout for the cog modal sections. */
+/* The Dashboard Configuration modal sizes to its content (operator
+   2026-10-02: it opened far taller than the three groups inside it, with a
+   band of empty space under the buttons, and on a short screen the actions
+   fell below the fold). Width is capped so the profile row stays readable;
+   height follows the content and only scrolls if it genuinely overflows. */
+.dashboard-config-modal {
+  width: min(560px, 94vw);
+  max-height: min(86vh, 720px);
+  display: flex;
+  flex-direction: column;
+}
+.dashboard-config-modal > h3 { flex: 0 0 auto; }
+.dashboard-config-modal > .modal-actions { flex: 0 0 auto; }
+.dashboard-config-modal .dashboard-config-section {
+  flex: 0 1 auto;
+  min-height: 0;
+}
+.dashboard-config-hint { margin: 0 0 8px; }
+
 .dashboard-config-section {
   margin-top: 12px;
   padding-top: 12px;
@@ -3521,7 +3540,28 @@ input[type="checkbox"] {
   padding: 8px 10px;
   border-radius: 10px;
   margin-bottom: 10px;
+  /* The message takes the width it needs; the dismiss sits hard right.
+     2026-10-12: this banner was the only one on the page with no way to
+     close it. */
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  justify-content: space-between;
 }
+
+.banner-dismiss {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  opacity: 0.65;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.banner-dismiss:hover { opacity: 1; }
 
 .lock-note {
   margin-top: 10px;
@@ -4411,7 +4451,7 @@ input[type="checkbox"] {
 .oee-tab {
   min-width: 120px;
   height: 36px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: transparent;
   color: var(--muted);
@@ -4481,7 +4521,7 @@ input[type="checkbox"] {
    same component renders on Machine Detail, where no area grid applies. */
 .power-kpi-grid .stat-card.oee-kpi {
   display: block;
-  padding: 8px 10px;
+  padding: var(--space-3) var(--space-4);
 }
 
 .power-kpi-grid .stat-card .stat-title {
@@ -6199,9 +6239,114 @@ textarea {
 .tn-row-2 { grid-template-columns: 1fr 1fr; }
 .tn-row-3 { grid-template-columns: 1fr 1fr 1fr; }
 .tn-row-4 { grid-template-columns: repeat(4, 1fr); }
+/* Gateway + tag + aggregation + title + remove, on one line. */
+.tn-row-5 { grid-template-columns: repeat(5, 1fr); }
+@media (max-width: 1200px) {
+  .tn-row-5 { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+}
 .tn-row-tight { gap: 4px 6px; flex-wrap: wrap; }
 @media (max-width: 700px) {
-  .tn-row-2, .tn-row-3, .tn-row-4 { grid-template-columns: 1fr; }
+  .tn-row-2, .tn-row-3, .tn-row-4, .tn-row-5 { grid-template-columns: 1fr; }
+}
+
+/* Group heading inside a section editor: When / Trigger / Layout.
+ *
+ * 2026-10-01: the section form put the time range, two four-field trigger
+ * pickers, the width, the alignment and the repeat field in ONE two-column
+ * row, each carrying a paragraph of help - so nothing lined up and the card
+ * was mostly prose. The controls are grouped now and these caption the
+ * groups. Used but never defined until now, so they rendered as plain text. */
+.tn-subhead {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.55;
+  margin: 10px 0 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line, rgba(148, 163, 184, 0.25));
+}
+
+/* A text field with a tag picker. The button sits ON the label row so the
+ * input keeps its full width, and the picker drops under the field rather
+ * than pushing the form around. */
+.tn-tag-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+
+.tn-tag-field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.tn-tag-insert {
+  background: none;
+  border: 1px solid var(--line, rgba(148, 163, 184, 0.35));
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 5px;
+  opacity: 0.75;
+}
+
+.tn-tag-insert:hover { opacity: 1; }
+
+.tn-tag-pop {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  margin-top: 4px;
+}
+
+@media (max-width: 700px) {
+  .tn-tag-pop { grid-template-columns: 1fr; }
+}
+
+/* A section editor collapses to one line: toggle, type, title, window.
+ *
+ * 2026-10-01: a fifteen-section report was an unbroken wall of controls with
+ * no way to see its shape. Configured sections start closed. */
+.tn-section-editor-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tn-section-toggle {
+  background: none;
+  border: 0;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+  color: inherit;
+  opacity: 0.7;
+}
+
+.tn-section-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.tn-section-window {
+  font-weight: 400;
+  opacity: 0.6;
+}
+
+.tn-section-editor.is-collapsed {
+  padding-bottom: 4px;
+}
+
+.tn-subhead:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
 }
 
 /* The KPI/series/rule/limit/column rows inside section editors must also
@@ -7591,54 +7736,54 @@ textarea {
  * are semantic and are ALWAYS shown beside the state's name - colour never
  * carries the meaning on its own.
  * ======================================================================== */
-.oee-page { display: flex; flex-direction: column; gap: 12px; }
+.oee-page { display: flex; flex-direction: column; gap: var(--space-5); }
 
 /* ------------------------------------------------------------ filters --- */
-.oee-filters { padding: 10px 14px; }
-.oee-filter-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+.oee-filters { padding: var(--space-4) var(--space-5); }
+.oee-filter-row { display: flex; flex-wrap: wrap; gap: var(--space-4); align-items: flex-end; }
 .oee-filter-row label {
   display: flex; flex-direction: column; gap: 3px;
-  font-size: 11px; color: var(--muted); min-width: 0;
+  font-size: var(--font-xs); color: var(--muted); min-width: 0;
 }
 .oee-filter-row select { min-width: 140px; }
 
 /* --------------------------------------------------------------- KPIs --- */
 .oee-kpi-grid {
   display: grid;
-  gap: 10px;
-  margin-bottom: 12px;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
 }
 .oee-kpi { min-width: 0; }
-.oee-kpi-sub { font-size: 10.5px; line-height: 1.3; margin-top: 2px; }
+.oee-kpi-sub { font-size: var(--font-xs); line-height: 1.3; margin-top: 2px; }
 /* A KPI with no value says so in words, smaller, so it reads as an
    explanation rather than as a number. */
-.oee-kpi-empty { font-size: 13px; font-weight: 600; opacity: 0.75; }
+.oee-kpi-empty { font-size: var(--font-sm); font-weight: 600; opacity: 0.75; }
 .oee-kpi-primary .stat-value { color: var(--accent, #22c55e); }
 .oee-kpi-warn .stat-value { color: var(--danger, #ef4444); }
 
 /* ------------------------------------------------------ machine cards --- */
 .oee-machine-grid {
-  display: grid; gap: 10px;
+  display: grid; gap: var(--space-4);
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
 }
 .oee-machine-card {
   border: 1px solid var(--stroke); border-left-width: 4px;
-  border-radius: 10px; padding: 10px 12px; background: var(--card);
-  display: flex; flex-direction: column; gap: 6px; min-width: 0;
+  border-radius: var(--radius-md); padding: var(--space-4) var(--space-5); background: var(--card);
+  display: flex; flex-direction: column; gap: var(--space-2); min-width: 0;
 }
-.oee-mc-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.oee-mc-line { font-size: 11.5px; }
-.oee-mc-conf { display: flex; align-items: center; gap: 8px; font-size: 11px; flex-wrap: wrap; }
+.oee-mc-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
+.oee-mc-line { font-size: var(--font-xs); }
+.oee-mc-conf { display: flex; align-items: center; gap: var(--space-3); font-size: var(--font-xs); flex-wrap: wrap; }
 .oee-mc-grid {
   display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 6px 8px; margin-top: 2px;
+  gap: var(--space-2) var(--space-3); margin-top: 2px;
 }
 .oee-mc-grid > div { display: flex; flex-direction: column; min-width: 0; }
-.oee-mc-grid span { font-size: 10px; text-transform: uppercase; letter-spacing: .03em; }
-.oee-mc-grid strong { font-size: 14px; }
-.oee-mc-foot { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px; }
-.oee-mc-detail { font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.oee-mc-grid span { font-size: var(--font-xs); text-transform: uppercase; letter-spacing: .03em; }
+.oee-mc-grid strong { font-size: var(--font-md); }
+.oee-mc-foot { display: flex; flex-wrap: wrap; gap: var(--space-3); font-size: var(--font-xs); }
+.oee-mc-detail { font-size: var(--font-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .oee-mc-running { border-left-color: #22c55e; }
 .oee-mc-idle { border-left-color: #f59e0b; }
@@ -7650,7 +7795,7 @@ textarea {
 .oee-mc-off { border-left-color: #64748b; }
 .oee-mc-unknown { border-left-color: #94a3b8; }
 
-.oee-state { font-size: 11px; white-space: nowrap; }
+.oee-state { font-size: var(--font-xs); white-space: nowrap; }
 .oee-state-running { background: rgba(34,197,94,.16); border-color: rgba(34,197,94,.5); }
 .oee-state-idle { background: rgba(245,158,11,.16); border-color: rgba(245,158,11,.5); }
 .oee-state-stopped, .oee-state-faulted { background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.5); }
@@ -7659,7 +7804,7 @@ textarea {
 .oee-state-off, .oee-state-unknown { background: rgba(148,163,184,.16); border-color: rgba(148,163,184,.5); }
 
 .oee-conf {
-  font-size: 10.5px; font-weight: 700; padding: 1px 7px; border-radius: 999px;
+  font-size: var(--font-xs); font-weight: 700; padding: 1px var(--space-3); border-radius: 999px;
   border: 1px solid var(--stroke); white-space: nowrap;
 }
 .oee-conf-high { background: rgba(34,197,94,.14); border-color: rgba(34,197,94,.45); }
@@ -7670,7 +7815,7 @@ textarea {
 
 .oee-mc-flags { display: flex; flex-wrap: wrap; gap: 5px; }
 .oee-flag {
-  font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px;
+  font-size: var(--font-xs); font-weight: 700; padding: 1px var(--space-2); border-radius: var(--radius-sm);
   border: 1px solid var(--stroke);
 }
 .oee-flag-energy_waste { background: rgba(245,158,11,.18); border-color: rgba(245,158,11,.5); }
@@ -7679,119 +7824,119 @@ textarea {
 
 /* ------------------------------------------------------------- charts --- */
 .oee-chart-grid {
-  display: grid; gap: 12px;
+  display: grid; gap: var(--space-5);
   grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
 }
 
 /* ----------------------------------------------------------- operator --- */
-.oee-op-picker { display: flex; flex-wrap: wrap; gap: 8px; }
+.oee-op-picker { display: flex; flex-wrap: wrap; gap: var(--space-3); }
 .oee-op-tab {
   display: flex; flex-direction: column; gap: 4px; align-items: flex-start;
-  padding: 8px 12px; border-radius: 10px; cursor: pointer;
+  padding: var(--space-3) var(--space-5); border-radius: var(--radius-md); cursor: pointer;
   border: 1px solid var(--stroke); border-left-width: 4px; background: var(--card);
   color: inherit; min-width: 150px;
 }
 .oee-op-tab.active { outline: 2px solid var(--accent, #22c55e); }
 .oee-op-tab-name { font-weight: 700; }
 .oee-op-status-main { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-.oee-op-title { margin: 2px 0; font-size: 22px; }
+.oee-op-title { margin: 2px 0; font-size: var(--font-lg); }
 .oee-op-state { display: flex; flex-direction: column; gap: 5px; align-items: flex-end; }
-.oee-op-since { font-size: 18px; font-weight: 700; }
+.oee-op-since { font-size: var(--font-lg); font-weight: 700; }
 .oee-op-metrics {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: 8px; margin-top: 10px;
+  gap: var(--space-3); margin-top: var(--space-4);
 }
 .oee-op-metrics > div { display: flex; flex-direction: column; }
-.oee-op-metrics span { font-size: 10px; text-transform: uppercase; }
-.oee-op-metrics strong { font-size: 16px; }
+.oee-op-metrics span { font-size: var(--font-xs); text-transform: uppercase; }
+.oee-op-metrics strong { font-size: var(--font-md); }
 /* Real tap targets: this screen is used standing at a machine. */
-.oee-op-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.oee-op-buttons { display: flex; flex-wrap: wrap; gap: var(--space-3); }
 .btn.btn-lg { min-height: 46px; padding: 0 22px; font-size: 15px; }
-.oee-op-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
-.oee-op-fields label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
+.oee-op-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: var(--space-4); }
+.oee-op-fields label { display: flex; flex-direction: column; gap: 3px; font-size: var(--font-xs); }
 .oee-op-fields input, .oee-op-fields select { min-height: 34px; }
 
 .oee-dt-modal { width: min(620px, 96vw); }
 .oee-dt-facts {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-  gap: 8px; margin-bottom: 10px;
+  gap: var(--space-3); margin-bottom: var(--space-4);
 }
 .oee-dt-facts > div { display: flex; flex-direction: column; }
-.oee-dt-facts span { font-size: 10px; text-transform: uppercase; }
-.oee-dt-comment { display: flex; flex-direction: column; gap: 3px; font-size: 11px; margin-top: 8px; }
+.oee-dt-facts span { font-size: var(--font-xs); text-transform: uppercase; }
+.oee-dt-comment { display: flex; flex-direction: column; gap: 3px; font-size: var(--font-xs); margin-top: var(--space-3); }
 .oee-dt-comment textarea { width: 100%; resize: vertical; }
 
 /* ------------------------------------------------------ configuration --- */
 .oee-section { padding: 0; }
 .oee-section-head {
-  display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer;
+  display: flex; align-items: center; gap: var(--space-4); padding: var(--space-4) var(--space-5); cursor: pointer;
   border-bottom: 1px solid transparent;
 }
 .oee-section-head:hover { background: rgba(148,163,184,.06); }
 .oee-caret { transition: transform .15s ease; display: inline-block; }
 .oee-caret.open { transform: rotate(90deg); }
 .oee-count {
-  font-size: 10.5px; font-weight: 700; padding: 1px 7px; border-radius: 999px;
+  font-size: var(--font-xs); font-weight: 700; padding: 1px var(--space-3); border-radius: 999px;
   border: 1px solid var(--stroke); background: rgba(148,163,184,.12);
 }
-.oee-section-sub { font-size: 11px; }
-.oee-section-actions { margin-left: auto; display: flex; gap: 6px; }
-.oee-section-body { padding: 0 14px 14px; border-top: 1px solid var(--stroke); }
-.oee-subhead { margin: 12px 0 6px; font-size: 13px; }
-.oee-scope-note { font-size: 12px; }
+.oee-section-sub { font-size: var(--font-xs); }
+.oee-section-actions { margin-left: auto; display: flex; gap: var(--space-2); }
+.oee-section-body { padding: 0 var(--space-5) var(--space-5); border-top: 1px solid var(--stroke); }
+.oee-subhead { margin: 12px 0 6px; font-size: var(--font-sm); }
+.oee-scope-note { font-size: var(--font-sm); }
 
-.oee-machine-editor { display: grid; grid-template-columns: 220px 1fr; gap: 12px; }
+.oee-machine-editor { display: grid; grid-template-columns: 220px 1fr; gap: var(--space-5); }
 .oee-machine-list { display: flex; flex-direction: column; gap: 4px; max-height: 420px; overflow-y: auto; }
 .oee-machine-item {
   display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
-  padding: 7px 10px; border-radius: 8px; border: 1px solid var(--stroke);
+  padding: var(--space-3) var(--space-4); border-radius: var(--radius-sm); border: 1px solid var(--stroke);
   background: var(--card); color: inherit; cursor: pointer; text-align: left;
 }
 .oee-machine-item.active { outline: 2px solid var(--accent, #22c55e); }
 .oee-off-badge {
-  font-size: 9.5px; font-weight: 700; padding: 0 5px; border-radius: 4px;
+  font-size: var(--font-xs); font-weight: 700; padding: 0 5px; border-radius: var(--radius-sm);
   background: rgba(239,68,68,.18);
 }
-.oee-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
-.oee-form-grid label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
+.oee-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--space-4); }
+.oee-form-grid label { display: flex; flex-direction: column; gap: 3px; font-size: var(--font-xs); }
 .oee-span-2 { grid-column: span 2; }
 .oee-span-all { grid-column: 1 / -1; }
 /* Toggles on ONE row each, wrapping - the dialog density convention. */
 .oee-toggle-row {
-  display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 10px 0;
-  padding: 8px 10px; border: 1px solid var(--stroke); border-radius: 8px;
+  display: flex; flex-wrap: wrap; gap: var(--space-3) 18px; margin: 10px 0;
+  padding: var(--space-3) var(--space-4); border: 1px solid var(--stroke); border-radius: var(--radius-sm);
 }
 .oee-row-card {
-  border: 1px solid var(--stroke); border-radius: 8px; padding: 10px;
-  margin-bottom: 8px; display: flex; flex-direction: column; gap: 8px;
+  border: 1px solid var(--stroke); border-radius: var(--radius-sm); padding: var(--space-4);
+  margin-bottom: var(--space-3); display: flex; flex-direction: column; gap: var(--space-3);
 }
-.oee-row-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.oee-row-head { display: flex; flex-wrap: wrap; gap: var(--space-3); align-items: center; }
 .oee-row-head > select { min-width: 150px; }
 .oee-row-head > button { margin-left: auto; }
-.oee-tagpicker { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
-.oee-tagpicker label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
-.oee-examples { font-size: 11px; line-height: 1.5; margin-top: 6px; }
+.oee-tagpicker { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: var(--space-4); }
+.oee-tagpicker label { display: flex; flex-direction: column; gap: 3px; font-size: var(--font-xs); }
+.oee-examples { font-size: var(--font-xs); line-height: 1.5; margin-top: var(--space-2); }
 .oee-examples em { font-style: normal; font-weight: 700; }
 
 .oee-rule-row {
   display: grid;
   grid-template-columns: 34px minmax(120px, 1.4fr) 110px 80px 80px 80px 130px 62px 62px 34px;
-  gap: 6px; align-items: center; margin-bottom: 6px;
+  gap: var(--space-2); align-items: center; margin-bottom: var(--space-2);
 }
 .oee-rule-row input, .oee-rule-row select { min-width: 0; }
 
 .oee-simple-table { overflow-x: auto; }
-.oee-st-head, .oee-st-row { display: grid; gap: 6px; align-items: center; }
+.oee-st-head, .oee-st-row { display: grid; gap: var(--space-2); align-items: center; }
 .oee-st-head {
-  font-size: 10.5px; text-transform: uppercase; letter-spacing: .03em;
+  font-size: var(--font-xs); text-transform: uppercase; letter-spacing: .03em;
   color: var(--muted); margin-bottom: 4px;
 }
 .oee-st-row { margin-bottom: 5px; }
 .oee-st-row input, .oee-st-row select { width: 100%; min-width: 0; }
 .oee-st-actions { display: flex; gap: 4px; }
 
-.oee-empty { padding: 18px 6px; display: flex; flex-direction: column; gap: 4px; }
-.oee-empty .muted { font-size: 12px; }
+.oee-empty { padding: 18px var(--space-2); display: flex; flex-direction: column; gap: 4px; }
+.oee-empty .muted { font-size: var(--font-sm); }
 
 /* Narrow screens: stack the machine editor and let the cards breathe. */
 @media (max-width: 900px) {
@@ -8033,16 +8178,16 @@ textarea {
    machine appeared. The window caption reads perfectly well at the end of the
    control row, and the whole bar is now one line. */
 .oee-period-bar {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: var(--space-3);
   flex-wrap: wrap; margin-bottom: 0;
 }
-.oee-period-window { font-size: 11.5px; white-space: nowrap; }
+.oee-period-window { font-size: var(--font-xs); white-space: nowrap; }
 /* Narrower than the 150px they were given: at ~1044px of content the row has
    to hold a preset, two steppers, a shift, a line, two filters and the
    refresh interval. */
 .oee-period-bar select { width: auto; min-width: 104px; max-width: 150px; }
 .oee-stepper { display: inline-flex; align-items: center; gap: 4px; }
-.oee-stepper-label { font-size: 11px; opacity: .7; min-width: 34px; text-align: center; }
+.oee-stepper-label { font-size: var(--font-xs); opacity: .7; min-width: 34px; text-align: center; }
 
 /* ---- gauge ---- */
 .oee-gauge { position: relative; display: inline-grid; place-items: center; }
@@ -8056,22 +8201,22 @@ textarea {
 .oee-gauge-warn { stroke: #e0a458; }
 .oee-gauge-bad  { stroke: #ef4444; }
 .oee-gauge-centre { position: relative; text-align: center; line-height: 1.15; }
-.oee-gauge-value { font-size: 20px; font-weight: 700; }
-.oee-gauge-label { font-size: 10px; opacity: .7; text-transform: uppercase; letter-spacing: .04em; }
+.oee-gauge-value { font-size: var(--font-lg); font-weight: 700; }
+.oee-gauge-label { font-size: var(--font-xs); opacity: .7; text-transform: uppercase; letter-spacing: .04em; }
 .oee-tone-good { color: #16a34a; }
 .oee-tone-warn { color: #e0a458; }
 .oee-tone-bad  { color: #ef4444; }
 
 /* ---- A/P/Q bars ---- */
 .oee-apq { display: grid; gap: 4px; min-width: 132px; }
-.oee-apq-row { display: grid; grid-template-columns: 14px 1fr 42px; gap: 6px; align-items: center; }
-.oee-apq-key { font-size: 11px; font-weight: 700; opacity: .75; }
+.oee-apq-row { display: grid; grid-template-columns: 14px 1fr 42px; gap: var(--space-2); align-items: center; }
+.oee-apq-key { font-size: var(--font-xs); font-weight: 700; opacity: .75; }
 .oee-apq-track { height: 6px; border-radius: 999px; background: var(--stroke); overflow: hidden; }
 .oee-apq-fill { display: block; height: 100%; background: var(--accent, #14b8a6); }
 .oee-apq-good { background: #16a34a; }
 .oee-apq-warn { background: #e0a458; }
 .oee-apq-bad  { background: #ef4444; }
-.oee-apq-val { font-size: 11px; text-align: right; }
+.oee-apq-val { font-size: var(--font-xs); text-align: right; }
 
 /* ---- maturity ---- */
 .oee-maturity {
@@ -8079,8 +8224,8 @@ textarea {
      "2 of 3 machines have a complete figure", which wrapped to six lines and
      shoved the sparkline out of the card. One line, ellipsis, full text in
      the title attribute where it was always available. */
-  display: inline-block; font-size: 10.5px; font-weight: 700;
-  padding: 1px 7px; border-radius: 999px; border: 1px solid var(--stroke);
+  display: inline-block; font-size: var(--font-xs); font-weight: 700;
+  padding: 1px var(--space-3); border-radius: 999px; border: 1px solid var(--stroke);
   max-width: 100%; white-space: nowrap; overflow: hidden;
   text-overflow: ellipsis; vertical-align: bottom;
 }
@@ -8091,23 +8236,23 @@ textarea {
 .oee-mc-clickable { cursor: pointer; }
 .oee-mc-clickable:hover { border-color: var(--accent, #14b8a6); }
 .oee-mc-clickable:focus-visible { outline: 2px solid var(--accent, #14b8a6); outline-offset: 2px; }
-.oee-mc-gauge-row { display: flex; gap: 12px; align-items: center; margin: 6px 0; }
+.oee-mc-gauge-row { display: flex; gap: var(--space-5); align-items: center; margin: 6px 0; }
 
 /* ---- timeline ---- */
 .oee-timeline { display: grid; gap: 4px; }
-.oee-tl-lane { display: grid; grid-template-columns: 150px 1fr; gap: 8px; align-items: center; }
+.oee-tl-lane { display: grid; grid-template-columns: 150px 1fr; gap: var(--space-3); align-items: center; }
 .oee-tl-name {
-  font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: var(--font-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .oee-tl-track {
-  position: relative; background: var(--stroke); border-radius: 4px; overflow: hidden;
+  position: relative; background: var(--stroke); border-radius: var(--radius-sm); overflow: hidden;
 }
 .oee-tl-block {
   position: absolute; top: 0; bottom: 0; border: 0; padding: 0;
   cursor: pointer; min-width: 1px;
 }
 .oee-tl-block:hover { filter: brightness(1.15); }
-.oee-tl-legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px; opacity: .8; margin-top: 4px; }
+.oee-tl-legend { display: flex; gap: var(--space-5); flex-wrap: wrap; font-size: var(--font-xs); opacity: .8; margin-top: 4px; }
 .oee-tl-legend-item { display: inline-flex; align-items: center; gap: 4px; }
 .oee-tl-legend-item i { width: 12px; height: 8px; border-radius: 2px; display: inline-block; }
 
@@ -8124,15 +8269,15 @@ textarea {
 .oee-state-dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; }
 
 /* ---- machine detail ---- */
-.oee-detail { display: grid; gap: 12px; }
-.oee-detail-head { display: grid; gap: 6px; margin-bottom: 10px; }
+.oee-detail { display: grid; gap: var(--space-5); }
+.oee-detail-head { display: grid; gap: var(--space-2); margin-bottom: var(--space-4); }
 .oee-detail-kpis {
-  display: grid; gap: 12px; align-items: center;
+  display: grid; gap: var(--space-5); align-items: center;
   grid-template-columns: auto auto repeat(auto-fit, minmax(140px, 1fr));
 }
-.oee-detail-gauge { display: grid; gap: 6px; justify-items: center; }
+.oee-detail-gauge { display: grid; gap: var(--space-2); justify-items: center; }
 .oee-block-detail { display: grid; gap: 4px; margin: 8px 0; }
-.oee-block-detail > div { display: grid; grid-template-columns: 110px 1fr; gap: 8px; font-size: 12.5px; }
+.oee-block-detail > div { display: grid; grid-template-columns: 110px 1fr; gap: var(--space-3); font-size: var(--font-sm); }
 /* Twelve columns inside the ~980px a laptop leaves once the sidebar is
    open. The fixed columns hold values of known length (times, durations,
    yes/no); Reason and Comment take what is left and ellipsis, because they
@@ -8143,7 +8288,7 @@ textarea {
 .oee-dt-table { display: block; overflow-x: auto; }
 .oee-dt-table .thead, .oee-dt-table .trow {
   display: grid;
-  gap: 6px;
+  gap: var(--space-2);
   grid-template-columns:
     58px 58px 62px 92px minmax(0, 1.4fr) 88px 74px 80px 72px 84px
     minmax(0, 1fr) 132px;
@@ -8154,22 +8299,22 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.oee-dt-table .trow + .trow { margin-top: 6px; }
+.oee-dt-table .trow + .trow { margin-top: var(--space-2); }
 /* A stop nobody has classified is the work this table exists to surface. */
 .oee-dt-table .trow.oee-dt-unknown {
   box-shadow: inset 3px 0 0 var(--warn, #f59e0b);
 }
 .oee-needs-reason { color: var(--warn, #f59e0b); font-style: normal; }
 .oee-dt-actions { display: flex; gap: 4px; justify-content: flex-end; }
-.oee-dt-actions .btn { padding: 2px 8px; font-size: 11px; white-space: nowrap; }
+.oee-dt-actions .btn { padding: 2px var(--space-3); font-size: var(--font-xs); white-space: nowrap; }
 .oee-dt-comment { opacity: 0.8; }
 .oee-dt-form label.span-2 { grid-column: 1 / -1; }
 
 /* ---- planning ---- */
-.oee-planning { display: grid; gap: 12px; }
+.oee-planning { display: grid; gap: var(--space-5); }
 .oee-plan-timeline .oee-tl-block { border-radius: 3px; }
 .oee-plan-label {
-  font-size: 10px; padding: 0 4px; color: #fff; white-space: nowrap;
+  font-size: var(--font-xs); padding: 0 4px; color: #fff; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; display: block;
 }
 .oee-plan-planned_production { background: #16a34a; }
@@ -8184,18 +8329,18 @@ textarea {
 }
 
 /* ---- dashboard widgets ---- */
-.oee-widget { display: grid; gap: 6px; height: 100%; align-content: start; }
-.oee-widget-title { font-size: 12px; font-weight: 700; opacity: .85; }
-.oee-widget-meta { font-size: 10.5px; }
+.oee-widget { display: grid; gap: var(--space-2); height: 100%; align-content: start; }
+.oee-widget-title { font-size: var(--font-sm); font-weight: 700; opacity: .85; }
+.oee-widget-meta { font-size: var(--font-xs); }
 .oee-widget-kpi { display: grid; place-items: center; }
-.oee-widget-machine { display: flex; gap: 12px; align-items: center; }
-.oee-widget-facts { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11.5px; }
+.oee-widget-machine { display: flex; gap: var(--space-5); align-items: center; }
+.oee-widget-facts { display: flex; gap: var(--space-4); flex-wrap: wrap; font-size: var(--font-xs); }
 .oee-widget-states { display: grid; gap: 4px; }
-.oee-widget-state-row { display: grid; grid-template-columns: 12px 1fr auto auto; gap: 8px; align-items: center; font-size: 12px; }
+.oee-widget-state-row { display: grid; grid-template-columns: 12px 1fr auto auto; gap: var(--space-3); align-items: center; font-size: var(--font-sm); }
 .oee-widget-state-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.oee-widget-state-label { font-size: 11px; opacity: .75; }
+.oee-widget-state-label { font-size: var(--font-xs); opacity: .75; }
 .oee-widget-quality { display: grid; gap: 4px; }
-.oee-widget-quality-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.oee-widget-quality-row { display: flex; justify-content: space-between; align-items: center; gap: var(--space-3); }
 .oee-widget-quality-count { font-weight: 700; }
 
 /* ===================================================== button variants
@@ -8431,47 +8576,59 @@ textarea {
 }
 
 /* ================================== settings pages: use the width available
-   2026-08-29, reported: "Settings/Interface is not well designed — minimum
+   2026-08-29, reported: "Settings/Interface is not well designed - minimum
    spaces and more items on the screen across the width without scrolling."
 
-   These pages are a stack of small cards, each holding a handful of fields.
-   On a 1400 px screen that wastes two thirds of the width and makes the
-   operator scroll past six cards to reach the last setting. Columns instead,
-   and only once there is genuinely room: below 1180 px they stay stacked,
-   because two cramped columns are worse than one readable one. */
-@media (min-width: 1180px) {
-  .content-scroll[data-page="interface"],
-  .content-scroll[data-page="edge"],
-  .content-scroll[data-page="directories"] {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(430px, 1fr));
-    gap: var(--space-3, 10px);
-    align-items: start;
-  }
-  /* Full-width elements must not be dragged into a column: the page title,
-     any alert, and the workspace banner still span the whole page. */
-  .content-scroll[data-page="interface"] > .page-title-row,
-  .content-scroll[data-page="edge"] > .page-title-row,
-  .content-scroll[data-page="directories"] > .page-title-row,
-  .content-scroll[data-page="interface"] > .error,
-  .content-scroll[data-page="edge"] > .error,
-  .content-scroll[data-page="directories"] > .error,
-  .content-scroll[data-page="interface"] > .workspace-warning,
-  .content-scroll[data-page="edge"] > .workspace-warning,
-  .content-scroll[data-page="directories"] > .workspace-warning {
-    grid-column: 1 / -1;
-  }
+   First attempt put the CARDS in two columns. 2026-10-02 the operator asked
+   for the opposite and was right: a card is a subject ("Edge Identity",
+   "Time and Timestamp Display"), and splitting subjects into columns makes
+   the eye hunt. One card per row, full width - and the width is spent on the
+   FIELDS INSIDE it, which flow four or five across instead of two. Same
+   screen, fewer rows, and the reading order stays top to bottom. */
+.content-scroll[data-page="interface"],
+.content-scroll[data-page="edge"],
+.content-scroll[data-page="directories"] {
+  gap: var(--space-2, 8px);
 }
 
 /* A card on a settings page carries a title and a few fields; the default
    card padding is tuned for data pages and leaves too much air here. */
 .content-scroll[data-page="interface"] .card,
-.content-scroll[data-page="edge"] .card {
+.content-scroll[data-page="edge"] .card,
+.content-scroll[data-page="directories"] .card {
   padding: var(--space-3, 10px) var(--space-4, 14px);
 }
 .content-scroll[data-page="interface"] .card-title,
-.content-scroll[data-page="edge"] .card-title {
+.content-scroll[data-page="edge"] .card-title,
+.content-scroll[data-page="directories"] .card-title {
   margin-bottom: 6px;
+}
+.content-scroll[data-page="interface"] .interface-header-row,
+.content-scroll[data-page="edge"] .interface-header-row,
+.content-scroll[data-page="directories"] .interface-header-row {
+  margin-bottom: 6px;
+}
+/* The fields are what spends the width now. A settings field is a label and
+   a short control, so it needs far less than the 260 px the data pages ask
+   for - at 240 px a 1400 px card fits five across. */
+.content-scroll[data-page="interface"] .form-grid,
+.content-scroll[data-page="edge"] .form-grid,
+.content-scroll[data-page="directories"] .form-grid {
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--space-2, 8px) var(--space-3, 10px);
+  margin-bottom: 8px;
+}
+.content-scroll[data-page="interface"] .form-grid:last-child,
+.content-scroll[data-page="edge"] .form-grid:last-child,
+.content-scroll[data-page="directories"] .form-grid:last-child {
+  margin-bottom: 0;
+}
+/* A one-line explanation under a control does not deserve its own band of
+   air; keep it attached to the field it explains. */
+.content-scroll[data-page="interface"] .lock-note,
+.content-scroll[data-page="edge"] .lock-note,
+.content-scroll[data-page="directories"] .lock-note {
+  margin-top: 4px;
 }
 
 /* The resolution the SERVER chose for the current window. A chart of a month
@@ -9043,7 +9200,7 @@ textarea {
    legend toggles, Pareto controls, refresh interval. Every other .oee-* rule
    already lives in this file, so these do too - one stylesheet to search
    beats two that each hold half the answer. */
-.oee-kpi-delta { font-size: 11px; margin-top: 2px; }
+.oee-kpi-delta { font-size: var(--font-xs); margin-top: 2px; }
 .oee-kpi-delta.is-up { color: var(--ok, #22c55e); }
 .oee-kpi-delta.is-down { color: var(--danger, #ef4444); }
 .oee-kpi-delta.is-none { opacity: 0.5; }
@@ -9052,43 +9209,43 @@ textarea {
 .oee-kpi-spark .recharts-wrapper { height: 18px !important; }
 .oee-kpi-maturity { margin-top: 4px; min-width: 0; max-width: 100%; }
 
-.oee-period-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.oee-period-row { display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap; }
 /* No `margin-left: auto` here. Measured at 1366px: it computed to 919px,
    consumed every pixel of free space in the wrapping row and GUARANTEED the
    control wrapped onto a line of its own - the row was 1086px of children in
    1066px, over by twenty, and the auto margin turned that into a 75px second
    row. It sits after the Filters button instead, and wraps only when it
    genuinely has to. */
-.oee-refresh { display: flex; align-items: center; gap: 8px; }
+.oee-refresh { display: flex; align-items: center; gap: var(--space-3); }
 /* Explicit row: the global `label { display: grid }` and several page-level
    `label { flex-direction: column }` rules are all trying to stack this, and
    a stacked caption doubles the height of the toolbar. */
 .oee-toolbar-field {
   display: flex; flex-direction: row; align-items: center;
-  gap: 6px; font-size: 11px;
+  gap: var(--space-2); font-size: var(--font-xs);
 }
 .oee-toolbar-field > span {
   opacity: 0.7; text-transform: uppercase; letter-spacing: 0.04em;
 }
-.oee-live { font-size: 11px; opacity: 0.75; display: inline-flex; align-items: center; gap: 6px; }
+.oee-live { font-size: var(--font-xs); opacity: 0.75; display: inline-flex; align-items: center; gap: var(--space-2); }
 .oee-live-dot {
   width: 7px; height: 7px; border-radius: 50%;
   background: var(--ok, #22c55e); display: inline-block;
 }
 
 /* Trend legend: checkboxes, so a line can be taken off the chart. */
-.oee-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 6px; }
+.oee-legend { display: flex; flex-wrap: wrap; gap: var(--space-5); margin-bottom: var(--space-2); }
 .oee-legend-item {
-  display: inline-flex; align-items: center; gap: 6px; font-size: 11px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: var(--space-2); font-size: var(--font-xs); cursor: pointer;
 }
 .oee-legend-dot { width: 10px; height: 3px; border-radius: 2px; display: inline-block; }
 
 .oee-tooltip {
   background: var(--card, #111); border: 1px solid var(--line, rgba(255, 255, 255, 0.15));
-  border-radius: 6px; padding: 8px 10px; font-size: 11px; min-width: 170px;
+  border-radius: var(--radius-sm); padding: var(--space-3) var(--space-4); font-size: var(--font-xs); min-width: 170px;
 }
 .oee-tt-time { font-weight: 700; margin-bottom: 4px; opacity: 0.8; }
-.oee-tt-row { display: flex; justify-content: space-between; gap: 14px; }
+.oee-tt-row { display: flex; justify-content: space-between; gap: var(--space-5); }
 
 /* A two-way toggle. Built from the same tokens as .oee-tab so Duration/Stops
    reads as a choice, not as one wide button - it had no rule at all and the
@@ -9096,7 +9253,7 @@ textarea {
 .seg {
   display: inline-flex;
   border: 1px solid var(--stroke);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   overflow: hidden;
 }
 .seg button {
@@ -9118,7 +9275,7 @@ textarea {
 }
 
 .oee-pareto-controls {
-  display: flex; align-items: center; gap: 12px; margin-bottom: 6px; flex-wrap: wrap;
+  display: flex; align-items: center; gap: var(--space-5); margin-bottom: var(--space-2); flex-wrap: wrap;
 }
 
 
@@ -9127,8 +9284,8 @@ textarea {
    Colours come from the theme tokens, so light and dark both follow the
    app rather than this page. */
 .oee-breadcrumb {
-  display: flex; align-items: center; gap: 6px;
-  font-size: 12px; color: var(--muted);
+  display: flex; align-items: center; gap: var(--space-2);
+  font-size: var(--font-sm); color: var(--muted);
 }
 .oee-breadcrumb [aria-current="page"] { color: var(--text); }
 .linkish {
@@ -9137,13 +9294,13 @@ textarea {
 }
 .linkish:hover { color: var(--text); text-decoration: underline; }
 
-.oee-detail-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.oee-detail-title { display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap; }
 .oee-detail-title h3 { margin: 0; }
 .oee-head-spacer { margin-left: auto; }
 
 .oee-ctx-row {
-  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-  font-size: 12px;
+  display: flex; align-items: center; gap: var(--space-5); flex-wrap: wrap;
+  font-size: var(--font-sm);
 }
 .oee-ctx-item { display: inline-flex; align-items: baseline; gap: 5px; }
 .oee-ctx-label { color: var(--muted); }
@@ -9156,29 +9313,241 @@ textarea {
   position: absolute; right: 0; top: calc(100% + 4px); z-index: 40;
   min-width: 240px; padding: 4px;
   background: var(--panel, var(--card)); color: var(--text);
-  border: 1px solid var(--stroke); border-radius: 10px;
+  border: 1px solid var(--stroke); border-radius: var(--radius-md);
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.28);
 }
 .oee-quick-menu button {
   display: block; width: 100%; text-align: left;
   background: none; border: 0; color: inherit; font: inherit;
-  padding: 7px 10px; border-radius: 7px; cursor: pointer;
+  padding: var(--space-3) var(--space-4); border-radius: 7px; cursor: pointer;
 }
 .oee-quick-menu button:hover { background: var(--table-row); }
 .oee-quick-note {
-  padding: 6px 10px; font-size: 11px; color: var(--muted);
+  padding: var(--space-2) var(--space-4); font-size: var(--font-xs); color: var(--muted);
   border-top: 1px solid var(--stroke); margin-top: 4px;
 }
-.oee-quick-none { font-size: 12px; }
+.oee-quick-none { font-size: var(--font-sm); }
 
 /* Two cards side by side, stacking on a narrow panel. */
 .oee-detail-row {
-  display: grid; gap: 12px; margin-bottom: 12px;
+  display: grid; gap: var(--space-5); margin-bottom: var(--space-5);
   grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
 }
-.oee-detail-tabs { display: flex; gap: 6px; margin: 4px 0 12px; }
+.oee-detail-tabs { display: flex; gap: var(--space-2); margin: 4px 0 12px; }
 .oee-filter-extra {
-  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-  padding: 8px 10px; margin-bottom: 10px;
-  border: 1px solid var(--stroke); border-radius: 10px;
+  display: flex; align-items: center; gap: var(--space-5); flex-wrap: wrap;
+  padding: var(--space-3) var(--space-4); margin-bottom: var(--space-4);
+  border: 1px solid var(--stroke); border-radius: var(--radius-md);
+}
+
+/* ---------------------------------------- scheduled report destination
+   2026-10-07: "the location to pick where the report would be saved should
+   be a option to pick the folder and validated". The result of that check
+   sits under the field, so a bad path is visible while typing rather than
+   discovered when a run fails overnight. */
+.sr-path-field { min-width: 0; }
+.sr-path-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.sr-path-row input { flex: 1 1 auto; min-width: 0; }
+.sr-path-ok,
+.sr-path-bad {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.sr-path-ok { color: var(--ok, #14a89a); }
+.sr-path-bad { color: var(--warn, #d98324); }
+/* The tokens a file name accepts, spelled out next to the field. */
+.sr-token-hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.sr-token-hint code {
+  background: var(--card_2, rgba(127, 127, 127, .14));
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+/* ======================================================== batch KPI cards
+   2026-10-08, reported: "the batch management batch overview page the KIPS
+   should be better arranged designed".
+
+   They were a flex-wrap row of inline-styled boxes, each min-width 120 px
+   with its own font sizes. Wrapping left a ragged gap at the end of every
+   line, a long label pushed its card wider than its neighbours, and the
+   values sat at whatever height their own label happened to end at.
+
+   A grid fixes all three: equal columns that fill the row, equal heights,
+   and the value on a common baseline because the label occupies a fixed
+   band above it. Sizes come from the tokens, so these read as the same
+   component as every other KPI in the app. */
+.bm-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: var(--space-3);
+  align-items: stretch;
+}
+.bm-kpi-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: var(--space-1);
+  min-width: 0;
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-md);
+  background: var(--card-2, var(--card));
+}
+/* Two lines of room, so a wrapped label cannot shove the value down out of
+   line with the card beside it. */
+.bm-kpi-label {
+  font-size: var(--font-xs);
+  color: var(--muted);
+  line-height: 1.25;
+  min-height: calc(var(--font-xs) * 2.5);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.bm-kpi-value {
+  font-size: var(--font-lg);
+  font-weight: 700;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.bm-kpi-flag {
+  font-size: var(--font-xs);
+  font-weight: 700;
+  color: var(--danger);
+}
+.bm-kpi-empty {
+  color: var(--muted);
+  font-size: var(--font-sm);
+}
+
+/* ---------------------------------------- report builder: text + table style
+   2026-10-09: size / colour / alignment / weight for text sections, and the
+   rule controls for tables. A colour input next to its reset, and the B / I
+   pair as a toggle group rather than two stray checkboxes. */
+.tn-colour-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.tn-colour-row input[type="color"] {
+  width: 38px;
+  min-width: 38px;
+  height: 28px;
+  padding: 2px;
+  cursor: pointer;
+}
+.tn-style-toggles {
+  display: flex;
+  gap: var(--space-2);
+}
+.tn-style-toggles .btn {
+  min-width: 34px;
+  padding: 0 var(--space-3);
+}
+
+/* ------------------------------------------------ report builder: pill rows
+   2026-10-09: a pill is label + value + two colours, and it has to be
+   editable on one line or a card of six becomes a wall of stacked inputs. */
+.tn-pill-row {
+  display: grid;
+  grid-template-columns:
+    minmax(70px, 1fr) minmax(90px, 1.2fr) minmax(76px, .9fr)
+    minmax(76px, .9fr) minmax(64px, .7fr) minmax(44px, .45fr)
+    minmax(84px, .9fr) 38px 38px auto auto;
+  gap: var(--space-2);
+  align-items: center;
+  margin-bottom: var(--space-2);
+}
+.tn-pill-row input,
+.tn-pill-row select { min-width: 0; }
+.tn-pill-row input[type="color"] {
+  width: 38px;
+  height: 28px;
+  padding: 2px;
+  cursor: pointer;
+}
+/* A pill bound to a tag takes its value from the tag; the text box says so
+   by dimming rather than silently losing what is typed into it. */
+.tn-pill-row input:disabled { opacity: .45; }
+@media (max-width: 1100px) {
+  .tn-pill-row { grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); }
+}
+
+/* --------------------------------------- report builder: details table rows
+   A row of cells edited inline, so a six-row detail sheet stays one screen. */
+.tn-static-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin-bottom: var(--space-2);
+}
+.tn-static-row input { flex: 1 1 0; min-width: 0; }
+.tn-token-help {
+  margin: var(--space-1) 0 var(--space-3);
+  font-size: var(--font-xs);
+  color: var(--muted);
+}
+.tn-token-help code {
+  background: var(--card_2, rgba(127, 127, 127, .14));
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.tn-pill-mask { min-width: 0; }
+
+/* Column-formatting rows: the column's name, then how it is drawn. */
+.tn-col-name {
+  flex: 0 0 150px;
+  font-size: var(--font-xs);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tn-static-row .tn-checkbox { flex: 0 0 auto; white-space: nowrap; }
+
+/* -------------------------------------------- inline tag picker (TokenInput)
+   2026-10-09: the details-table cells and the pill text accepted a tag token
+   but had no picker, so those paths had to be typed from memory. This is the
+   full TagTokenField's picker in a control that fits inside a grid row. */
+.tn-token-input {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1 1 0;
+  min-width: 0;
+}
+.tn-token-input > input { flex: 1 1 0; min-width: 0; }
+.tn-token-input .tn-tag-insert {
+  flex: 0 0 auto;
+  line-height: 1;
+  padding: 0 6px;
+}
+/* The popup floats so a row of cells does not reflow when one is opened. */
+.tn-tag-pop-inline {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 260px;
+  padding: var(--space-2);
+  display: grid;
+  gap: var(--space-2);
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .28);
 }

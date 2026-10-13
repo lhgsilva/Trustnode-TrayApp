@@ -55,7 +55,16 @@ def _build_control_plane_store():
     Wired here at import time so every caller (routers + workers + auth)
     transparently gets the right backend; no per-call branching needed.
     """
-    backend = os.environ.get("TRUSTNODE_CONTROL_PLANE_BACKEND", "").strip().lower()
+    # 2026-10-13: the target is a SETTING now (portal-editable), with the
+    # environment kept as the break-glass path. control_plane_target.resolve()
+    # owns the precedence; see that module for why a saved file wins over the
+    # environment and how to force the old behaviour.
+    try:
+        from app.services import control_plane_target as _cp_target
+        backend = _cp_target.backend()
+    except Exception:
+        # Never let a bad/unreadable target stop the service booting.
+        backend = os.environ.get("TRUSTNODE_CONTROL_PLANE_BACKEND", "").strip().lower()
     if backend == "cloud":
         try:
             from app.services.control_plane_store_cloud import ControlPlaneStoreCloud
@@ -197,8 +206,63 @@ def _scheduler_live_lookup(gateway_id: str, tag_name: str) -> float | None:
     return None
 
 
-def _render_fn(template: dict[str, Any]):
-    return render_template_to_pdf(template)
+def _scheduler_history_lookup(gateway_id: str, tag_name: str,
+                              from_utc: str, to_utc: str) -> list:
+    """Readings for one tag BETWEEN two instants, oldest first.
+
+    The cycle trigger used only the live value, sampled once per tick. A PLC
+    coil that pulses high for a scan was therefore invisible unless the daemon
+    happened to wake inside that pulse - toggling the inputs produced no
+    report at all. Reading what was RECORDED catches the pulse whenever it
+    happened, and carries its real timestamp.
+    """
+    gw = (gateway_id or "").strip()
+    tag = (tag_name or "").strip()
+    if not tag:
+        return []
+    try:
+        rows = app_store.get_historian_rows_range(
+            from_utc=from_utc, to_utc=to_utc, limit=2000, offset=0,
+            gateway=gw, tag=tag, prefer_cloud_reads=False)
+    except Exception:
+        return []
+    out = []
+    for r in reversed(rows or []):
+        ts = str(r.get("ts") or r.get("ts_utc") or "")
+        if ts:
+            out.append((ts, r.get("value")))
+    return out
+
+
+def _render_fn(template: dict[str, Any], *, window=None, segments=None,
+               file_name: str = ""):
+    """Render a template, optionally over a CYCLE window and under a chosen name.
+
+    Both extras default to off, so a time- or tag-triggered schedule renders
+    exactly as it always has.
+    """
+    output_path = None
+    if file_name:
+        import os as _os
+        from pathlib import Path as _Path
+        candidate = _Path(file_name)
+        if candidate.is_absolute() or "/" in file_name or "\\" in file_name:
+            # A full destination: the operator chose the folder (a local one,
+            # or a synced OneDrive folder - the same thing to us). Create it,
+            # and fall back to the reports folder if it cannot be written.
+            try:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                output_path = candidate
+            except OSError:
+                output_path = None
+        if output_path is None:
+            base = _os.environ.get("TRUSTNODE_DATA_DIR", "").strip() or _os.path.join(
+                _os.path.expanduser("~"), ".trustnode_edge", "data")
+            reports_dir = _Path(base) / "reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            output_path = reports_dir / candidate.name
+    return render_template_to_pdf(template, output_path=output_path, window=window,
+                                  segments=segments)
 
 
 def _is_any_gateway_running() -> bool:
@@ -231,6 +295,7 @@ report_scheduler = ReportScheduler(
     runner=report_runner,
     reports_store=reports_store,
     live_lookup=_scheduler_live_lookup,
+    history_lookup=_scheduler_history_lookup,
     email_settings_lookup=scheduler_email_settings_holder.get,
     is_any_gateway_running=_is_any_gateway_running,
     tick_seconds=15,

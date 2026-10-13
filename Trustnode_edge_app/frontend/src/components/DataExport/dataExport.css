@@ -174,3 +174,41 @@
 .dexp-conditions .dexp-condition input {
   min-height: 32px;
 }
+
+/* The first group opens the card, so it carries no divider above it. */
+.dexp-subgroup:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+/* Actions belong to the CARD, not to a field row.
+ *
+ * 2026-09-29: "the UI fields are not organized and aligned and is not
+ * organized in groups". Preview/Clear/Export were the seventh cell of the
+ * filter grid, so they wrapped with the inputs and landed at a different
+ * height from the buttons they sit beside. A footer bar pins them to the
+ * bottom-right at every width, with the status text keeping the left. */
+.dexp-footer {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  border-top: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  padding-top: 10px;
+}
+
+.dexp-footer .dexp-status {
+  margin: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* A hint that is actually a problem: a failed read, or a historian whose
+   rows sit under a tenant this edge does not resolve to. Empty dropdowns
+   alone were read as "the export page is broken" (2026-10-08). */
+.dexp-hint-bad {
+  color: var(--warn, #d98324);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}

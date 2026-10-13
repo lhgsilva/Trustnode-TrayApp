@@ -261,6 +261,32 @@ function _tokenExpiryMs(token) {
   }
 }
 
+/* Is the SAVED session beyond any hope of renewal?
+ *
+ * 2026-10-09, reported: every launch opens on "Your session has ended" plus
+ * "Configuration not loaded ... (Session expired. Please sign in again.)",
+ * over a dashboard that still renders. The app had restored the user from a
+ * token that was already dead, then blocked every request - so the operator
+ * is nominally signed in and nothing works.
+ *
+ * A token lives 12 h and the server will still renew it for 30 min past
+ * expiry, so an app closed overnight ALWAYS wakes up past saving. That case
+ * is not an incident to announce; it is simply "please sign in", and it can
+ * be decided here without a single request.
+ *
+ * Conservative on purpose: an unreadable or missing expiry returns false, so
+ * anything uncertain still goes through the normal refresh path.
+ */
+const SESSION_RENEW_GRACE_MS = 30 * 60_000;   // mirrors the server default
+
+export function storedSessionBeyondRenewal() {
+  const token = localStorage.getItem(AUTH_TOKEN_KEY) || "";
+  if (!token) return false;                   // nothing saved: not our case
+  const expMs = _tokenExpiryMs(token);
+  if (!expMs) return false;                   // unreadable: let the server say
+  return (Date.now() - expMs) > SESSION_RENEW_GRACE_MS;
+}
+
 export function sessionIsExpired() {
   return _sessionExpired;
 }
@@ -331,7 +357,22 @@ export function scheduleSessionRefresh() {
   const expMs = _tokenExpiryMs(token);
   if (!expMs) return;
   const remaining = expMs - Date.now();
-  if (remaining <= 0) return;
+  if (remaining <= 0 && storedSessionBeyondRenewal()) {
+    // Closed overnight. The server cannot renew this and saying so would
+    // raise "your session has ended" over a login screen the operator is
+    // about to use anyway. App.jsx clears it and shows the sign-in page.
+    return;
+  }
+  if (remaining <= 0) {
+    // ALREADY DEAD when the app started. Returning silently here is what made
+    // a restart open in "degraded mode": nothing renewed, nothing was said,
+    // and the boot loop then read the resulting 401 as the backend being
+    // slow. Try the renewal - the server may still accept it inside its
+    // grace window - and if it is genuinely over, refreshSession() marks the
+    // session expired, which is what raises the sign-in banner.
+    refreshSession();
+    return;
+  }
   const delay = Math.max(60_000, Math.floor(remaining * 0.7));
   _refreshTimer = setTimeout(() => { refreshSession(); }, delay);
 }
@@ -356,7 +397,12 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
     throw err;
   }
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  // Remember WHY we aborted. Without this the caller sees the browser's raw
+  // "signal is aborted without reason", which told an operator nothing: the
+  // Reporting page showed "Failed to load templates: signal is aborted
+  // without reason" whenever the backend was still warming up.
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
   try {
     const headers = { ...(options.headers || {}) };
     const token = localStorage.getItem(AUTH_TOKEN_KEY) || "";
@@ -394,6 +440,22 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
       }
     }
     return res;
+  } catch (err) {
+    if (!timedOut) throw err;
+    // A read that timed out gets ONE more, longer, attempt.
+    //
+    // At start-up the backend is still doing its deferred init, so the first
+    // wave of page loads can exceed the 12s budget; nothing retried them, so
+    // templates and configuration came up empty and the operator had to
+    // reload the app every time. Only idempotent requests, only once
+    // (__tnTimeoutRetry stops it recursing), so a slow backend cannot be
+    // turned into a stampede.
+    const method = String((options || {}).method || "GET").toUpperCase();
+    if (method !== "GET" || options.__tnTimeoutRetry) {
+      throw new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s: ${url}`);
+    }
+    return await fetchWithTimeout(
+      url, { ...options, __tnTimeoutRetry: true }, Math.round(timeoutMs * 2));
   } finally {
     clearTimeout(timeout);
   }
@@ -2691,6 +2753,19 @@ export async function setDirectories(overrides) {
   return res.json();
 }
 
+/* Is this "Save to" path a folder we can actually write into?
+   The report destination used to be free text, so a typo was only found when
+   a scheduled run failed hours later (2026-10-07). */
+export async function validateDirectoryPath(path, { create = false } = {}) {
+  const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/directories/validate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: String(path || ""), create: Boolean(create) }),
+  }, 10000);
+  await ensureOk(res, "Could not check that folder");
+  return res.json();
+}
+
 export async function resetDirectory(key) {
   const res = await fetchWithTimeout(`${getApiBase()}/api/directories/reset/${encodeURIComponent(key)}`, {
     method: "POST",
@@ -2732,6 +2807,39 @@ export async function getControlPlaneLicenses(tenantId = "") {
 // Infrastructure Endpoints (developer-admin) — the single source of truth for
 // where the deployment's services live. Values flow into activation codes so
 // edges self-configure without any hardcoded URL. 2026-07-15.
+/* Where the PORTAL's own database lives (2026-10-13).
+ *
+ * Moving the control-plane database used to mean editing systemd over SSH and
+ * restarting. These three make it a portal action, with a mandatory
+ * test-before-save so a wrong host cannot take the portal down on next boot.
+ * The password is never returned by the API - only whether one is set.
+ */
+export async function getControlPlaneDatabase() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/database`);
+  await ensureOk(res, "Control-plane database fetch failed");
+  return res.json();
+}
+
+export async function testControlPlaneDatabase(target) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/database/test`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(target || {}),
+  });
+  await ensureOk(res, "Control-plane database test failed");
+  return res.json();
+}
+
+export async function saveControlPlaneDatabase(target) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/database`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(target || {}),
+  });
+  await ensureOk(res, "Control-plane database save failed");
+  return res.json();
+}
+
 export async function getInfrastructureEndpoints(tenantId = "") {
   const params = new URLSearchParams();
   if (tenantId) params.set("tenant_id", String(tenantId));

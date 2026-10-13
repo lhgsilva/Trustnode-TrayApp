@@ -30,6 +30,31 @@ const STRINGS = {
 };
 
 function findRcedit() {
+  // The devDependency FIRST. This used to look only in electron-builder's
+  // winCodeSign cache - which build-release.ps1 deletes at the start of every
+  // build to clear stale toolchains. The build therefore removed the very
+  // tool it needed, and because signAndEditExecutable is false
+  // electron-builder never re-downloaded it, so every build after the first
+  // cleanup shipped a shell that calls itself "Electron" by "GitHub, Inc."
+  // with only a warning line to show for it.
+  //
+  // A package in node_modules cannot be cleared by our own cache cleanup, so
+  // the branding no longer depends on build order.
+  // NOTE: require.resolve("rcedit/bin/rcedit-x64.exe") does NOT work - rcedit 5
+  // declares `exports: "./lib/index.js"`, so every other subpath is blocked
+  // with ERR_PACKAGE_PATH_NOT_EXPORTED even though the file is right there.
+  // Resolve the package ENTRY (which is exported) and walk to bin/ instead.
+  const roots = [];
+  try {
+    roots.push(path.resolve(path.dirname(require.resolve("rcedit")), ".."));
+  } catch (_) { /* not installed - fall through */ }
+  roots.push(path.join(__dirname, "node_modules", "rcedit"));
+  for (const root of roots) {
+    for (const candidate of ["rcedit-x64.exe", "rcedit.exe"]) {
+      const local = path.join(root, "bin", candidate);
+      if (fs.existsSync(local)) return local;
+    }
+  }
   const cache = path.join(
     process.env.LOCALAPPDATA || "", "electron-builder", "Cache", "winCodeSign");
   if (!fs.existsSync(cache)) return null;
@@ -45,6 +70,9 @@ function findRcedit() {
   }
   return null;
 }
+
+// Exported so the build can be checked without running a full pack.
+exports.findRcedit = findRcedit;
 
 exports.default = async function afterPack(context) {
   if (context.electronPlatformName !== "win32") return;

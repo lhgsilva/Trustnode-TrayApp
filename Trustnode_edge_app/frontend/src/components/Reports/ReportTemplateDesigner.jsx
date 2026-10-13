@@ -39,11 +39,17 @@ const SECTION_PRESETS = [
   { type: "header", label: "Header", description: "Title + subtitle banner" },
   { type: "text", label: "Text block", description: "Plain text paragraph" },
   { type: "kpi_grid", label: "KPI grid", description: "Aggregated values per tag" },
+  { type: "pill_card", label: "Pill cards",
+    description: "Coloured status pills - literal text or a live tag value" },
   { type: "line_chart", label: "Line chart", description: "Tag values over time (multi-tag)" },
   { type: "area_chart", label: "Area chart", description: "Filled trend line" },
   { type: "bar_chart", label: "Bar chart", description: "Tag samples as bars" },
   { type: "pie_chart", label: "Pie chart", description: "Distribution (direct or computed rules)" },
   { type: "table", label: "Data table", description: "Historian rows with custom columns" },
+  { type: "static_table", label: "Details table",
+    description: "Your own rows - fixed text, or a tag value via {TagName}" },
+  { type: "segment_summary", label: "Test summary table",
+    description: "One row per test/cycle, aggregated per tag, with a total row" },
   { type: "image", label: "Image", description: "Embed an uploaded picture (logo, photo, diagram)" },
   { type: "spacer", label: "Spacer", description: "Vertical gap" },
   { type: "page_break", label: "Page break", description: "Force a new page" },
@@ -62,6 +68,11 @@ const TIME_PRESETS = [
   // Operator 2026-07-06: anchor the section to a BATCH's window — the report
   // shows exactly the data collected during that batch (or the latest of a type).
   { value: "batch", label: "Batch window" },
+  // 2026-09-30: the run's own trigger window, and one sub-period of it.
+  // "Run window" is what a section follows by default; "Segment" lets four
+  // charts on one page each cover a different test or cycle.
+  { value: "run", label: "Run window (start→stop trigger)" },
+  { value: "segment", label: "One test / cycle (segment)" },
 ];
 
 // Picker shown when a section's time-range preset is "batch". Lets the user
@@ -120,6 +131,20 @@ const KPI_AGGREGATIONS = [
   { value: "min", label: "Min" },
   { value: "max", label: "Max" },
   { value: "latest", label: "Latest" },
+];
+
+// What a Test summary table can compute per test, and again across tests.
+// Mirrors the backend's _reduce(); "latest" is deliberately absent because a
+// column of per-test results has no meaningful "latest".
+const SEGMENT_AGGREGATIONS = [
+  { value: "avg", label: "Average" },
+  { value: "min", label: "Min" },
+  { value: "max", label: "Max" },
+  { value: "last", label: "Final value" },
+  { value: "first", label: "First value" },
+  { value: "sum", label: "Sum" },
+  { value: "count", label: "Count" },
+  { value: "median", label: "Median" },
 ];
 
 const RULE_OPERATORS = [
@@ -236,8 +261,356 @@ function toUtcFilterText(preset, fromUtc, toUtc) {
 // Preset starter templates so users can begin from a sensible skeleton
 // instead of an empty draft. They map gateway_id / tag_name to "" so the
 // operator can pick concrete tags in the section editor before saving.
+// A TCU functional test, as described by the operator on 2026-09-30:
+//   initial assessment (a short test), then a final test of several cycles
+//   whose average is the result. Both run the phases Enabling, Deadhead,
+//   Heating, Holding, Cooling, Holding, monitoring pressure, flow and
+//   temperature on the reference unit and on the TCU under test.
+//
+// Every section that needs its own window uses a SECTION TRIGGER on the phase
+// tag, so the same template works whether it is fired by the test's own
+// start/stop trigger or by a schedule. Gateway and tag names are left blank
+// on purpose - the operator picks them from their own gateways, and a guessed
+// tag name would render an empty chart that looks like a failed test.
+const TCU_PHASES = ["Enabling", "Deadhead", "Heating", "Holding", "Cooling"];
+
+function tcuPhaseTrigger(phase) {
+  return { start: { gateway_id: "", tag_name: "", operator: "==", value: phase } };
+}
+
+function tcuTestingReport() {
+  const meas = [
+    { label: "Pressure", tag: "" },
+    { label: "Flow", tag: "" },
+    { label: "Temperature", tag: "" },
+  ];
+  return {
+    name: "Testing Report",
+    description: "TCU functional test - initial assessment, final test cycles, per-phase detail",
+    sections: [
+      { ...defaultSection("header"), title: "Testing Report",
+        subtitle: "TCU functional test" },
+      { ...defaultSection("text"), title: "Part details",
+        text: "Part number:\nSerial number:\nDescription:\nOperator:\nRecipe:" },
+
+      // Whole-test KPIs: the main start/stop trigger window.
+      { ...defaultSection("kpi_grid"), title: "Overall result",
+        time_range: { preset: "run" }, columns: 4,
+        items: meas.map((m) => ({ label: m.label, gateway_id: "", tag_name: m.tag,
+                                  aggregation: "avg", operator: "any" })) },
+
+      // KPIs for one phase only - a different window inside the same report.
+      { ...defaultSection("kpi_grid"), title: "Heating phase",
+        time_range: { preset: "run" }, trigger: tcuPhaseTrigger("Heating"), columns: 3,
+        items: meas.map((m) => ({ label: `${m.label} (heating)`, gateway_id: "",
+                                  tag_name: m.tag, aggregation: "max", operator: "any" })) },
+
+      { ...defaultSection("area_chart"), title: "Temperature - whole test",
+        time_range: { preset: "run" } },
+      { ...defaultSection("line_chart"), title: "Heating phase detail",
+        time_range: { preset: "run" }, trigger: tcuPhaseTrigger("Heating") },
+      { ...defaultSection("bar_chart"), title: "Cooling phase detail",
+        time_range: { preset: "run" }, trigger: tcuPhaseTrigger("Cooling") },
+
+      { ...defaultSection("table"), title: "Telemetry", row_limit: 100,
+        time_range: { preset: "run" } },
+
+      // One row per cycle of the final test, averaged at the foot: "the
+      // average results of them is the final test result".
+      { ...defaultSection("segment_summary"), title: "Final test - result per cycle",
+        stream: "cycle", segment: "", segment_header: "Cycle",
+        columns: meas.map((m) => ({ tag_name: m.tag, aggregation: "avg",
+                                    title: `${m.label} avg` })),
+        footer_aggregation: "avg", footer_label: "Final result", format: "3dp" },
+
+      // One row per phase, so the recipe can be checked phase by phase.
+      { ...defaultSection("segment_summary"), title: "Results by phase",
+        stream: "phase", segment: "", segment_header: "Phase",
+        columns: meas.map((m) => ({ tag_name: m.tag, aggregation: "avg",
+                                    title: `${m.label} avg` })),
+        footer_aggregation: "", format: "3dp" },
+
+      { ...defaultSection("table"), title: "Alarm log", row_limit: 100,
+        time_range: { preset: "run" } },
+    ],
+  };
+}
+
+// The live PLC cycle rig: cycle_started / cycle_ended open and close the run,
+// cycle_started1/2 and cycle_ended1/2 mark the two inner cycles, and
+// SimREAL[3] / SimREAL[4] are the values being charted.
+//
+// 2026-10-01: the tag names are REAL, so the preset works the moment it is
+// chosen. gateway_id is left blank on purpose - the historian matches on the
+// tag alone when no gateway is given, so there is no id here to go stale.
+const PLC_VALUE_TAGS = ["SimREAL[3]", "SimREAL[4]"];
+
+function plcSeries(tag, color) {
+  return { id: tag, label: tag, gateway_id: "", tag_name: tag, color };
+}
+
+function plcCond(tag) {
+  return { gateway_id: "", tag_name: tag, operator: "==", value: 1 };
+}
+
+function plcLiveCycleTest() {
+  const run = { preset: "run" };
+  const inner = [
+    ["cycle_started1", "cycle_ended1"],
+    ["cycle_started2", "cycle_ended2"],
+  ];
+  return {
+    name: "TCU Live Cycle Test",
+    description: "PLC cycle bits open and close the run; each inner cycle has its own trigger",
+    sections: [
+      { ...defaultSection("header"), title: "TCU Cycle Test",
+        subtitle: "generated automatically when the cycle ends" },
+      { ...defaultSection("text"), title: "Part details",
+        text: "Part number:\nSerial number:\nOperator:\nRecipe:" },
+
+      { ...defaultSection("kpi_grid"), title: "Cycle results", columns: 4,
+        time_range: { ...run },
+        items: [
+          { label: "SimREAL[3] max", gateway_id: "", tag_name: "SimREAL[3]",
+            aggregation: "max", operator: "any" },
+          { label: "SimREAL[3] avg", gateway_id: "", tag_name: "SimREAL[3]",
+            aggregation: "avg", operator: "any" },
+          { label: "Peak rise (per min)", gateway_id: "", tag_name: "SimREAL[3]",
+            aggregation: "rate_max", operator: "any" },
+          { label: "SimREAL[4] avg", gateway_id: "", tag_name: "SimREAL[4]",
+            aggregation: "avg", operator: "any" },
+        ] },
+
+      { ...defaultSection("line_chart"), title: "Whole cycle",
+        time_range: { ...run }, x_axis_label: "Time", y_axis_label: "Value",
+        series: [plcSeries(PLC_VALUE_TAGS[0], "#ef5350"),
+                 plcSeries(PLC_VALUE_TAGS[1], "#42a5f5")] },
+
+      { ...defaultSection("line_chart"), title: "Inner cycle 1",
+        time_range: { ...run },
+        trigger: { start: plcCond(inner[0][0]), stop: plcCond(inner[0][1]) },
+        x_axis_label: "Time", y_axis_label: PLC_VALUE_TAGS[0],
+        series: [plcSeries(PLC_VALUE_TAGS[0], "#26a69a")] },
+      { ...defaultSection("bar_chart"), title: "Inner cycle 2",
+        time_range: { ...run }, side_by_side: true,
+        trigger: { start: plcCond(inner[1][0]), stop: plcCond(inner[1][1]) },
+        x_axis_label: "Time", y_axis_label: PLC_VALUE_TAGS[0],
+        series: [plcSeries(PLC_VALUE_TAGS[0], "#7e57c2")] },
+
+      { ...defaultSection("table"), title: "Telemetry", row_limit: 60,
+        time_range: { ...run },
+        align_columns: ["left", "right", "right"],
+        series: PLC_VALUE_TAGS.map((t) => plcSeries(t, "#888")),
+        columns: [{ key: "ts", title: "Time" },
+                  ...PLC_VALUE_TAGS.map((t) => ({ key: "value", series_id: t, title: t }))] },
+    ],
+  };
+}
+
+// Energy usage across a production run.
+//
+// 2026-10-01: a professional energy report for a production line. Tag names
+// are the ones the EM meter records, so it works as soon as it is picked;
+// gateway_id is blank on purpose, so it matches whichever gateway carries
+// them. Everything is scoped to the report's window, which means the same
+// template answers "this shift", "this batch" or "this production order"
+// depending on the schedule that fires it.
+function energyProductionReport() {
+  const run = { preset: "run" };
+  const S = (tag, label, color, axis) => ({
+    id: tag, label, gateway_id: "", tag_name: tag, color,
+    ...(axis ? { axis } : {}),
+  });
+  return {
+    name: "Energy Usage - Production Line",
+    description: "Consumption, demand, power quality and cost for a production run",
+    sections: [
+      { ...defaultSection("header"), title: "Energy Usage",
+        subtitle: "Production line - {start} to {end}" },
+
+      { ...defaultSection("kpi_grid"), title: "Headline", columns: 4,
+        time_range: { ...run },
+        items: [
+          { label: "Energy used (kWh)", gateway_id: "", tag_name: "insight.power_usage_kwh",
+            aggregation: "max", operator: "any" },
+          { label: "Peak demand (kW)", gateway_id: "", tag_name: "insight.active_power_kw",
+            aggregation: "max", operator: "any" },
+          { label: "Average load (kW)", gateway_id: "", tag_name: "insight.active_power_kw",
+            aggregation: "avg", operator: "any" },
+          { label: "Energy cost", gateway_id: "", tag_name: "insight.energy_cost_eur",
+            aggregation: "max", operator: "any" },
+        ] },
+      { ...defaultSection("kpi_grid"), title: "Power quality", columns: 4,
+        time_range: { ...run },
+        items: [
+          { label: "Power factor (avg)", gateway_id: "", tag_name: "insight.power_factor",
+            aggregation: "avg", operator: "any" },
+          { label: "Power factor (worst)", gateway_id: "", tag_name: "insight.power_factor",
+            aggregation: "min", operator: "any" },
+          { label: "Voltage (avg V)", gateway_id: "", tag_name: "voltage_avg_v",
+            aggregation: "avg", operator: "any" },
+          { label: "Run time (s)", gateway_id: "", tag_name: "insight.active_power_kw",
+            aggregation: "duration_s", operator: "any" },
+        ] },
+
+      { ...defaultSection("area_chart"), title: "Demand profile (kW)",
+        time_range: { ...run }, bucket: "1m",
+        x_axis_label: "Time", y_axis_label: "Active power", y_axis_unit: "kW",
+        series: [{ ...S("insight.active_power_kw", "Active power", "#ef5350"),
+                   aggregation: "avg" }] },
+
+      { ...defaultSection("line_chart"), title: "Phase balance",
+        time_range: { ...run }, bucket: "1m",
+        x_axis_label: "Time", y_axis_label: "Active power", y_axis_unit: "W",
+        series: [{ ...S("active_power_l1_w", "L1", "#ef5350"), aggregation: "avg" },
+                 { ...S("active_power_l2_w", "L2", "#42a5f5"), aggregation: "avg" },
+                 { ...S("active_power_l3_w", "L3", "#66bb6a"), aggregation: "avg" }] },
+
+      { ...defaultSection("line_chart"), title: "Power factor",
+        time_range: { ...run }, bucket: "1m", side_by_side: false,
+        x_axis_label: "Time", y_axis_label: "Power factor",
+        series: [{ ...S("insight.power_factor", "PF", "#7e57c2"), aggregation: "avg" }] },
+      { ...defaultSection("line_chart"), title: "Voltage & current",
+        time_range: { ...run }, bucket: "1m", side_by_side: true,
+        x_axis_label: "Time", y_axis_label: "Voltage", y_axis_unit: "V",
+        y_axis_right_label: "Current", y_axis_right_unit: "A",
+        series: [{ ...S("voltage_avg_v", "Voltage", "#26a69a"), aggregation: "avg" },
+                 { ...S("current_avg_a", "Current", "#ffa726", "right"), aggregation: "avg" }] },
+
+      // One row per shift / batch / cycle, whichever the schedule segments by.
+      { ...defaultSection("segment_summary"), title: "Energy by period",
+        stream: "", segment: "", segment_header: "Period", format: "2dp",
+        columns: [
+          { tag_name: "insight.power_usage_kwh", aggregation: "max", title: "kWh" },
+          { tag_name: "insight.active_power_kw", aggregation: "max", title: "Peak kW" },
+          { tag_name: "insight.active_power_kw", aggregation: "avg", title: "Avg kW" },
+          { tag_name: "insight.power_factor", aggregation: "avg", title: "Avg PF" },
+          { tag_name: "insight.energy_cost_eur", aggregation: "max", title: "Cost" },
+        ],
+        footer_aggregation: "sum", footer_label: "Total" },
+
+      { ...defaultSection("text"), title: "Summary",
+        text: "Energy used: {max:insight.power_usage_kwh} kWh" + "\n"
+          + "Peak demand: {max:insight.active_power_kw} kW" + "\n"
+          + "Average power factor: {avg:insight.power_factor}" + "\n"
+          + "Cost: {max:insight.energy_cost_eur}" },
+
+      { ...defaultSection("table"), title: "Readings", row_limit: 60,
+        time_range: { ...run }, bucket: "5m",
+        align_columns: ["left", "right", "right", "right"],
+        series: [{ ...S("insight.active_power_kw", "kW", "#ef5350"), aggregation: "avg" },
+                 { ...S("insight.power_factor", "PF", "#7e57c2"), aggregation: "avg" },
+                 { ...S("insight.power_usage_kwh", "kWh", "#42a5f5"), aggregation: "max" }],
+        columns: [{ key: "ts", title: "Time" },
+                  { key: "value", series_id: "insight.active_power_kw", title: "kW" },
+                  { key: "value", series_id: "insight.power_factor", title: "PF" },
+                  { key: "value", series_id: "insight.power_usage_kwh", title: "kWh" }] },
+    ],
+  };
+}
+
+// A complete functional-test report, exercising every capability: the run's
+// own trigger window, per-section triggers for the phases, repeat-per-cycle,
+// a cross-cycle summary with ramp time, tag-linked text, side-by-side
+// sections and column alignment.
+//
+// 2026-10-01. Real tag names from the test rig, blank gateway so it binds by
+// tag wherever they are collected.
+function fullTestReport() {
+  const run = { preset: "run" };
+  const VAL = "SimREAL[3]";
+  const VAL2 = "SimREAL[4]";
+  const S = (tag, label, color) => ({ id: tag, label, gateway_id: "", tag_name: tag, color });
+  const phase = (startTag, stopTag) => ({
+    start: { gateway_id: "", tag_name: startTag, operator: "==", value: 1 },
+    stop: { gateway_id: "", tag_name: stopTag, operator: "==", value: 1 },
+  });
+  return {
+    name: "Functional Test Report (full)",
+    description: "Run trigger, per-cycle detail, cross-cycle averages and ramp time",
+    sections: [
+      { ...defaultSection("header"), title: "Functional Test Report",
+        subtitle: "Work order {tag:Work_Order} - {start} to {end}" },
+
+      { ...defaultSection("text"), title: "Unit under test",
+        text: "Work order: {tag:Work_Order}" + "\n"
+          + "Serial number: {tag:Serial_Number}" + "\n"
+          + "Operator: {tag:Operator_Id}" + "\n"
+          + "Peak recorded: {max:SimREAL[3]}   Average: {avg:SimREAL[3]}" },
+
+      { ...defaultSection("kpi_grid"), title: "Overall result", columns: 4,
+        time_range: { ...run },
+        items: [
+          { label: "Peak value", gateway_id: "", tag_name: VAL,
+            aggregation: "max", operator: "any" },
+          { label: "Average", gateway_id: "", tag_name: VAL,
+            aggregation: "avg", operator: "any" },
+          { label: "Peak rise (per min)", gateway_id: "", tag_name: VAL,
+            aggregation: "rate_max", operator: "any" },
+          { label: "Test duration (s)", gateway_id: "", tag_name: VAL,
+            aggregation: "duration_s", operator: "any" },
+        ] },
+
+      { ...defaultSection("line_chart"), title: "Whole test",
+        time_range: { ...run }, x_axis_label: "Time", y_axis_label: "Value",
+        series: [S(VAL, VAL, "#ef5350"), S(VAL2, VAL2, "#42a5f5")] },
+
+      { ...defaultSection("line_chart"), title: "Cycle 1 detail",
+        time_range: { ...run }, trigger: phase("cycle_started1", "cycle_ended1"),
+        x_axis_label: "Time", y_axis_label: VAL,
+        series: [S(VAL, VAL, "#26a69a")] },
+      { ...defaultSection("bar_chart"), title: "Cycle 2 detail",
+        time_range: { ...run }, side_by_side: true,
+        trigger: phase("cycle_started2", "cycle_ended2"),
+        x_axis_label: "Time", y_axis_label: VAL,
+        series: [S(VAL, VAL, "#7e57c2")] },
+
+      // One row per cycle, averaged at the foot: the final test result.
+      { ...defaultSection("segment_summary"), title: "Result per cycle",
+        stream: "cycle", segment: "", segment_header: "Cycle", format: "2dp",
+        align_columns: ["left", "right", "right", "right", "right"],
+        columns: [
+          { tag_name: VAL, aggregation: "max", title: "Peak" },
+          { tag_name: VAL, aggregation: "avg", title: "Average" },
+          { tag_name: VAL, aggregation: "rate_max", title: "Rise /min" },
+          { tag_name: VAL, aggregation: "duration_s", title: "Duration s" },
+        ],
+        footer_aggregation: "avg", footer_label: "Final result" },
+
+      { ...defaultSection("segment_summary"), title: "Result per phase",
+        stream: "phase", segment: "", segment_header: "Phase", format: "2dp",
+        align_columns: ["left", "right", "right"],
+        columns: [
+          { tag_name: VAL, aggregation: "avg", title: "Average" },
+          { tag_name: VAL2, aggregation: "avg", title: "Secondary" },
+        ] },
+
+      { ...defaultSection("table"), title: "Telemetry", row_limit: 60,
+        time_range: { ...run }, align_columns: ["left", "right", "right"],
+        series: [S(VAL, VAL, "#888"), S(VAL2, VAL2, "#888")],
+        columns: [{ key: "ts", title: "Time" },
+                  { key: "value", series_id: VAL, title: VAL },
+                  { key: "value", series_id: VAL2, title: VAL2 }] },
+
+      { ...defaultSection("static_table"), title: "Sign-off",
+        header: ["Check", "Result"],
+        rows: [["Peak within limit", "{max:SimREAL[3]}"],
+               ["Test completed", "PASS"],
+               ["Operator", "{tag:Operator_Id}"]] },
+    ],
+  };
+}
+
 function makePresetTemplate(presetKey) {
   switch (presetKey) {
+    case "full_test_report":
+      return fullTestReport();
+    case "energy_production_line":
+      return energyProductionReport();
+    case "plc_live_cycle_test":
+      return plcLiveCycleTest();
+    case "tcu_testing_report":
+      return tcuTestingReport();
     case "daily_summary":
       return {
         name: "Daily production summary",
@@ -362,7 +735,35 @@ const TEMPLATE_PRESETS = [
   { value: "alarm_overview", label: "Alarm overview" },
   { value: "tag_audit", label: "Tag audit (single tag)" },
   { value: "shift_summary", label: "Shift summary (8h)" },
+  { value: "tcu_testing_report", label: "Testing Report (TCU functional test)" },
+  { value: "plc_live_cycle_test", label: "TCU Live Cycle Test (PLC cycle bits)" },
+  { value: "energy_production_line", label: "Energy Usage - Production Line" },
+  { value: "full_test_report", label: "Functional Test Report (full)" },
 ];
+
+/* A structural copy of a section with every id replaced.
+ *
+ * The editor addresses nested things by id - updateSeries(s.id, ...),
+ * updatePill(pill.id, ...) - so a duplicate that reused them would edit the
+ * original too. Arrays of objects that carry an `id` get a fresh one; a row
+ * of a details table is a plain array and is copied as it is.
+ */
+function reidSection(section) {
+  const fresh = (v) => {
+    if (Array.isArray(v)) return v.map(fresh);
+    if (v && typeof v === "object") {
+      const out = {};
+      for (const [k, val] of Object.entries(v)) out[k] = fresh(val);
+      if (typeof v.id === "string" && v.id) out.id = makeId("dup");
+      return out;
+    }
+    return v;
+  };
+  const copy = fresh(section || {});
+  copy.id = makeId("sec");
+  return copy;
+}
+
 
 function defaultSection(type) {
   switch (type) {
@@ -376,6 +777,47 @@ function defaultSection(type) {
       };
     case "text":
       return { id: makeId("sec"), type, title: "", text: "" };
+    case "static_table":
+      // 2026-10-09, requested: "static table so we can create with details
+      // and link any text to a tag or fix text". Starts as a two-column
+      // detail sheet because that is what it is nearly always used for.
+      return {
+        id: makeId("sec"),
+        type,
+        title: "Details",
+        header: ["Field", "Value"],
+        rows: [["Work order", "{Work_Order}"], ["Operator", ""]],
+        table_borders: "all",
+      };
+    case "pill_card":
+      // One pill to start, already readable: an operator should see the
+      // shape of the thing before configuring it.
+      return {
+        id: makeId("sec"),
+        type,
+        title: "",
+        align: "left",
+        columns: 4,
+        font_size: 10,
+        pills: [{
+          id: makeId("pill"), label: "Result", text: "PASS",
+          color: "#ffffff", background: "#14a89a", bold: true,
+        }],
+      };
+    case "segment_summary":
+      // One row per test/cycle the run produced, one column per tag, and an
+      // optional row aggregating those results again.
+      return {
+        id: makeId("sec"),
+        type,
+        title: "Test results",
+        segment: "",
+        segment_header: "Test",
+        columns: [{ tag_name: "", aggregation: "avg", title: "", unit: "" }],
+        footer_aggregation: "avg",
+        footer_label: "Average",
+        format: "3dp",
+      };
     case "kpi_grid":
       return {
         id: makeId("sec"),
@@ -1131,24 +1573,711 @@ function HistorianDataCard({ section, formatTagForDisplay, onNotify }) {
 // ---------------------------------------------------------------------------
 // SectionEditor (per-type configuration UI)
 // ---------------------------------------------------------------------------
+// One tag condition: gateway, tag, operator, value.
+//
+// 2026-09-30, requested: "for each section of my report I want to be able to
+// pick different start and end trigger where the data inside of the section
+// would be loaded, I want to be able to select from the gateways tags". The
+// section's own time range still encloses the search, so a scheduled 24h
+// report can hold a chart covering only the heating phase within it.
+/* Width on the page, and whether this section repeats per cycle.
+ *
+ * 2026-10-09, requested: "not all sections have the option of the layout and
+ * we need all of them have the option to have more than one section in the
+ * same row". This markup lived inline in the chart/table branch, so only a
+ * chart or a data table could be told to share a line - a pill card, a
+ * details table, a KPI grid or an image could not, even though the renderer
+ * has always been able to put any of them in a row (group_side_by_side
+ * pairs by POSITION, not by type).
+ *
+ * `showAlign` is off where the section already has its own alignment
+ * control, so a text block or a pill card does not end up with two.
+ */
+// Types the renderer refuses to pair a following section WITH. Mirrors
+// group_side_by_side() in report_renderer.py.
+const CANNOT_LEAD = new Set(["header", "page_break", "spacer"]);
+
+function SectionLayout({ section, onChange, showAlign = false, prevType = "" }) {
+  return (
+    <>
+      <div className="tn-subhead">Layout</div>
+      <div className={showAlign ? "tn-row tn-row-3" : "tn-row tn-row-2"}>
+        <label>Width
+          <select
+            value={section.side_by_side ? "yes" : "no"}
+            onChange={(e) => onChange({ side_by_side: e.target.value === "yes" })}
+            title="Up to three sections can share one line. This one joins the line above."
+          >
+            <option value="no">Full width</option>
+            <option value="yes">Share line above</option>
+          </select>
+        </label>
+        {showAlign ? (
+          <label>Text alignment
+            <select value={section.align || ""}
+                    onChange={(e) => onChange({ align: e.target.value })}>
+              <option value="">Default</option>
+              <option value="left">Left</option>
+              <option value="center">Centre</option>
+              <option value="right">Right</option>
+            </select>
+          </label>
+        ) : null}
+        <label>Repeat per cycle
+          <input
+            placeholder="test2 · blank = no"
+            value={section.repeat_for?.segment || ""}
+            title="Renders one copy of this section per cycle of that test, each over its own window."
+            onChange={(e) => onChange({
+              repeat_for: e.target.value ? { segment: e.target.value } : undefined,
+            })}
+          />
+        </label>
+      </div>
+      {/* The renderer pairs a section with the one ABOVE it, and a banner,
+          spacer or page break is never a partner - it stays full width by
+          design. Saying so beats a setting that silently does nothing. */}
+      {section.side_by_side && CANNOT_LEAD.has(String(prevType || "")) ? (
+        <p className="tn-token-help">
+          The section above is a {prevType.replace("_", " ")}, which always takes a
+          full line - this one will not join it. Move it below a chart, table,
+          KPI grid or pill card.
+        </p>
+      ) : null}
+      {section.side_by_side && !prevType ? (
+        <p className="tn-token-help">
+          This is the first section, so there is no line above to join.
+        </p>
+      ) : null}
+    </>
+  );
+}
+
+
+/* Start / stop triggers for ONE section.
+ *
+ * 2026-10-07, requested: "not all the template reports has the option to
+ * pick the start and end trigger, we should have for all". This markup lived
+ * inline in the chart/table branch, so a KPI grid, a text block, a segment
+ * summary and a pie chart could never be bound to a cycle - even though the
+ * backend applies section triggers by type-agnostic rule
+ * (apply_section_triggers / resolve_trigger_window). It was only ever a gap
+ * in the editor.
+ *
+ * The stop picker appears once a start tag is chosen: a stop with no start
+ * has nothing to close.
+ */
+/* Size / weight / colour / alignment for one run of text.
+ *
+ * 2026-10-09, requested: "we should be able to modify fonts size, style and
+ * color, in special for text sections ... and how the text should be
+ * aligned". Every text block rendered with one hard-coded body style, so a
+ * heading could not be made bigger, a warning could not be red, and nothing
+ * could be centred.
+ *
+ * `prefix` lets one section style its heading and its body independently
+ * (title_font_size vs font_size) without a second section type. Every field
+ * is optional - blank means "leave it as the report's default", which is
+ * why an untouched template renders exactly as it did before.
+ */
+function FontControls({ section, onChange, prefix = "", label = "Text style" }) {
+  const k = (name) => `${prefix}${name}`;
+  const val = (name) => section[k(name)];
+  return (
+    <>
+      <div className="tn-subhead">{label}</div>
+      <div className="tn-row tn-row-4">
+        <label>Size (pt)
+          <input
+            type="number" min="5" max="72" step="1"
+            placeholder="default"
+            value={val("font_size") ?? ""}
+            onChange={(e) => onChange({ [k("font_size")]: e.target.value === "" ? "" : Number(e.target.value) })}
+          />
+        </label>
+        <label>Colour
+          <div className="tn-colour-row">
+            <input
+              type="color"
+              value={String(val("font_color") || "#0e1116")}
+              onChange={(e) => onChange({ [k("font_color")]: e.target.value })}
+            />
+            {val("font_color")
+              ? <button type="button" className="btn btn-secondary btn-sm"
+                        title="Back to the report's default colour"
+                        onClick={() => onChange({ [k("font_color")]: "" })}>Reset</button>
+              : null}
+          </div>
+        </label>
+        <label>Alignment
+          <select
+            value={String(val("align") || "")}
+            onChange={(e) => onChange({ [k("align")]: e.target.value })}
+          >
+            <option value="">Default</option>
+            <option value="left">Left</option>
+            <option value="center">Centre</option>
+            <option value="right">Right</option>
+            <option value="justify">Justified</option>
+          </select>
+        </label>
+        <label>Weight
+          <div className="tn-style-toggles">
+            <button
+              type="button"
+              className={`btn btn-sm ${val("bold") ? "btn-primary" : "btn-secondary"}`}
+              title="Bold" aria-pressed={Boolean(val("bold"))}
+              onClick={() => onChange({ [k("bold")]: !val("bold") })}
+            ><strong>B</strong></button>
+            <button
+              type="button"
+              className={`btn btn-sm ${val("italic") ? "btn-primary" : "btn-secondary"}`}
+              title="Italic" aria-pressed={Boolean(val("italic"))}
+              onClick={() => onChange({ [k("italic")]: !val("italic") })}
+            ><em>I</em></button>
+          </div>
+        </label>
+      </div>
+    </>
+  );
+}
+
+
+/* How each COLUMN of a table is drawn: alignment, colour, or rendered as a
+ * coloured pill.
+ *
+ * 2026-10-09, requested: "we should also be able to format the text in
+ * tables and card to be centralized, to be a pill inside of the table color
+ * formated, font size and color too".
+ *
+ * Per COLUMN rather than per cell: a check list has one column of labels
+ * and one of results, and what the operator wants is "every result is a
+ * green pill" - not to colour forty cells by hand.
+ */
+function ColumnStyleControls({ section, onChange }) {
+  const header = section.header || [];
+  const styles = Array.isArray(section.column_styles) ? section.column_styles : [];
+  const setCol = (c, patch) => {
+    const next = header.map((_h, i) => ({ ...(styles[i] || {}) }));
+    next[c] = { ...next[c], ...patch };
+    onChange({ column_styles: next });
+  };
+  if (!header.length) return null;
+  return (
+    <>
+      <div className="tn-subhead">Column formatting</div>
+      {header.map((h, c) => {
+        const cs = styles[c] || {};
+        return (
+          <div key={c} className="tn-static-row">
+            <span className="tn-col-name">{h || `Column ${c + 1}`}</span>
+            <select value={String(cs.align || "")}
+                    onChange={(e) => setCol(c, { align: e.target.value })}
+                    title="How this column's text sits in its cell">
+              <option value="">Default align</option>
+              <option value="left">Left</option>
+              <option value="center">Centre</option>
+              <option value="right">Right</option>
+            </select>
+            <label className="tn-checkbox">
+              <input type="checkbox" checked={Boolean(cs.pill)}
+                     onChange={(e) => setCol(c, { pill: e.target.checked })} />
+              Pill
+            </label>
+            <input type="color" title={cs.pill ? "Pill background" : "Text colour"}
+                   value={String((cs.pill ? cs.background : cs.color) || (cs.pill ? "#14a89a" : "#0e1116"))}
+                   onChange={(e) => setCol(c, cs.pill
+                     ? { background: e.target.value }
+                     : { color: e.target.value })} />
+            {cs.pill ? (
+              <input type="color" title="Pill text colour"
+                     value={String(cs.color || "#ffffff")}
+                     onChange={(e) => setCol(c, { color: e.target.value })} />
+            ) : null}
+            <button type="button" title="Bold"
+                    className={`btn btn-sm ${cs.bold ? "btn-primary" : "btn-secondary"}`}
+                    onClick={() => setCol(c, { bold: !cs.bold })}>
+              <strong>B</strong>
+            </button>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+
+/* Rules, their colour and weight, and the text density inside a table. */
+function TableStyleControls({ section, onChange }) {
+  return (
+    <>
+      <div className="tn-subhead">Table style</div>
+      <div className="tn-row tn-row-4">
+        <label>Borders
+          <select
+            value={String(section.table_borders || "all")}
+            onChange={(e) => onChange({ table_borders: e.target.value })}
+            title="Which rules are drawn. Zebra shading stays unless turned off below."
+          >
+            <option value="all">Full grid</option>
+            <option value="outline">Outline only</option>
+            <option value="rows">Horizontal rules</option>
+            <option value="columns">Vertical rules</option>
+            <option value="none">No borders</option>
+          </select>
+        </label>
+        <label>Rule colour
+          <div className="tn-colour-row">
+            <input
+              type="color"
+              value={String(section.border_color || "#e1e6ec")}
+              onChange={(e) => onChange({ border_color: e.target.value })}
+            />
+            {section.border_color
+              ? <button type="button" className="btn btn-secondary btn-sm"
+                        onClick={() => onChange({ border_color: "" })}>Reset</button>
+              : null}
+          </div>
+        </label>
+        <label>Rule width (pt)
+          <input
+            type="number" min="0.1" max="3" step="0.1" placeholder="default"
+            value={section.border_width ?? ""}
+            onChange={(e) => onChange({ border_width: e.target.value === "" ? "" : Number(e.target.value) })}
+          />
+        </label>
+        <label>Text size (pt)
+          <input
+            type="number" min="5" max="24" step="0.5" placeholder="8.5"
+            value={section.table_font_size ?? ""}
+            onChange={(e) => onChange({ table_font_size: e.target.value === "" ? "" : Number(e.target.value) })}
+          />
+        </label>
+      </div>
+      <label className="tn-checkbox">
+        <input
+          type="checkbox"
+          checked={section.zebra !== false}
+          onChange={(e) => onChange({ zebra: e.target.checked })}
+        />
+        Shade alternate rows
+      </label>
+    </>
+  );
+}
+
+
+/* The conditions on one side of a section trigger.
+ *
+ * 2026-10-11, requested: "make sure the section trigger also consider
+ * multiples conditions". A side used to be ONE condition, so a section could
+ * not say "while Cycle_Active = 1 AND Phase = Heating" - it had to pick one
+ * and chart the wrong window.
+ *
+ * The first condition is still written to trigger.start / trigger.stop, which
+ * is the shape every saved template carries and the shape the renderer reads
+ * when there is no list. Extra conditions go to *_conditions, so a template
+ * edited here and opened by an older build still resolves its first
+ * condition rather than losing the trigger entirely.
+ */
+function TriggerSide({ label, side, trigger, onChange, gatewayOptions, tagList,
+                      formatTagForDisplay }) {
+  const t = trigger || {};
+  const listKey = `${side}_conditions`;
+  const logicKey = `${side}_logic`;
+  const stored = Array.isArray(t[listKey]) ? t[listKey] : [];
+  // Gate on the condition EXISTING, not on it being finished. Keying this on
+  // `tag_name` meant that choosing a gateway - which deliberately clears the
+  // tag - made the condition fall back to {} on the very next render: the
+  // gateway select snapped back to "Gateway…" and the tag list stayed empty,
+  // so the trigger could never be filled in at all (2026-10-11).
+  const first = t[side];
+  const conds = stored.length
+    ? stored
+    : (first && typeof first === "object" && Object.keys(first).length ? [first] : [{}]);
+
+  const write = (next) => {
+    const clean = next.filter((c) => c && Object.keys(c).length);
+    onChange({
+      ...t,
+      [side]: clean[0] || null,
+      [listKey]: clean.length > 1 ? clean : undefined,
+    });
+  };
+  const setOne = (idx, cond) => write(conds.map((c, i) => (i === idx ? cond : c)));
+
+  return (
+    <>
+      {conds.map((c, idx) => (
+        <TriggerPicker
+          key={idx}
+          label={idx === 0 ? label : (String(t[logicKey] || "all") === "any" ? "…or when" : "…and when")}
+          cond={c}
+          gatewayOptions={gatewayOptions}
+          tagList={tagList}
+          formatTagForDisplay={formatTagForDisplay}
+          onChange={(cond) => setOne(idx, cond)}
+        />
+      ))}
+      <div className="tn-trigger-tools">
+        <button type="button" className="btn btn-link"
+                onClick={() => write([...conds, {}])}>+ Add condition</button>
+        {conds.length > 1 ? (
+          <>
+            <button type="button" className="btn btn-link"
+                    onClick={() => write(conds.slice(0, -1))}>Remove last</button>
+            <label className="tn-inline-label" title="ALL: every condition must hold at the same moment. ANY: the first one to hold opens the window.">
+              Combine
+              <select value={t[logicKey] || "all"}
+                      onChange={(e) => onChange({ ...t, [logicKey]: e.target.value })}>
+                <option value="all">All must be true</option>
+                <option value="any">Any may be true</option>
+              </select>
+            </label>
+          </>
+        ) : null}
+      </div>
+    </>
+  );
+}
+
+
+function SectionTrigger({ section, onChange, gatewayOptions, tagList,
+                          formatTagForDisplay }) {
+  const trigger = section.trigger || {};
+  const setTrigger = (next) => onChange({ trigger: next });
+  const hasStart = Boolean(trigger.start?.tag_name
+    || (Array.isArray(trigger.start_conditions)
+        && trigger.start_conditions.some((c) => c?.tag_name)));
+  return (
+    <>
+      <div className="tn-subhead">Trigger (optional)</div>
+      <TriggerSide
+        label="Start when" side="start" trigger={trigger} onChange={setTrigger}
+        gatewayOptions={gatewayOptions} tagList={tagList}
+        formatTagForDisplay={formatTagForDisplay}
+      />
+      {hasStart ? (
+        <>
+          <TriggerSide
+            label="Stop when" side="stop" trigger={trigger} onChange={setTrigger}
+            gatewayOptions={gatewayOptions} tagList={tagList}
+            formatTagForDisplay={formatTagForDisplay}
+          />
+          {/* 2026-10-11, requested: "when the report section do no clear do
+              not use different trigger". A trigger that never fires now
+              covers the window the schedule's own start/end trigger
+              produced, and the section caption says so - rather than
+              printing an empty chart or inventing a 24h range. */}
+          <label className="tn-inline-label" title="What to do when this trigger never becomes true inside the report window.">
+            If it never fires
+            <select value={trigger.on_miss || "window"}
+                    onChange={(e) => setTrigger({ ...trigger, on_miss: e.target.value })}>
+              <option value="window">Use the report's own window</option>
+              <option value="empty">Leave the section empty</option>
+            </select>
+          </label>
+        </>
+      ) : null}
+    </>
+  );
+}
+
+
+/* One of the four canonical axes. Mirrors norm_axis4() in
+   backend/app/services/report_renderer.py and normSeriesAxis4() in the
+   dashboard widgets - legacy templates stored only "left"/"right". */
+function normAxis4(value) {
+  const a = String(value || "left1").trim().toLowerCase();
+  if (a === "left2") return "left2";
+  if (a === "right2") return "right2";
+  if (a === "right" || a === "right1") return "right1";
+  return "left1";
+}
+
+
+function TriggerPicker({ label, cond, gatewayOptions, tagList, formatTagForDisplay,
+                        onChange, hint }) {
+  const c = cond || {};
+  const set = (patch) => onChange({ ...c, ...patch });
+  return (
+    <div className="tn-row tn-row-4">
+      <label>{label}
+        <select
+          title="Which gateway carries the tag"
+          value={c.gateway_id || ""}
+          onChange={(e) => set({ gateway_id: e.target.value, tag_name: "" })}
+        >
+          <option value="">Gateway…</option>
+          {gatewayOptions.map((g) => <option key={g.id} value={g.id}>{g.name || g.id}</option>)}
+        </select>
+      </label>
+      <label>Tag
+        <select value={c.tag_name || ""} onChange={(e) => set({ tag_name: e.target.value })}>
+          <option value="">No trigger</option>
+          {tagList(c.gateway_id).map((t) => (
+            <option key={t} value={t}>{formatTagForDisplay(t)}</option>
+          ))}
+        </select>
+      </label>
+      <label>Is
+        <select value={c.operator || "=="} onChange={(e) => set({ operator: e.target.value })}>
+          <option value="==">equal to</option>
+          <option value="!=">not equal to</option>
+          <option value=">">greater than</option>
+          <option value=">=">at least</option>
+          <option value="<">less than</option>
+          <option value="<=">at most</option>
+          <option value="between">between</option>
+        </select>
+      </label>
+      <label>Value
+        <input
+          value={c.value ?? ""}
+          placeholder="1, 80 or Heating"
+          title={hint || "A fixed value, or the text a state tag holds."}
+          onChange={(e) => set({ value: e.target.value })}
+        />
+      </label>
+    </div>
+  );
+}
+
+// A text field with a tag picker beside it.
+//
+// 2026-10-01 added {tag:Name} tokens; 2026-10-02: "the text field elements
+// all of them in any report should have an option (small icon to link to a
+// tag value)". A token nobody can discover is a token nobody uses - the
+// operator should not have to remember tag names or the syntax.
+//
+// The token is inserted AT THE CURSOR, so a sentence can be built up around
+// it rather than always appending at the end.
+/* Line interpolation, same five the dashboard widgets offer and by the same
+ * names, so a chart means the same thing in both places. The report default
+ * is "linear" - that is how every existing report was drawn, and changing it
+ * silently would redraw them all (2026-10-11). */
+const CHART_INTERPOLATIONS = [
+  { value: "linear", label: "Linear" },
+  { value: "monotone", label: "Monotone (smooth)" },
+  { value: "natural", label: "Natural (smooth)" },
+  { value: "stepAfter", label: "Step after" },
+  { value: "stepBefore", label: "Step before" },
+];
+
+const TOKEN_KINDS = [
+  { value: "tag", label: "Latest value" },
+  { value: "avg", label: "Average" },
+  { value: "max", label: "Maximum" },
+  { value: "min", label: "Minimum" },
+  { value: "first", label: "First value" },
+];
+
+function TagTokenField({ label, value, onChange, multiline = false, rows = 4,
+                        placeholder = "", gatewayOptions = [], tagList,
+                        formatTagForDisplay }) {
+  const [open, setOpen] = useState(false);
+  const [gw, setGw] = useState("");
+  const [kind, setKind] = useState("tag");
+  const ref = useRef(null);
+
+  const insert = (tag) => {
+    if (!tag) return;
+    const token = `{${kind}:${tag}}`;
+    const el = ref.current;
+    const current = String(value || "");
+    let next = current + token;
+    if (el && typeof el.selectionStart === "number") {
+      const a = el.selectionStart;
+      const b = el.selectionEnd;
+      next = current.slice(0, a) + token + current.slice(b);
+    }
+    onChange(next);
+    setOpen(false);
+  };
+
+  const tags = typeof tagList === "function" ? tagList(gw) : [];
+
+  return (
+    <label className="tn-tag-field">
+      <span className="tn-tag-field-head">
+        {label}
+        <button
+          type="button"
+          className="tn-tag-insert"
+          title="Insert a value read from a tag"
+          onClick={() => setOpen((v) => !v)}
+        >
+          🏷
+        </button>
+      </span>
+      {multiline ? (
+        <textarea ref={ref} rows={rows} value={value || ""} placeholder={placeholder}
+                  onChange={(e) => onChange(e.target.value)} />
+      ) : (
+        <input ref={ref} value={value || ""} placeholder={placeholder}
+               onChange={(e) => onChange(e.target.value)} />
+      )}
+      {open ? (
+        <div className="tn-tag-pop">
+          <select value={kind} onChange={(e) => setKind(e.target.value)}>
+            {TOKEN_KINDS.map((k) => <option key={k.value} value={k.value}>{k.label}</option>)}
+          </select>
+          <select value={gw} onChange={(e) => setGw(e.target.value)}>
+            <option value="">Gateway…</option>
+            {gatewayOptions.map((g) => (
+              <option key={g.id} value={g.id}>{g.name || g.id}</option>
+            ))}
+          </select>
+          <select value="" onChange={(e) => insert(e.target.value)}>
+            <option value="">Pick a tag…</option>
+            {tags.map((t) => (
+              <option key={t} value={t}>
+                {formatTagForDisplay ? formatTagForDisplay(t) : t}
+              </option>
+            ))}
+          </select>
+        </div>
+      ) : null}
+    </label>
+  );
+}
+
+/* An input that can take a tag, sized to sit in a grid row.
+ *
+ * 2026-10-09, reported: "in all the report sections I should be able to
+ * pick the tag available and now I am having to enter manually". Audited
+ * every branch: the details-table CELLS and the pill card's text box
+ * accepted {TagName} but offered no picker, so those were the two places
+ * the operator had to type a tag path from memory.
+ *
+ * TagTokenField is the full-size version - a label, a header row and a
+ * popup - which does not fit inside a table row or a pill row. This is the
+ * same picker and the same insert-at-cursor behaviour in a control that
+ * does.
+ */
+function TokenInput({ value, onChange, placeholder = "", className = "",
+                      title = "", disabled = false,
+                      gatewayOptions = [], tagList, formatTagForDisplay }) {
+  const [open, setOpen] = useState(false);
+  const [gw, setGw] = useState("");
+  const [kind, setKind] = useState("tag");
+  const ref = useRef(null);
+
+  const insert = (tag) => {
+    if (!tag) return;
+    // The bare form reads better in a sentence or a cell; the prefixed
+    // form is only needed for an aggregate.
+    const token = kind === "tag" ? `{${tag}}` : `{${kind}:${tag}}`;
+    const el = ref.current;
+    const current = String(value || "");
+    let next = current + token;
+    if (el && typeof el.selectionStart === "number") {
+      next = current.slice(0, el.selectionStart) + token
+        + current.slice(el.selectionEnd);
+    }
+    onChange(next);
+    setOpen(false);
+  };
+
+  const tags = typeof tagList === "function" ? tagList(gw) : [];
+  return (
+    <span className={`tn-token-input ${className}`}>
+      <input ref={ref} value={value || ""} placeholder={placeholder}
+             title={title} disabled={disabled}
+             onChange={(e) => onChange(e.target.value)} />
+      <button type="button" className="tn-tag-insert" disabled={disabled}
+              title="Pick a tag to insert here"
+              onClick={() => setOpen((v) => !v)}>🏷</button>
+      {open ? (
+        <div className="tn-tag-pop tn-tag-pop-inline">
+          <select value={kind} onChange={(e) => setKind(e.target.value)}>
+            {TOKEN_KINDS.map((k) => <option key={k.value} value={k.value}>{k.label}</option>)}
+          </select>
+          <select value={gw} onChange={(e) => setGw(e.target.value)}>
+            <option value="">Gateway…</option>
+            {gatewayOptions.map((g) => (
+              <option key={g.id} value={g.id}>{g.name || g.id}</option>
+            ))}
+          </select>
+          <select value="" onChange={(e) => insert(e.target.value)}>
+            <option value="">Pick a tag…</option>
+            {tags.map((t) => (
+              <option key={t} value={t}>
+                {formatTagForDisplay ? formatTagForDisplay(t) : t}
+              </option>
+            ))}
+          </select>
+        </div>
+      ) : null}
+    </span>
+  );
+}
+
+
 function SectionEditor({
   section,
   index,
   total,
+  prevType = "",
   gatewayOptions,
   tagsByGateway,
   formatTagForDisplay,
   onChange,
   onRemove,
+  onDuplicate,
   onMoveUp,
   onMoveDown,
   onNotify,
 }) {
   const type = section?.type || "text";
   const preset = SECTION_PRESETS.find((p) => p.type === type);
+  // Configured sections start closed; a brand-new one opens so it can be set up.
+  const [collapsed, setCollapsed] = useState(Boolean(section?.title));
   const tagList = (gid) => {
     const raw = tagsByGateway?.[String(gid || "")];
     return Array.isArray(raw) ? raw : [];
+  };
+
+  const cols = () => (section.header || []).length || 1;
+  const setHeaderCell = (c, v) => {
+    const h = [...(section.header || [])];
+    h[c] = v;
+    onChange({ header: h });
+  };
+  const setCell = (r, c, v) => {
+    const rows = (section.rows || []).map((row) => [...(row || [])]);
+    while (rows.length <= r) rows.push([]);
+    while (rows[r].length < cols()) rows[r].push("");
+    rows[r][c] = v;
+    onChange({ rows });
+  };
+  const addRow = () => onChange({
+    rows: [...(section.rows || []), Array.from({ length: cols() }, () => "")] });
+  const removeRow = (r) => onChange({
+    rows: (section.rows || []).filter((_x, i) => i !== r) });
+  // Named for the DETAILS table: addColumn/removeColumn already belong to
+  // the data-table editor further down and mean something different there.
+  const addDetailColumn = () => onChange({
+    header: [...(section.header || []), ""],
+    // Keep every row rectangular, or a cell edit lands in the wrong column.
+    rows: (section.rows || []).map((row) => [...(row || []), ""]),
+  });
+  const removeDetailColumn = () => onChange({
+    header: (section.header || []).slice(0, -1),
+    rows: (section.rows || []).map((row) => (row || []).slice(0, -1)),
+  });
+
+  const updatePill = (pid, patch) => {
+    onChange({ pills: (section.pills || []).map((p) => (p.id === pid ? { ...p, ...patch } : p)) });
+  };
+  const addPill = () => {
+    onChange({ pills: [...(section.pills || []), {
+      id: makeId("pill"), label: "", text: "",
+      color: "#ffffff", background: pickColor((section.pills || []).length),
+    }] });
+  };
+  const removePill = (pid) => {
+    onChange({ pills: (section.pills || []).filter((p) => p.id !== pid) });
   };
 
   const updateSeries = (sid, patch) => {
@@ -1227,22 +2356,55 @@ function SectionEditor({
 
   const isChart = type === "line_chart" || type === "area_chart" || type === "bar_chart";
 
+  // Every section collapses. A fifteen-section report was an unbroken wall of
+  // controls; the header now carries enough to identify a section without
+  // opening it - its title and the window it covers.
+  const windowSummary = () => {
+    const tr = section.time_range || {};
+    const preset_ = String(tr.preset || "");
+    if (section.trigger?.start?.tag_name) {
+      return `trigger · ${section.trigger.start.tag_name}`;
+    }
+    if (preset_ === "segment") return `segment · ${tr.segment || "any"}`;
+    if (preset_ === "custom") return "custom range";
+    if (preset_ === "batch") return "batch window";
+    if (preset_ === "run") return "run window";
+    return preset_ || "";
+  };
+
   return (
-    <div className="tn-section-editor">
+    <div className={`tn-section-editor ${collapsed ? "is-collapsed" : ""}`.trim()}>
       <header className="tn-section-editor-head">
+        <button
+          type="button"
+          className="tn-section-toggle"
+          onClick={() => setCollapsed((v) => !v)}
+          aria-expanded={!collapsed}
+          title={collapsed ? "Expand" : "Collapse"}
+        >
+          {collapsed ? "▸" : "▾"}
+        </button>
         <span className="tn-section-pill">{preset?.label || type}</span>
+        <span className="tn-section-summary">
+          {section.title || <em>untitled</em>}
+          {windowSummary() ? <span className="tn-section-window"> · {windowSummary()}</span> : null}
+        </span>
         <div className="tn-section-editor-tools">
           <button type="button" className="icon-btn" onClick={onMoveUp} disabled={index === 0} title="Move up">↑</button>
           <button type="button" className="icon-btn" onClick={onMoveDown} disabled={index === total - 1} title="Move down">↓</button>
+          <button type="button" className="icon-btn" onClick={onDuplicate}
+                  title="Duplicate this section, directly below">⧉</button>
           <button type="button" className="icon-btn icon-btn-danger" onClick={onRemove} title="Remove">×</button>
         </div>
       </header>
+      {collapsed ? null : (
+       <>
 
       {type === "header" ? (
         <div className="tn-section-form">
           <div className="tn-row tn-row-2">
-            <label>Title<input value={section.title || ""} onChange={(e) => onChange({ title: e.target.value })} /></label>
-            <label>Subtitle<input value={section.subtitle || ""} onChange={(e) => onChange({ subtitle: e.target.value })} /></label>
+            <TagTokenField label="Title" value={section.title} onChange={(v) => onChange({ title: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
+            <TagTokenField label="Subtitle" value={section.subtitle} onChange={(v) => onChange({ subtitle: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
           </div>
           <label className="tn-checkbox">
             <input
@@ -1252,27 +2414,299 @@ function SectionEditor({
             />
             Show generated timestamp
           </label>
+            <SectionTrigger
+              section={section} onChange={onChange}
+              gatewayOptions={gatewayOptions} tagList={tagList}
+              formatTagForDisplay={formatTagForDisplay}
+            />
+          {/* 2026-10-09, clarified: "it need to be a header but just in a
+              pill style that can be linked to a tag or not, the value
+              inside of the pill is the title too". So this is an option ON
+              the header rather than a new section: the title text - which
+              may be a {TagName} - sits INSIDE the band, and nothing is
+              drawn above it. */}
+          <div className="tn-row tn-row-4">
+            <label>Show as
+              <select value={section.as_pill ? "pill" : "plain"}
+                      onChange={(e) => onChange({ as_pill: e.target.value === "pill" })}>
+                <option value="plain">Plain heading</option>
+                <option value="pill">Pill band</option>
+              </select>
+            </label>
+            {section.as_pill ? (
+              <>
+                <label>Band colour
+                  <div className="tn-colour-row">
+                    <input type="color"
+                           value={String(section.pill_background || "#14a89a")}
+                           onChange={(e) => onChange({ pill_background: e.target.value })} />
+                  </div>
+                </label>
+                <label>Text colour
+                  <div className="tn-colour-row">
+                    <input type="color"
+                           value={String(section.pill_color || "#ffffff")}
+                           onChange={(e) => onChange({ pill_color: e.target.value })} />
+                  </div>
+                </label>
+                <label>Corners
+                  <select value={String(section.pill_corners || "both")}
+                          onChange={(e) => onChange({ pill_corners: e.target.value })}>
+                    <option value="both">Rounded (both ends)</option>
+                    <option value="left">Rounded left only</option>
+                    <option value="right">Rounded right only</option>
+                    <option value="top">Rounded top only</option>
+                    <option value="bottom">Rounded bottom only</option>
+                    <option value="none">Square</option>
+                  </select>
+                </label>
+              </>
+            ) : <><span /><span /><span /></>}
+          </div>
+          {section.as_pill ? (
+            <p className="tn-token-help">
+              The heading text is what shows inside the band - use the tag
+              button on Title to put a reading in it, e.g. <code>{"{Station}"}</code>.
+              Size, weight and alignment come from <strong>Title style</strong> below.
+            </p>
+          ) : null}
+
+          {/* 2026-10-09: "all the text section including the title header
+              one should have the option to centralized and make font
+              adjustments and alignment". The banner was the one piece of
+              text with no controls at all - and it is the piece most people
+              want centred. Three independent runs. */}
+          <FontControls section={section} onChange={onChange}
+                        prefix="title_" label="Title style" />
+          <FontControls section={section} onChange={onChange}
+                        prefix="subtitle_" label="Subtitle style" />
+          <FontControls section={section} onChange={onChange}
+                        prefix="stamp_" label="Generated-at stamp style" />
+<SectionLayout section={section} onChange={onChange} prevType={prevType} showAlign />
         </div>
       ) : null}
 
       {type === "text" ? (
         <div className="tn-section-form">
-          <label>Heading<input value={section.title || ""} onChange={(e) => onChange({ title: e.target.value })} /></label>
-          <label>Text
-            <textarea
-              rows={4}
-              value={section.text || ""}
-              onChange={(e) => onChange({ text: e.target.value })}
-              placeholder="Plain text paragraph; line breaks are preserved."
+          <TagTokenField label="Heading" value={section.title} onChange={(v) => onChange({ title: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
+          <TagTokenField
+            label="Text"
+            multiline
+            rows={4}
+            value={section.text}
+            onChange={(v) => onChange({ text: v })}
+            placeholder="Plain text; line breaks are kept. Use the tag button to insert a value."
+            gatewayOptions={gatewayOptions}
+            tagList={tagList}
+            formatTagForDisplay={formatTagForDisplay}
+          />
+          <p className="tn-token-help">
+            Insert a tag with the button above, or type one:{" "}
+            <code>{"{TagName}"}</code>. A mask shows a word instead of a
+            number — <code>{"{R1_Pass|1=PASS,0=FAIL}"}</code>. Run values:{" "}
+            <code>{"{start}"}</code> <code>{"{end}"}</code>{" "}
+            <code>{"{date}"}</code>.
+          </p>
+          <FontControls section={section} onChange={onChange}
+                        prefix="title_" label="Heading style" />
+          <FontControls section={section} onChange={onChange}
+                        label="Body text style" />
+            <SectionTrigger
+              section={section} onChange={onChange}
+              gatewayOptions={gatewayOptions} tagList={tagList}
+              formatTagForDisplay={formatTagForDisplay}
             />
-          </label>
+          <SectionLayout section={section} onChange={onChange} prevType={prevType} />
+        </div>
+      ) : null}
+
+      {type === "static_table" ? (
+        <div className="tn-section-form">
+          <TagTokenField label="Heading" value={section.title}
+            onChange={(v) => onChange({ title: v })}
+            gatewayOptions={gatewayOptions} tagList={tagList}
+            formatTagForDisplay={formatTagForDisplay} />
+          <p className="tn-token-help">
+            Any cell can be fixed text, a tag value as <code>{"{TagName}"}</code>,
+            or the run itself: <code>{"{start}"}</code> <code>{"{end}"}</code>{" "}
+            <code>{"{date}"}</code> <code>{"{template}"}</code>. Add a mask to
+            show a word instead of a number:{" "}
+            <code>{"{R1_Pass|1=PASS,0=FAIL}"}</code> — this works in any text,
+            in every section.
+          </p>
+
+          <div className="tn-subhead">Columns</div>
+          <div className="tn-static-row">
+            {(section.header || []).map((h, c) => (
+              <TokenInput key={c} value={h || ""} placeholder={`Column ${c + 1}`}
+                          gatewayOptions={gatewayOptions} tagList={tagList}
+                          formatTagForDisplay={formatTagForDisplay}
+                          onChange={(v) => setHeaderCell(c, v)} />
+            ))}
+            <button type="button" className="btn btn-secondary btn-sm"
+                    onClick={addDetailColumn} title="Add a column">+ Col</button>
+            <button type="button" className="btn btn-danger btn-sm"
+                    disabled={(section.header || []).length <= 1}
+                    onClick={removeDetailColumn} title="Remove the last column">− Col</button>
+          </div>
+
+          <div className="tn-subhead">Rows</div>
+          {(section.rows || []).map((row, r) => (
+            <div key={r} className="tn-static-row">
+              {(section.header || []).map((_h, c) => (
+                <TokenInput key={c} value={(row && row[c]) || ""}
+                            placeholder={c === 0 ? "Label" : "Text or a tag"}
+                            gatewayOptions={gatewayOptions} tagList={tagList}
+                            formatTagForDisplay={formatTagForDisplay}
+                            onChange={(v) => setCell(r, c, v)} />
+              ))}
+              <button type="button" className="btn btn-danger btn-sm"
+                      onClick={() => removeRow(r)} title="Remove this row">×</button>
+            </div>
+          ))}
+          <button type="button" className="btn btn-secondary btn-sm" onClick={addRow}>
+            + Add row
+          </button>
+
+          <TableStyleControls section={section} onChange={onChange} />
+          <ColumnStyleControls section={section} onChange={onChange} />
+          <SectionTrigger
+            section={section} onChange={onChange}
+            gatewayOptions={gatewayOptions} tagList={tagList}
+            formatTagForDisplay={formatTagForDisplay}
+          />
+          <SectionLayout section={section} onChange={onChange} prevType={prevType} showAlign />
+        </div>
+      ) : null}
+
+      {type === "pill_card" ? (
+        <div className="tn-section-form">
+          <TagTokenField label="Heading" value={section.title}
+            onChange={(v) => onChange({ title: v })}
+            gatewayOptions={gatewayOptions} tagList={tagList}
+            formatTagForDisplay={formatTagForDisplay} />
+          <div className="tn-row tn-row-3">
+            <label>Alignment
+              <select value={String(section.align || "left")}
+                      onChange={(e) => onChange({ align: e.target.value })}>
+                <option value="left">Left</option>
+                <option value="center">Centre</option>
+                <option value="right">Right</option>
+              </select>
+            </label>
+            <label>Per row
+              <input type="number" min="1" max="8" value={section.columns ?? 4}
+                     onChange={(e) => onChange({ columns: Number(e.target.value) || 1 })} />
+            </label>
+            <label>Text size (pt)
+              <input type="number" min="6" max="28" step="0.5" value={section.font_size ?? 10}
+                     onChange={(e) => onChange({ font_size: Number(e.target.value) || 10 })} />
+            </label>
+          </div>
+          <div className="tn-row tn-row-3">
+            <label>Corners
+              <select value={String(section.pill_corners || "both")}
+                      onChange={(e) => onChange({ pill_corners: e.target.value })}
+                      title="Which corners are rounded. Left or right only makes two pills read as one joined badge.">
+                <option value="both">Rounded (both ends)</option>
+                <option value="left">Rounded left only</option>
+                <option value="right">Rounded right only</option>
+                <option value="top">Rounded top only</option>
+                <option value="bottom">Rounded bottom only</option>
+                <option value="none">Square</option>
+              </select>
+            </label>
+            <label>Corner radius (pt)
+              <input type="number" min="0" max="40" step="1" placeholder="auto"
+                     value={section.pill_radius ?? ""}
+                     title="Blank follows the text size, which gives fully rounded ends."
+                     onChange={(e) => onChange({ pill_radius: e.target.value === "" ? "" : Number(e.target.value) })} />
+            </label>
+            <label className="tn-checkbox">
+              <input type="checkbox" checked={Boolean(section.as_header)}
+                     onChange={(e) => onChange({ as_header: e.target.checked })} />
+              Use as a section header
+            </label>
+          </div>
+
+          <div className="tn-subhead">Pills</div>
+          {(section.pills || []).map((pill, i) => (
+            <div key={pill.id || i} className="tn-pill-row">
+              <input className="tn-pill-label" placeholder="Label"
+                     value={pill.label || ""}
+                     onChange={(e) => updatePill(pill.id, { label: e.target.value })} />
+              {/* Either a literal value OR a tag. The tag wins when set, so
+                  the text box dims to say so rather than quietly losing. */}
+              <TokenInput className="tn-pill-text" placeholder="Text, or a tag"
+                          value={pill.text || ""}
+                          disabled={Boolean(pill.tag_name)}
+                          title={pill.tag_name
+                            ? "A tag is selected below, so it supplies the value"
+                            : "Literal text, or pick a tag to insert a token"}
+                          gatewayOptions={gatewayOptions} tagList={tagList}
+                          formatTagForDisplay={formatTagForDisplay}
+                          onChange={(v) => updatePill(pill.id, { text: v })} />
+              <select value={pill.gateway_id || ""}
+                      onChange={(e) => updatePill(pill.id, { gateway_id: e.target.value, tag_name: "" })}>
+                <option value="">(no tag)</option>
+                {gatewayOptions.map((g) => <option key={g.id} value={g.id}>{g.name || g.id}</option>)}
+              </select>
+              <select value={pill.tag_name || ""}
+                      onChange={(e) => updatePill(pill.id, { tag_name: e.target.value })}>
+                <option value="">—</option>
+                {tagList(pill.gateway_id).map((t) => (
+                  <option key={t} value={t}>{formatTagForDisplay ? formatTagForDisplay(t) : t}</option>
+                ))}
+              </select>
+              <select value={pill.aggregation || "latest"}
+                      disabled={!pill.tag_name}
+                      onChange={(e) => updatePill(pill.id, { aggregation: e.target.value })}>
+                {KPI_AGGREGATIONS.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
+              </select>
+              <input className="tn-pill-unit" placeholder="Unit"
+                     value={pill.unit || ""}
+                     onChange={(e) => updatePill(pill.id, { unit: e.target.value })} />
+              {/* 2026-10-09: "if the value is 1 we should show ... passed
+                  and 0 failed". Free text because that is quicker to type
+                  than a row editor; "*" catches anything unlisted. */}
+              <input className="tn-pill-mask" placeholder="1=PASS, 0=FAIL"
+                     title={"Show a word instead of the number.\n"
+                            + "1=PASS, 0=FAIL  -  and * for anything else.\n"
+                            + "A tag with no reading still shows a dash."}
+                     value={pill.value_map || ""}
+                     onChange={(e) => updatePill(pill.id, { value_map: e.target.value })} />
+              <input type="color" title="Text colour"
+                     value={String(pill.color || "#ffffff")}
+                     onChange={(e) => updatePill(pill.id, { color: e.target.value })} />
+              <input type="color" title="Background"
+                     value={String(pill.background || "#14a89a")}
+                     onChange={(e) => updatePill(pill.id, { background: e.target.value })} />
+              <button type="button" title="Bold"
+                      className={`btn btn-sm ${pill.bold ? "btn-primary" : "btn-secondary"}`}
+                      onClick={() => updatePill(pill.id, { bold: !pill.bold })}>
+                <strong>B</strong>
+              </button>
+              <button type="button" className="btn btn-danger btn-sm" title="Remove"
+                      onClick={() => removePill(pill.id)}>×</button>
+            </div>
+          ))}
+          <button type="button" className="btn btn-secondary btn-sm" onClick={addPill}>
+            + Add pill
+          </button>
+
+          <SectionTrigger
+            section={section} onChange={onChange}
+            gatewayOptions={gatewayOptions} tagList={tagList}
+            formatTagForDisplay={formatTagForDisplay}
+          />
+          <SectionLayout section={section} onChange={onChange} prevType={prevType} />
         </div>
       ) : null}
 
       {type === "image" ? (
         <div className="tn-section-form">
           <div className="tn-row tn-row-2">
-            <label>Title<input value={section.title || ""} onChange={(e) => onChange({ title: e.target.value })} /></label>
+            <TagTokenField label="Title" value={section.title} onChange={(v) => onChange({ title: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
             <label>Caption<input value={section.caption || ""} onChange={(e) => onChange({ caption: e.target.value })} /></label>
           </div>
           <div className="tn-row tn-row-3">
@@ -1333,13 +2767,182 @@ function SectionEditor({
               </div>
             </div>
           ) : null}
+          <SectionLayout section={section} onChange={onChange} prevType={prevType} />
+        </div>
+      ) : null}
+
+      {type === "segment_summary" ? (
+        <div className="tn-section-form">
+          <div className="tn-row tn-row-3">
+            <TagTokenField label="Title" value={section.title} onChange={(v) => onChange({ title: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
+            <label>Only this test
+              <input
+                placeholder="e.g. test2 — blank = every test"
+                value={section.segment || ""}
+                onChange={(e) => onChange({ segment: e.target.value })}
+              />
+            </label>
+            <label>First column header
+              <input value={section.segment_header || "Test"}
+                onChange={(e) => onChange({ segment_header: e.target.value })} />
+            </label>
+          </div>
+
+          {/* 2026-10-09, reported: "test summary table ... when try to load
+              and select a tag no tag is selected". The tag dropdowns read
+              tagList(col.gateway_id || section.gateway_id) and this branch
+              offered NO way to set either, so the list was always empty and
+              the picker looked broken. A section-level gateway fills every
+              column's list; a column may still override it below. */}
+          <div className="tn-row tn-row-2">
+            <label>Gateway
+              <select
+                value={section.gateway_id || ""}
+                onChange={(e) => onChange({ gateway_id: e.target.value })}
+                title="Where these measurements come from. Each column can override it."
+              >
+                <option value="">Choose a gateway</option>
+                {gatewayOptions.map((g) => (
+                  <option key={g.id} value={g.id}>{g.name || g.id}</option>
+                ))}
+              </select>
+            </label>
+            <span />
+          </div>
+
+          <div className="tn-subhead">One column per measurement</div>
+          {!section.gateway_id && !(section.columns || []).some((c) => c.gateway_id) ? (
+            <p className="tn-token-help">
+              Choose a gateway above and the tag lists below will fill in.
+            </p>
+          ) : null}
+          {(section.columns || []).map((col, i) => (
+            <div className="tn-row tn-row-5" key={`col-${i}`}>
+              <label>Gateway
+                <select
+                  value={col.gateway_id || ""}
+                  onChange={(e) => onChange({ columns: (section.columns || []).map((c, j) => j === i ? { ...c, gateway_id: e.target.value, tag_name: "" } : c) })}
+                  title="Blank uses the section's gateway"
+                >
+                  <option value="">(section default)</option>
+                  {gatewayOptions.map((g) => (
+                    <option key={g.id} value={g.id}>{g.name || g.id}</option>
+                  ))}
+                </select>
+              </label>
+              <label>Tag
+                <select
+                  value={col.tag_name || ""}
+                  onChange={(e) => onChange({ columns: (section.columns || []).map((c, j) => j === i ? { ...c, tag_name: e.target.value } : c) })}
+                >
+                  <option value="">Choose a tag</option>
+                  {tagList(col.gateway_id || section.gateway_id).map((t) => (
+                    <option key={t} value={t}>{formatTagForDisplay(t)}</option>
+                  ))}
+                </select>
+              </label>
+              <label>Aggregation
+                <select
+                  value={col.aggregation || "avg"}
+                  onChange={(e) => onChange({ columns: (section.columns || []).map((c, j) => j === i ? { ...c, aggregation: e.target.value } : c) })}
+                >
+                  {SEGMENT_AGGREGATIONS.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
+                </select>
+              </label>
+              <label>Column title
+                <input value={col.title || ""} placeholder="optional"
+                  onChange={(e) => onChange({ columns: (section.columns || []).map((c, j) => j === i ? { ...c, title: e.target.value } : c) })} />
+              </label>
+              <button type="button" className="btn btn-danger btn-sm"
+                onClick={() => onChange({ columns: (section.columns || []).filter((_, j) => j !== i) })}>
+                Remove
+              </button>
+            </div>
+          ))}
+          <button type="button" className="btn btn-sm"
+            onClick={() => onChange({ columns: [...(section.columns || []), { tag_name: "", aggregation: "avg", title: "" }] })}>
+            Add measurement
+          </button>
+
+          <div className="tn-row tn-row-3">
+            <label>Total row
+              <select
+                value={section.footer_aggregation || ""}
+                onChange={(e) => onChange({ footer_aggregation: e.target.value })}
+              >
+                <option value="">No total row</option>
+                {SEGMENT_AGGREGATIONS.map((a) => (
+                  <option key={a.value} value={a.value}>{`${a.label} of all tests`}</option>
+                ))}
+              </select>
+            </label>
+            <label>Total row label
+              <input value={section.footer_label || ""} placeholder="Average"
+                onChange={(e) => onChange({ footer_label: e.target.value })} />
+            </label>
+            <label>Decimals
+              <select value={section.format || "3dp"} onChange={(e) => onChange({ format: e.target.value })}>
+                <option value="int">0</option>
+                <option value="2dp">2</option>
+                <option value="3dp">3</option>
+                <option value="scientific">scientific</option>
+              </select>
+            </label>
+          </div>
+            <SectionTrigger
+              section={section} onChange={onChange}
+              gatewayOptions={gatewayOptions} tagList={tagList}
+              formatTagForDisplay={formatTagForDisplay}
+            />
+          <SectionLayout section={section} onChange={onChange} prevType={prevType} showAlign />
         </div>
       ) : null}
 
       {type === "kpi_grid" ? (
         <div className="tn-section-form">
+          {/* The grid always carried a time_range; until 2026-09-30 nothing
+              read it, so every KPI aggregated the whole historian. */}
           <div className="tn-row tn-row-2">
-            <label>Title<input value={section.title || ""} onChange={(e) => onChange({ title: e.target.value })} /></label>
+            <label>Time range
+              <select
+                value={section.time_range?.preset || "run"}
+                onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), preset: e.target.value } })}
+              >
+                {TIME_PRESETS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+              </select>
+            </label>
+            {section.time_range?.preset === "segment" ? (
+              <label>Which test / cycle
+                <input
+                  placeholder="test2 · 3 or last"
+                  value={section.time_range?.segment || ""}
+                  onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), segment: e.target.value } })}
+                />
+              </label>
+            ) : null}
+          </div>
+          <div className="tn-row tn-row-2">
+            <TagTokenField label="Title" value={section.title} onChange={(v) => onChange({ title: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
+            <label>Show as
+              <select
+                value={section.kpi_style || "cards"}
+                onChange={(e) => onChange({ kpi_style: e.target.value })}
+              >
+                <option value="cards">Cards</option>
+                <option value="table">Table</option>
+              </select>
+            </label>
+            {(section.kpi_style || "cards") === "cards" ? (
+              <label>Corners
+                <select
+                  value={section.kpi_corners || "round"}
+                  onChange={(e) => onChange({ kpi_corners: e.target.value })}
+                >
+                  <option value="round">Rounded</option>
+                  <option value="square">Square</option>
+                </select>
+              </label>
+            ) : null}
             <label>Columns
               <input
                 type="number" min={1} max={6}
@@ -1353,7 +2956,8 @@ function SectionEditor({
               <div key={item.id || idx} className="tn-kpi-row">
                 <input
                   value={item.label || ""}
-                  placeholder="Label"
+                  placeholder="Label — {tag:Name} works here too"
+                  title="A KPI label can carry a tag value, e.g. 'Peak on {tag:Line_Id}'."
                   onChange={(e) => onChange({
                     items: section.items.map((it, i) => (i === idx ? { ...it, label: e.target.value } : it)),
                   })}
@@ -1396,16 +3000,50 @@ function SectionEditor({
               + Add KPI cell
             </button>
           </div>
+            <SectionTrigger
+              section={section} onChange={onChange}
+              gatewayOptions={gatewayOptions} tagList={tagList}
+              formatTagForDisplay={formatTagForDisplay}
+            />
+          <SectionLayout section={section} onChange={onChange} prevType={prevType} showAlign />
         </div>
       ) : null}
 
       {(isChart || type === "table") ? (
         <div className="tn-section-form">
           <CollapsibleCard id={`${section.id}-basics`} title="Basics" defaultOpen>
+            {/* 2026-10-09, requested: "a option to change the type of the
+                chart selected in the section where is possible, like change
+                from line to area to bar etc without the need to delete and
+                create a new one".
+
+                Only the three time-series types are offered here. They are
+                the ones that share an IDENTICAL configuration - series,
+                axes, bucket, window - so switching between them keeps every
+                setting. A pie or a data table is configured differently
+                (compute rules, column definitions), and silently carrying a
+                chart's series into one would lose work rather than save
+                it. */}
+            {isChart ? (
+              <div className="tn-row tn-row-2">
+                <label>Chart type
+                  <select
+                    value={type}
+                    onChange={(e) => onChange({ type: e.target.value })}
+                    title="Switch between line, area and bar. Series, axes and the time window are kept."
+                  >
+                    <option value="line_chart">Line chart</option>
+                    <option value="area_chart">Area chart</option>
+                    <option value="bar_chart">Bar chart</option>
+                  </select>
+                </label>
+                <span />
+              </div>
+            ) : null}
             <div className="tn-row tn-row-2">
-              <label>Title<input value={section.title || ""} onChange={(e) => onChange({ title: e.target.value })} /></label>
+              <TagTokenField label="Title" value={section.title} onChange={(v) => onChange({ title: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
               {isChart ? (
-                <label>Sample count
+                <label>Max samples<span className="tn-hint" title="The most points to DRAW. The time range decides what is read; this only thins it evenly across the window, so two sections on the same trigger always cover the same period."> </span>
                   <input
                     type="number" min={20} max={5000}
                     value={section.readings_count || 200}
@@ -1422,7 +3060,14 @@ function SectionEditor({
                 </label>
               )}
             </div>
-            <div className="tn-row tn-row-2">
+            {/* Three groups, each a tidy row: WHEN the data comes from, WHAT
+                opens and closes it, and HOW it sits on the page. Before this
+                they shared one two-column row - two four-field trigger
+                pickers among them - and every control carried a paragraph of
+                help, so nothing lined up. Long explanations now live in the
+                title attribute, where they are available but not in the way. */}
+            <div className="tn-subhead">When</div>
+            <div className="tn-row tn-row-3">
               <label>Time range
                 <select
                   value={section.time_range?.preset || "24h"}
@@ -1431,42 +3076,53 @@ function SectionEditor({
                   {TIME_PRESETS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
                 </select>
               </label>
-              {section.time_range?.preset === "custom" ? (
-                <div className="tn-row tn-row-2 tn-row-tight">
-                  <label>From (UTC)
-                    <input type="datetime-local" value={section.time_range?.from_utc || ""} onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), from_utc: e.target.value } })} />
-                  </label>
-                  <label>To (UTC)
-                    <input type="datetime-local" value={section.time_range?.to_utc || ""} onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), to_utc: e.target.value } })} />
-                  </label>
-                </div>
-              ) : null}
-              {section.time_range?.preset === "batch" ? (
-                <BatchWindowPicker
-                  timeRange={section.time_range}
-                  onChange={(patch) => onChange({ time_range: { ...(section.time_range || {}), preset: "batch", ...patch } })}
-                />
-              ) : null}
-            </div>
-            {/* Section-level bucket size. "Raw samples" keeps the current
-                behaviour (every historian point is plotted as a chart point).
-                Anything else groups samples into fixed-width buckets and each
-                series reduces its bucket via its own aggregation choice. */}
-            <div className="tn-row tn-row-2">
-              <label>Bucket (group samples)
+              <label>Group samples
                 <select
                   value={section.bucket || "raw"}
                   onChange={(e) => onChange({ bucket: e.target.value })}
-                  title="Group raw samples into time buckets before aggregating per series"
+                  title="Summarise samples per minute / hour / day. Each series applies its own aggregation inside the bucket."
                 >
                   {BUCKET_SIZES.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
                 </select>
               </label>
-              <div className="tn-help-text">
-                Pick a bucket size to summarise samples per minute / hour / day. Each series below
-                chooses its own aggregation (avg, max, min, last…) which is applied <em>inside</em> the bucket.
-              </div>
+              {section.time_range?.preset === "segment" ? (
+                <label>Which test / cycle
+                  <input
+                    placeholder="test2 · 3 or last"
+                    value={section.time_range?.segment || ""}
+                    onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), segment: e.target.value } })}
+                  />
+                </label>
+              ) : <span />}
             </div>
+            {section.time_range?.preset === "custom" ? (
+              <div className="tn-row tn-row-2 tn-row-tight">
+                <label>From (UTC)
+                  <input type="datetime-local" step="1" value={section.time_range?.from_utc || ""} onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), from_utc: e.target.value } })} />
+                </label>
+                <label>To (UTC)
+                  <input type="datetime-local" step="1" value={section.time_range?.to_utc || ""} onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), to_utc: e.target.value } })} />
+                </label>
+              </div>
+            ) : null}
+            {section.time_range?.preset === "batch" ? (
+              <BatchWindowPicker
+                timeRange={section.time_range}
+                onChange={(patch) => onChange({ time_range: { ...(section.time_range || {}), preset: "batch", ...patch } })}
+              />
+            ) : null}
+
+            {type === "table" ? (
+              <TableStyleControls section={section} onChange={onChange} />
+            ) : null}
+
+            <SectionTrigger
+              section={section} onChange={onChange}
+              gatewayOptions={gatewayOptions} tagList={tagList}
+              formatTagForDisplay={formatTagForDisplay}
+            />
+
+            <SectionLayout section={section} onChange={onChange} prevType={prevType} showAlign />
           </CollapsibleCard>
 
           <CollapsibleCard id={`${section.id}-series`} title="Data series" subtitle={`${(section.series || []).length} configured`}>
@@ -1492,9 +3148,13 @@ function SectionEditor({
                     </select>
                     {isChart ? (
                       <>
-                        <select value={s.axis || "left"} onChange={(e) => updateSeries(s.id, { axis: e.target.value })} title="Axis">
-                          <option value="left">Left</option>
-                          <option value="right">Right</option>
+                        {/* Legacy rows stored "left"/"right"; the backend
+                            normalises both onto axis 1 and 2. */}
+                        <select value={normAxis4(s.axis)} onChange={(e) => updateSeries(s.id, { axis: e.target.value })} title="Which Y axis this series is read against">
+                          <option value="left1">Y-axis 1 (left)</option>
+                          <option value="right1">Y-axis 2 (right)</option>
+                          <option value="left2">Y-axis 3 (left, outer)</option>
+                          <option value="right2">Y-axis 4 (right, outer)</option>
                         </select>
                         <select value={s.chart_type || ""} onChange={(e) => updateSeries(s.id, { chart_type: e.target.value })} title="Chart kind">
                           {SERIES_CHART_KINDS.map((k) => <option key={k.value} value={k.value}>{k.label}</option>)}
@@ -1567,6 +3227,27 @@ function SectionEditor({
                         />
                       </label>
                     ) : null}
+                    <label className="tn-inline-label" title="How this series is drawn between readings. Blank follows the chart's setting.">
+                      Line shape
+                      <select
+                        value={s.interpolation || ""}
+                        onChange={(e) => updateSeries(s.id, { interpolation: e.target.value })}
+                      >
+                        <option value="">Chart default</option>
+                        {CHART_INTERPOLATIONS.map((o) => (
+                          <option key={o.value} value={o.value}>{o.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="tn-inline-label" title="Stroke width for this series only. Blank follows the chart's setting - useful for a thin setpoint under a thick measurement.">
+                      Thickness
+                      <input
+                        type="number" min="0.2" max="6" step="0.1"
+                        value={s.line_width ?? ""}
+                        placeholder="chart"
+                        onChange={(e) => updateSeries(s.id, { line_width: e.target.value })}
+                      />
+                    </label>
                   </div>
                 </div>
               );
@@ -1577,31 +3258,102 @@ function SectionEditor({
           {isChart ? (
             <CollapsibleCard id={`${section.id}-axes`} title="Axes, units & scale" defaultOpen={false}>
               <div className="tn-row tn-row-2">
-                <label>X-axis title<input value={section.x_axis_label || ""} onChange={(e) => onChange({ x_axis_label: e.target.value })} /></label>
+                {/* 2026-10-11, requested: axis labels "cab be a tag value".
+                    Same token vocabulary as every other text field, so an
+                    axis can be titled from the PLC - a unit the recipe sets,
+                    or the name of the product under test. */}
+                <label>X-axis title
+                  <TokenInput value={section.x_axis_label || ""}
+                              gatewayOptions={gatewayOptions} tagList={tagList}
+                              formatTagForDisplay={formatTagForDisplay}
+                              onChange={(v) => onChange({ x_axis_label: v })} />
+                </label>
                 <label>Value format
                   <select value={section.value_format || "auto"} onChange={(e) => onChange({ value_format: e.target.value })}>
                     {VALUE_FORMATS.map((v) => <option key={v.value} value={v.value}>{v.label}</option>)}
                   </select>
                 </label>
               </div>
+              {/* FOUR Y axes, same model and the same config keys as the
+                  dashboard widgets (2026-10-08, requested: "we still need
+                  the mutple Y axis as we had for the dashboard wdigets to be
+                  print more than 2 unis of readings"). An axis is only drawn
+                  when a series is assigned to it, so a one-unit chart looks
+                  exactly as it did. */}
               <fieldset className="tn-fieldset">
-                <legend>Primary Y-axis (left)</legend>
+                <legend>Y-axis 1 (left)</legend>
                 <div className="tn-row tn-row-4">
-                  <label>Title<input value={section.y_axis_label || ""} onChange={(e) => onChange({ y_axis_label: e.target.value })} /></label>
-                  <label>Unit / suffix<input value={section.y_axis_unit || ""} onChange={(e) => onChange({ y_axis_unit: e.target.value })} placeholder="e.g. kW" /></label>
+                  <label>Title<TokenInput value={section.y_axis_label || ""} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_axis_label: v })} /></label>
+                  <label>Unit / suffix<TokenInput value={section.y_axis_unit || ""} placeholder="e.g. kW" gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_axis_unit: v })} /></label>
                   <label>Min<input type="number" step="any" value={section.y_min ?? ""} onChange={(e) => onChange({ y_min: e.target.value })} placeholder="auto" /></label>
                   <label>Max<input type="number" step="any" value={section.y_max ?? ""} onChange={(e) => onChange({ y_max: e.target.value })} placeholder="auto" /></label>
                 </div>
               </fieldset>
               <fieldset className="tn-fieldset">
-                <legend>Secondary Y-axis (right, optional)</legend>
+                <legend>Y-axis 2 (right)</legend>
                 <div className="tn-row tn-row-4">
-                  <label>Title<input value={section.y_axis_right_label || ""} onChange={(e) => onChange({ y_axis_right_label: e.target.value })} /></label>
-                  <label>Unit / suffix<input value={section.y_axis_right_unit || ""} onChange={(e) => onChange({ y_axis_right_unit: e.target.value })} placeholder="e.g. °C" /></label>
+                  <label>Title<TokenInput value={section.y_axis_right_label || ""} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_axis_right_label: v })} /></label>
+                  <label>Unit / suffix<TokenInput value={section.y_axis_right_unit || ""} placeholder="e.g. °C" gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_axis_right_unit: v })} /></label>
                   <label>Min<input type="number" step="any" value={section.y_right_min ?? ""} onChange={(e) => onChange({ y_right_min: e.target.value })} placeholder="auto" /></label>
                   <label>Max<input type="number" step="any" value={section.y_right_max ?? ""} onChange={(e) => onChange({ y_right_max: e.target.value })} placeholder="auto" /></label>
                 </div>
               </fieldset>
+              <fieldset className="tn-fieldset">
+                <legend>Y-axis 3 (left, outer)</legend>
+                <div className="tn-row tn-row-4">
+                  <label>Title<TokenInput value={section.y_left2_label || ""} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_left2_label: v })} /></label>
+                  <label>Unit / suffix<TokenInput value={section.y_left2_unit || ""} placeholder="e.g. bar" gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_left2_unit: v })} /></label>
+                  <label>Min<input type="number" step="any" value={section.y_left2_min ?? ""} onChange={(e) => onChange({ y_left2_min: e.target.value })} placeholder="auto" /></label>
+                  <label>Max<input type="number" step="any" value={section.y_left2_max ?? ""} onChange={(e) => onChange({ y_left2_max: e.target.value })} placeholder="auto" /></label>
+                </div>
+              </fieldset>
+              <fieldset className="tn-fieldset">
+                <legend>Y-axis 4 (right, outer)</legend>
+                <div className="tn-row tn-row-4">
+                  <label>Title<TokenInput value={section.y_right2_label || ""} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_right2_label: v })} /></label>
+                  <label>Unit / suffix<TokenInput value={section.y_right2_unit || ""} placeholder="e.g. l/min" gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_right2_unit: v })} /></label>
+                  <label>Min<input type="number" step="any" value={section.y_right2_min ?? ""} onChange={(e) => onChange({ y_right2_min: e.target.value })} placeholder="auto" /></label>
+                  <label>Max<input type="number" step="any" value={section.y_right2_max ?? ""} onChange={(e) => onChange({ y_right2_max: e.target.value })} placeholder="auto" /></label>
+                </div>
+              </fieldset>
+              {/* 2026-10-11, requested: editable ticks, line thickness and
+                  legend alignment. Tick count is per CHART, not per axis:
+                  the horizontal grid lines are shared, so two different
+                  counts would print one axis's labels between the other's
+                  grid lines. */}
+              <div className="tn-row tn-row-3">
+                <label title="How many intervals the Y scale is divided into. Fewer ticks on a crowded chart.">
+                  Y-axis ticks
+                  <input type="number" min="2" max="12" step="1"
+                         value={section.y_tick_count ?? 5}
+                         onChange={(e) => onChange({ y_tick_count: e.target.value })} />
+                </label>
+                <label title="Default stroke for every series on this chart. A series can override it.">
+                  Line thickness
+                  <input type="number" min="0.2" max="6" step="0.1"
+                         value={section.line_width ?? 1.4}
+                         onChange={(e) => onChange({ line_width: e.target.value })} />
+                </label>
+                <label>Legend position
+                  <select value={section.legend_align || "left"}
+                          onChange={(e) => onChange({ legend_align: e.target.value })}>
+                    <option value="left">Left</option>
+                    <option value="center">Centred</option>
+                    <option value="right">Right</option>
+                  </select>
+                </label>
+              </div>
+              <div className="tn-row tn-row-2">
+                <label title="How the line is drawn between readings. Use a Step for a signal that holds its value - a straight diagonal implies readings that were never taken.">
+                  Interpolation
+                  <select value={section.interpolation || "linear"}
+                          onChange={(e) => onChange({ interpolation: e.target.value })}>
+                    {CHART_INTERPOLATIONS.map((o) => (
+                      <option key={o.value} value={o.value}>{o.label}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
               <label className="tn-checkbox">
                 <input type="checkbox" checked={section.show_legend !== false} onChange={(e) => onChange({ show_legend: e.target.checked })} />
                 Show legend
@@ -1701,7 +3453,7 @@ function SectionEditor({
 
       {type === "pie_chart" ? (
         <div className="tn-section-form">
-          <label>Title<input value={section.title || ""} onChange={(e) => onChange({ title: e.target.value })} /></label>
+          <TagTokenField label="Title" value={section.title} onChange={(v) => onChange({ title: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
           <div className="tn-row tn-row-2">
             <label>Data source
               <select value={section.data_source_type || "tag_direct"} onChange={(e) => onChange({ data_source_type: e.target.value })}>
@@ -1745,6 +3497,12 @@ function SectionEditor({
               </label>
             </div>
           )}
+            <SectionTrigger
+              section={section} onChange={onChange}
+              gatewayOptions={gatewayOptions} tagList={tagList}
+              formatTagForDisplay={formatTagForDisplay}
+            />
+          <SectionLayout section={section} onChange={onChange} prevType={prevType} showAlign />
         </div>
       ) : null}
 
@@ -1759,6 +3517,8 @@ function SectionEditor({
       {type === "page_break" ? (
         <p className="tn-section-caption">A page break starts the next section on a new page.</p>
       ) : null}
+       </>
+      )}
     </div>
   );
 }
@@ -1841,19 +3601,67 @@ export function ReportTemplateDesigner({
   const [previewState, setPreviewState] = useState({ rendering: false, generatedId: "", error: "" });
   const [previewKey, setPreviewKey] = useState(0);
 
+  // Set when a load failed, so the page can offer "Try again" instead of
+  // looking like an install with no templates.
+  const [loadError, setLoadError] = useState("");
+  // The last message we raised, so a retry loop cannot re-raise the same
+  // banner every few seconds. Cleared on success.
+  const notifiedErrRef = useRef("");
   const refreshTemplates = useCallback(async () => {
     try {
       const res = await listReportTemplates();
       const list = Array.isArray(res?.templates) ? res.templates : [];
       setTemplates(list);
+      setLoadError("");
+      notifiedErrRef.current = "";
       return list;
     } catch (e) {
-      onNotify({ type: "error", message: `Failed to load templates: ${e?.message || e}` });
-      return [];
+      const msg = String(e?.message || e);
+      setLoadError(msg);
+      // Only on CHANGE. onNotify sets a global banner, which re-renders the
+      // whole app; raising it on every retry made the page flicker.
+      if (notifiedErrRef.current !== msg) {
+        notifiedErrRef.current = msg;
+        onNotify({ type: "error", message: `Failed to load templates: ${msg}` });
+      }
+      return null;   // null = "could not read", NOT "there are none"
     }
   }, [onNotify]);
 
-  useEffect(() => { refreshTemplates(); }, [refreshTemplates]);
+  // Always the latest refreshTemplates, WITHOUT making it an effect
+  // dependency - see the loop described below.
+  const refreshRef = useRef(refreshTemplates);
+  refreshRef.current = refreshTemplates;
+
+  // KEEP TRYING (operator 2026-10-07: "problems to load the templates").
+  // This ran once. At startup the backend is still finishing deferred init
+  // against a multi-gigabyte store, so the first read often fails - and the
+  // designer then showed an empty template list for the rest of the session.
+  // An empty list and a failed read look identical to the operator, which is
+  // why this looked like "the templates are gone".
+  //
+  // RUNS ONCE - the dependency array MUST stay empty. `refreshTemplates` is
+  // rebuilt whenever `onNotify` changes, and the parent passes onNotify as an
+  // inline arrow, so its identity changes on EVERY App render. Depending on
+  // it meant: fetch fails -> onNotify sets a global banner -> App re-renders
+  // -> new onNotify -> new refreshTemplates -> this effect tears down and
+  // re-runs -> fetch immediately -> fails... a tight infinite loop that
+  // hammered the backend and made the page visibly flicker (reported the
+  // same day it shipped). The ref gives the loop the current function
+  // without making it a trigger.
+  useEffect(() => {
+    let cancelled = false;
+    let timer = null;
+    let attempt = 0;
+    const tick = async () => {
+      const got = await refreshRef.current?.();
+      if (cancelled || got !== null) return;    // loaded (even if empty): done
+      attempt += 1;
+      timer = setTimeout(tick, Math.min(15000, 2000 * Math.pow(2, attempt - 1)));
+    };
+    tick();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, []);
 
   const loadTemplate = (id) => {
     const tpl = templates.find((t) => String(t.id) === String(id));
@@ -1997,7 +3805,10 @@ export function ReportTemplateDesigner({
       });
       const list = await refreshTemplates();
       const first = Array.isArray(res?.imported) && res.imported[0];
-      if (first && first.id) {
+      // refreshTemplates returns null when the re-read FAILED (as opposed to
+      // returning none). The import itself still succeeded, so say nothing
+      // more and let the retry loop pick the list up.
+      if (first && first.id && Array.isArray(list)) {
         // Load the first imported template into the editor for convenience.
         const found = list.find((t) => String(t.id) === String(first.id));
         if (found) {
@@ -2103,6 +3914,29 @@ export function ReportTemplateDesigner({
       },
     }));
   };
+  /* Copy a section and drop the copy directly below the original.
+   *
+   * 2026-10-09, requested: "we also should have a option to duplicate the
+   * section and to be added right after the original one to make easy the
+   * things". Building a report of six near-identical cycle charts meant
+   * configuring each from scratch.
+   *
+   * Every id inside the section is regenerated, not just the section's own.
+   * Series, pills, KPI items and columns are all edited BY ID
+   * (updateSeries matches on s.id), so a copy that kept them would edit
+   * both sections at once - and the duplicate would look haunted.
+   */
+  const duplicateSection = (sectionId) => {
+    setDraft((prev) => {
+      const list = [...(prev.definition?.sections || [])];
+      const idx = list.findIndex((s) => String(s.id) === String(sectionId));
+      if (idx < 0) return prev;
+      const copy = reidSection(list[idx]);
+      list.splice(idx + 1, 0, copy);
+      return { ...prev, definition: { ...prev.definition, sections: list } };
+    });
+  };
+
   const moveSection = (sectionId, direction) => {
     setDraft((prev) => {
       const list = [...(prev.definition?.sections || [])];
@@ -2181,6 +4015,18 @@ export function ReportTemplateDesigner({
           </div>
         )}
       >
+        {/* A failed read must never look like "this install has no
+            templates". Say which it is, and let the operator retry now
+            instead of waiting out the backoff (2026-10-07). */}
+        {loadError ? (
+          <div className="error" role="alert" style={{ marginBottom: 8 }}>
+            Could not load the saved templates: {loadError}
+            <button className="btn btn-secondary btn-sm" style={{ marginLeft: 8 }}
+                    onClick={() => refreshTemplates()}>
+              Try again
+            </button>
+          </div>
+        ) : null}
         <div className="tn-report-meta-row">
           <label>Template
             <select
@@ -2238,11 +4084,13 @@ export function ReportTemplateDesigner({
             section={section}
             index={idx}
             total={sections.length}
+            prevType={idx > 0 ? String(sections[idx - 1]?.type || "") : ""}
             gatewayOptions={gatewayOptions}
             tagsByGateway={tagsByGateway}
             formatTagForDisplay={formatTagForDisplay}
             onChange={(patch) => updateSection(section.id, patch)}
             onRemove={() => removeSection(section.id)}
+            onDuplicate={() => duplicateSection(section.id)}
             onMoveUp={() => moveSection(section.id, -1)}
             onMoveDown={() => moveSection(section.id, 1)}
             onNotify={onNotify}
