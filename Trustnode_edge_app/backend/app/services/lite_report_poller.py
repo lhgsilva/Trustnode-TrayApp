@@ -99,6 +99,11 @@ class LiteReportRequestPoller:
             if self._stop_event.wait(self.tick_seconds):
                 return
 
+    #: PDFs re-uploaded per boot. Bounded because the upload shares a
+    #: connection pool with the historian writer; a long backlog drains over
+    #: successive restarts rather than stalling live ingest once.
+    _BACKFILL_UPLOAD_CAP = 25
+
     def _backfill_existing_rows(self) -> None:
         """Mirror local generated_reports rows that are missing in Supabase.
 
@@ -124,32 +129,69 @@ class LiteReportRequestPoller:
                 n_cloud = 0
         except Exception:
             n_cloud = 0
-        if n_cloud >= 50:
-            log.info("lite-report-poller: cloud already has %d generated_reports — skip backfill", n_cloud)
-            return
+        # 2026-10-13: a customer's Lite listed 269 reports stuck at
+        # "UPLOADING" with Preview and Download dead. storage_path is only
+        # ever set by the upload that runs once, fire-and-forget, when the
+        # report is created (ReportsStore.insert_generated). Nothing retried
+        # it, and this backfill made the situation UNRECOVERABLE in two ways:
+        #
+        #   * it returned early once the cloud held >= 50 rows - i.e. exactly
+        #     when there was a backlog worth fixing;
+        #   * it called mirror_generated_row(r, r["storage_path"]), writing
+        #     the SAME empty storage_path back, so a row whose upload failed
+        #     could never recover.
+        #
+        # The metadata mirror keeps its original "only when the cloud looks
+        # sparse" throttle. Missing PDFs are ALWAYS retried, capped per boot
+        # so a long backlog cannot monopolise the shared connection pool.
+        mirror_metadata = n_cloud < 50
+        if not mirror_metadata:
+            log.info("lite-report-poller: cloud has %d generated_reports — "
+                     "metadata mirror skipped; still checking for missing PDFs", n_cloud)
 
         try:
-            from app.services.reports_cloud_uploader import mirror_generated_row
+            from app.services.reports_cloud_uploader import (
+                mirror_generated_row, upload_and_mirror)
         except Exception:
             return
         try:
-            rows = self.store.list_generated(limit=50)  # smaller cap
+            rows = self.store.list_generated(limit=200)
         except Exception:
             return
         if not rows:
             return
         ok = 0
+        uploaded = 0
         import time as _time
         for r in rows:
-            sp = r.get("storage_path")
+            sp = str(r.get("storage_path") or "").strip()
             try:
-                if mirror_generated_row(r, sp):
+                if not sp:
+                    # Never uploaded, or the upload failed. This retry is the
+                    # only thing that can un-stick a report sitting at
+                    # "UPLOADING" in Lite - there is nothing to download
+                    # until the PDF reaches Storage.
+                    if r.get("file_path") and uploaded < self._BACKFILL_UPLOAD_CAP:
+                        new_sp = upload_and_mirror(r)
+                        if new_sp:
+                            try:
+                                self.store._set_storage_path(  # noqa: SLF001
+                                    str(r.get("id") or ""), new_sp)
+                            except Exception:
+                                pass
+                            uploaded += 1
+                            _time.sleep(0.15)
+                            continue
+                    if mirror_metadata and mirror_generated_row(r, None):
+                        ok += 1
+                elif mirror_metadata and mirror_generated_row(r, sp):
                     ok += 1
             except Exception:
                 continue
             # Yield between upserts so historian writes don't get starved.
             _time.sleep(0.05)
-        log.info("lite-report-poller: backfilled %d/%d generated_reports rows", ok, len(rows))
+        log.info("lite-report-poller: backfill uploaded %d missing PDF(s), "
+                 "mirrored %d row(s) of %d", uploaded, ok, len(rows))
 
     def _engine(self):
         cloud = self._get_cloud_target() if callable(self._get_cloud_target) else None
