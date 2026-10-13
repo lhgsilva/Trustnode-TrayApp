@@ -38,6 +38,43 @@ LIVE_CONFIG = "https://trustnode.lsapps.app/lite/config.json"
 REAL_SUPABASE = "https://esm.sh/@supabase/supabase-js@2.45.4"
 SHIM = "./local_supabase_shim.js"
 
+#: The LAN fork's hardcoded config. Must match index.html exactly; the build
+#: fails loudly if it does not, rather than shipping a half-converted bundle.
+LAN_LOAD_CONFIG = """async function loadConfig() {
+  // Operator 2026-06-18: LAN-served fork. No config.json here — the
+  // shim already knows it talks to the local backend. Token comes from
+  // the URL (?token=…) and is stored in sessionStorage by the shim.
+  cfg = {
+    supabase_url: "local://lan",
+    supabase_anon_key: "local",
+    customer_label: "TrustNode Local",
+    show_dashboard_tab: true,
+    show_alarms_tab: true,
+    show_power_tab: true,
+    live_poll_ms: 2000,
+    history_default_limit: 300,
+    default_chart_range_minutes: 60,
+  };
+  supabase = createClient(cfg.supabase_url, cfg.supabase_anon_key, {});"""
+
+#: What the cloud build puts in its place: read the config the host serves.
+CLOUD_LOAD_CONFIG = """async function loadConfig() {
+  // Cloud build (scripts/build_lite_cloud_bundle.py). The real supabase-js
+  // is in the importmap, so the project URL and anon key must come from the
+  // config.json this host serves. The LAN fork's hardcoded placeholder URL
+  // would make every call fail with "Failed to fetch" - which is exactly
+  // what shipped between 2026-09-30 and 2026-10-13.
+  const res = await fetch("config.json", { cache: "no-store" });
+  if (!res.ok) {
+    throw new Error("Could not load config.json (HTTP " + res.status + ")");
+  }
+  cfg = await res.json();
+  if (!cfg || !String(cfg.supabase_url || "").startsWith("http")) {
+    throw new Error("config.json has no usable supabase_url");
+  }
+  supabase = createClient(cfg.supabase_url, cfg.supabase_anon_key, {});"""
+
+
 # Copied verbatim. local_supabase_shim.js is deliberately NOT here: it is the
 # LAN adapter, and shipping it to the cloud would be the whole bug in reverse.
 COPY = ["styles.css", "manifest.json", "sw.js",
@@ -71,6 +108,37 @@ def main() -> int:
     # LAN/cloud split and mentioning the filename there is correct.
     if '"@supabase/supabase-js": "%s"' % SHIM in html:
         print("FAIL: the importmap still points at the shim after the swap")
+        return 2
+
+    # ---------------------------------------------------------------- #
+    # 2026-10-13: swapping the importmap ALONE shipped a broken cloud
+    # bundle for six weeks.
+    #
+    # The LAN fork hardcodes the config, because its shim already knows it
+    # talks to the local backend:
+    #
+    #     cfg = { supabase_url: "local://lan", supabase_anon_key: "local", ... }
+    #
+    # Swap in the REAL supabase-js and that placeholder becomes the
+    # project URL: every call goes to local://lan and the browser reports
+    # "Failed to fetch" - on the login, before anything else. The correct
+    # /lite/config.json was sitting on the VPS the whole time with nothing
+    # reading it (nginx even has a location block for it).
+    #
+    # So the cloud build must replace loadConfig() too.
+    # ---------------------------------------------------------------- #
+    if LAN_LOAD_CONFIG not in html:
+        print("FAIL: the LAN loadConfig() block was not found - has index.html changed?")
+        return 2
+    html = html.replace(LAN_LOAD_CONFIG, CLOUD_LOAD_CONFIG, 1)
+
+    # Prove the result is actually a cloud bundle, rather than trusting the
+    # replace. These two checks are the whole lesson of the incident.
+    if "local://lan" in html:
+        print("FAIL: the LAN placeholder URL survived into the cloud bundle")
+        return 2
+    if "fetch(\"config.json" not in html and "fetch('config.json" not in html:
+        print("FAIL: the cloud bundle does not read config.json")
         return 2
     (OUT / "index.html").write_text(html, encoding="utf-8", newline="")
     print("  + index.html         (cloud importmap, %d lines)" % html.count("\n"))
