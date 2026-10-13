@@ -83,3 +83,93 @@ running tests, and answering questions. Do that freely, then bring the plan.
   `app.state` migrates whatever database the environment points at.
 - A test that cannot fail proves nothing. When you add a guard for a bug,
   reintroduce the bug and confirm the guard catches it.
+
+## 6. The cloud surfaces (portal, Lite, Supabase) — 2026-10-13
+
+These come from a day spent finding out why the portal and Lite "stopped
+working". Every one of them cost hours because the symptom pointed somewhere
+other than the cause.
+
+### Authentication and authorisation are different stores
+
+A login needs BOTH and they fail independently:
+
+- **Supabase Auth** holds the password. `master@trustnode.local` was never
+  lost — it was confirmed, unbanned, and `updated_at` equalled its last
+  sign-in, which proves the password had not changed. "Restoring" it would
+  have *changed* the thing we were trying to preserve.
+- **`cp_users`** holds the role and tenant. That row was missing, which is
+  what broke the portal.
+
+`_is_global_admin()` is `role=admin AND tenant_id=="default"` — so the
+developer view needs a `default` row in **`cp_tenants`** too. It did not
+exist, and `cp_users` has a foreign key onto it: the developer scope itself
+had never been created when the control plane moved to the cloud.
+
+**Never leave `cp_users.password_hash` blank.** `_verify_password` ends in
+`hmac.compare_digest(password, raw)`, so an empty hash authenticates an
+EMPTY password. Use a pbkdf2 hash of random bytes you discard.
+
+### "Failed to fetch" is a network error, not a wrong password
+
+A wrong password returns a clean 400. `Failed to fetch` means the browser got
+no response at all. Check, in this order: the bundle's target URL, then the
+browser/network.
+
+The actual cause on 2026-09-30: `build_lite_cloud_bundle.py` turned the LAN
+fork into the cloud app by swapping ONE importmap entry and nothing else, so
+the real Supabase client ran against the LAN placeholder `local://lan`. The
+correct `config.json` sat on the VPS with nothing reading it — and the
+deployed page's fetch targets never listed it, which was visible from outside
+the whole time.
+
+- A build that converts one app into another must **assert the result**, not
+  trust the replace. Three guards now fail that build.
+- **Bump `CACHE_VERSION` in `sw.js` whenever `index.html` changes.** The shell
+  is served cache-first; a new page under an old version reaches nobody.
+- Make errors name the host and the build, or a stale cached shell and a
+  blocked network look identical in a screenshot.
+
+### Mirrors: metadata first, file in parallel
+
+`upload_and_mirror` returned early when there was no `file_path`, so a
+storage failure lost the **metadata too** — the report did not exist in the
+cloud at all. Metadata is authoritative: write it unconditionally, upload the
+bytes alongside, attach `storage_path` after. `ON CONFLICT` must COALESCE
+`storage_path` so the metadata-first write cannot null an existing one.
+
+- Record the **run window** in `meta`. It was `{}`, so a mirrored report said
+  which template ran but not over what period — regenerating would silently
+  use the template's default range.
+- `file_bytes` is the file SIZE (an integer). The content only ever lives in
+  the Storage bucket.
+- A backfill that skips "when the cloud already has rows" skips exactly when
+  there is a backlog worth fixing. Retry the *missing* work, capped per run.
+
+### Deploying
+
+- The canonical deploy is the **GitHub Action on push to `main`**; it builds
+  the frontend and ships backend + UI together. `vps_deploy.py --apply` pulls
+  and restarts the BACKEND ONLY.
+- **Ship the backend and the bundle as a pair.** `dist_cloud_readonly` is a
+  committed artefact and goes stale: pushing it unrebuilt regresses the portal
+  to whenever it was last built.
+- The deploy's health probe runs ~2 s after restart and will report
+  `HEALTH_FAILED` before uvicorn is listening. Re-check before believing it.
+- A traceback in the log at restart is usually the OLD process shutting down.
+  Compare its PID against `MainPID`.
+- Verify a build by **artifact timestamps**, never by exit code.
+- Many rapid SSH sessions trip fail2ban. Batch remote commands into one
+  connection.
+
+### Reading the live system
+
+- Ask for environment **key names**, not values — `systemctl show -p
+  Environment` prints secrets into the transcript.
+- `/api/health` on the cloud is the HOST's licence, not the selected
+  customer's. Per-customer modules come from `cp_licenses` ->
+  `cp_license_modules`, and those carry PRODUCT keys (`reporting`,
+  `historian`), not the `view.lan_*` spelling.
+- A git pathspec is relative to the current directory. From a subdirectory, a
+  repo-root path silently matches nothing — and a check that matches nothing
+  passes.
