@@ -2460,6 +2460,79 @@ function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, 
   );
 }
 
+// ============================================================
+// Per-customer licence modules (cloud)
+// ============================================================
+// 2026-10-13, requested: when signed in as master OR as a customer, Lite
+// must know WHICH customer is selected and show only the modules that
+// customer is licensed for.
+//
+// It did not. loadConfig() gates tabs on `view.lan_*` keys read from
+// `/api/health` - which on the CLOUD is the HOST's own licence, not the
+// selected customer's, and which returns modules:[] there. No view.lan_*
+// key exists in the control plane at all, so the gate failed open and
+// every tab showed for every customer regardless of their licence.
+//
+// The authoritative per-customer answer is in the control plane:
+//   cp_licenses(tenant_id, status='active') -> license_id
+//   cp_license_modules(license_id, enabled) -> module_key[]
+//
+// Those are the PRODUCT keys the portal actually issues ("reporting",
+// "historian", "power_overview", ...), not the view.lan_* spelling.
+const LITE_TAB_MODULES = {
+  show_dashboard_tab: ["dashboard", "custom_dashboards"],
+  show_history_tab:   ["historian"],
+  show_alarms_tab:    ["alarms"],
+  show_reporting_tab: ["reporting", "report_templates", "scheduled_reports"],
+  show_power_tab:     ["power_management", "power_overview"],
+};
+
+// The enabled module keys for one tenant, or null when they cannot be
+// determined. NULL MATTERS: it means "unknown", and the caller must then
+// leave the tabs alone rather than hiding everything - a licence lookup
+// failing is not a reason to blank a customer's app.
+async function fetchTenantModules(tenantId) {
+  const tid = String(tenantId || "").trim();
+  if (!tid) return null;
+  try {
+    const { data: lics, error: le } = await supabase
+      .from("cp_licenses")
+      .select("license_id, status")
+      .eq("tenant_id", tid);
+    if (le || !Array.isArray(lics) || !lics.length) return null;
+    const ids = lics
+      .filter((l) => String(l.status || "active").toLowerCase() === "active")
+      .map((l) => l.license_id)
+      .filter(Boolean);
+    if (!ids.length) return null;
+    const { data: mods, error: me } = await supabase
+      .from("cp_license_modules")
+      .select("module_key, enabled, license_id")
+      .in("license_id", ids);
+    if (me || !Array.isArray(mods)) return null;
+    return mods
+      .filter((m) => m.enabled)
+      .map((m) => String(m.module_key || "").toLowerCase())
+      .filter(Boolean);
+  } catch (_err) {
+    return null;
+  }
+}
+
+// Apply a module list to the tab flags. Unknown (null) leaves cfg as it is.
+function applyTenantModules(baseCfg, modules) {
+  if (!modules || !modules.length) return baseCfg;
+  const next = { ...(baseCfg || {}) };
+  for (const [flag, keys] of Object.entries(LITE_TAB_MODULES)) {
+    next[flag] = keys.some((k) => modules.includes(k));
+  }
+  // Positive-gated extras: only ever turned ON by an explicit licence.
+  if (modules.includes("batch_management")) next.show_batch_tab = true;
+  if (modules.includes("trustnode_intelligence")) next.show_intelligence = true;
+  next.license_modules = modules;
+  return next;
+}
+
 const NAV_ITEMS = (cfgIn) => {
   // Operator 2026-06-23: each flag is tri-state — `false` hides, `true`
   // shows, `undefined` defaults to show. The license loader sets
@@ -5070,6 +5143,40 @@ function App({ viewLink = null }) {
       setPickedEdgeId,
     };
   }, [isGlobalAdmin, pickedTenantId, userTenantId, isViewLinkMode, viewLink, pickedEdgeId]);
+
+  // 2026-10-13: gate the tabs on the SELECTED customer's licence.
+  //
+  // loadConfig() reads /api/health, which on the cloud is the HOST's
+  // licence (modules: []), not this customer's - so every tab showed for
+  // everyone. Re-read whenever the effective tenant changes, which covers
+  // both a customer signing in and the master switching customer in the
+  // picker.
+  //
+  // A null result means "could not determine" and deliberately leaves the
+  // tabs as they are: a licence lookup failing must not blank a
+  // customer's app.
+  // Declared BEFORE the effects that use them: a hook read above its own
+  // declaration is a temporal-dead-zone bug waiting to happen, and this
+  // codebase has a release-gate check for exactly that.
+  const [tenantModules, setTenantModules] = useState(null);
+  const [, setCfgRevision] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    const tid = tenantScopeValue.effectiveTenantId;
+    if (!tid) { setTenantModules(null); return undefined; }
+    (async () => {
+      const mods = await fetchTenantModules(tid);
+      if (!cancelled) setTenantModules(mods);
+    })();
+    return () => { cancelled = true; };
+  }, [tenantScopeValue.effectiveTenantId]);
+
+  useEffect(() => {
+    if (!tenantModules) return;
+    // cfg is the module-level config object every tab reads at render.
+    Object.assign(cfg, applyTenantModules(cfg, tenantModules));
+    setCfgRevision((n) => n + 1);
+  }, [tenantModules]);
 
   // Hooks must run unconditionally. The hooks themselves check supabase/
   // session before making any RPC, so calling them when signed out is a
