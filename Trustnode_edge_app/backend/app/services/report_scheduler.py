@@ -229,7 +229,19 @@ class ReportRunner:
             "file_name": path.name,
             "file_bytes": byte_count,
             "file_sha256": sha,
-            "meta": {},
+            # 2026-10-13: the window is what makes a report REGENERABLE.
+            # This was `{}`, so the mirrored cloud row recorded which
+            # template ran but not over what period - regenerating from it
+            # would silently use the template's default range instead of the
+            # run's actual one, producing a different report under the same
+            # name.
+            "meta": {
+                "window_from": str((window or ("", ""))[0] or ""),
+                "window_to": str((window or ("", ""))[1] or ""),
+                "segment_count": len(segments or []),
+                "report_id": str(report_id or ""),
+                "trigger": str(triggered_by or ""),
+            },
         })
 
         result = {"ok": True, "generated": record}

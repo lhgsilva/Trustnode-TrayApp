@@ -24,6 +24,12 @@ import requests
 log = logging.getLogger(__name__)
 
 _DEFAULT_BUCKET = "lite-reports"
+
+#: How long upload_and_mirror waits for the PDF before returning. The
+#: metadata is already written by then, so a slow bucket delays the download
+#: link, never the report's existence. The thread keeps running after a
+#: timeout; the storage_path is then attached by the poller's backfill.
+_UPLOAD_JOIN_TIMEOUT_S = 90.0
 _UPLOAD_TIMEOUT = 30.0
 _DB_TIMEOUT = 15.0
 
@@ -208,20 +214,65 @@ def mirror_generated_row(record: dict[str, Any], storage_path: str | None) -> bo
 
 
 def upload_and_mirror(record: dict[str, Any]) -> str | None:
-    """Convenience: upload the PDF, then mirror the row carrying the
-    resulting storage_path. Returns the object key (or None).
+    """Mirror the metadata and upload the PDF, IN PARALLEL.
 
-    Designed to be called fire-and-forget from `ReportsStore.insert_generated`
-    so a Supabase outage never breaks local report generation.
+    Returns the object key, or None when no file reached Storage.
+
+    2026-10-13, requested: "make sure that the metadata is pushed to the
+    cloud so the report can be regenerated and downloaded, and also attach
+    the file in parallel".
+
+    The previous version did neither:
+
+      * it returned EARLY when the record had no file_path, so the metadata
+        never reached the cloud at all - the report did not exist there, and
+        nothing could be listed, regenerated or even known about;
+      * a failing upload took the metadata down with it, because the mirror
+        only ran after the upload returned.
+
+    Metadata is the authoritative part: it is what lists the report and what
+    a regeneration reads its window from. So it is written UNCONDITIONALLY
+    and never waits on the bytes. The upload runs on its own thread and,
+    when it lands, a second upsert records the path - safe to repeat because
+    the ON CONFLICT clause COALESCEs storage_path and never nulls an existing
+    one.
     """
+    import threading
+
     file_path = record.get("file_path")
-    if not file_path:
-        return None
-    storage_path = upload_pdf_to_storage(
-        file_path,
-        tenant_id=str(record.get("tenant_id") or "default"),
-        generated_id=str(record.get("id") or ""),
-        file_name=str(record.get("file_name") or "report.pdf"),
-    )
-    mirror_generated_row(record, storage_path)
+    result: dict[str, Any] = {"storage_path": None}
+
+    def _upload() -> None:
+        if not file_path:
+            return
+        try:
+            result["storage_path"] = upload_pdf_to_storage(
+                file_path,
+                tenant_id=str(record.get("tenant_id") or "default"),
+                generated_id=str(record.get("id") or ""),
+                file_name=str(record.get("file_name") or "report.pdf"),
+            )
+        except Exception:
+            # A storage outage must never cost us the metadata below.
+            result["storage_path"] = None
+
+    worker = threading.Thread(target=_upload, name="tn-report-upload", daemon=True)
+    worker.start()
+
+    # Runs WHILE the file uploads. The report is listed and regenerable from
+    # this moment, whether or not the bytes ever arrive.
+    try:
+        mirror_generated_row(record, None)
+    except Exception:
+        pass
+
+    worker.join(timeout=_UPLOAD_JOIN_TIMEOUT_S)
+    storage_path = result.get("storage_path")
+    if storage_path:
+        try:
+            mirror_generated_row(record, str(storage_path))
+        except Exception:
+            # The row is already there; the next backfill pass will attach
+            # the path rather than leaving the report unlisted.
+            pass
     return storage_path
