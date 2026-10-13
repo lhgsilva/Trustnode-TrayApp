@@ -47,6 +47,10 @@ import {
 // ============================================================
 // Config + Supabase client (loaded once at boot)
 // ============================================================
+//: Stamped so a screenshot identifies the running bundle - a stale
+//: service-worker shell is otherwise indistinguishable from a fresh one.
+const LITE_BUILD = "v49-cloud-config-fix";
+
 let cfg = null;
 let supabase = null;
 
@@ -4750,7 +4754,20 @@ function LoginCard({ theme, onToggleTheme, onSignedIn }) {
       if (error) throw error;
       onSignedIn(data.session);
     } catch (e) {
-      setErr(e.message || String(e));
+      // 2026-10-13: "Failed to fetch" is what the browser says for ANY
+      // network-level failure, so it covered two completely different
+      // causes - a bundle pointing at the wrong host, and a browser that
+      // cannot reach the right one. Name the host and the build, so the
+      // next person reporting this does not have to open DevTools.
+      let msg = e && e.message ? e.message : String(e);
+      if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+        let host = "the sign-in service";
+        try { host = new URL(cfg && cfg.supabase_url).host; } catch (_err) {}
+        msg = "Cannot reach " + host + " from this browser. "
+            + "The server is reachable, so check your network, VPN or an "
+            + "ad/tracker blocker. (build " + LITE_BUILD + ")";
+      }
+      setErr(msg);
       setBusy(false);
     }
   };
