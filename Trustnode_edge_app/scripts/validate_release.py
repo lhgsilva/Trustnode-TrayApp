@@ -167,6 +167,10 @@ SOURCE_CHECKS = [
     # 2026-10-14: the onboarding chain - customer, licence, edge, activation
     # code, login. Every link has failed in production at least once.
     ("onboarding: licence, activation, login", "test_onboarding_activation_login.py"),
+    # 2026-10-14: a NEW customer's machine has no portal address, nothing in
+    # localStorage and an empty local store. The shipped bundle is the only
+    # thing that knows where to send the code.
+    ("fresh install can activate", "test_fresh_install_activation.py"),
 ]
 
 # --------------------------------------------------------------- containment

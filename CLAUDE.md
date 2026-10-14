@@ -244,3 +244,45 @@ is `hmac.compare_digest(password, raw)`, and `compare_digest("", "")` is
 hashes, so the exposure is any row written **directly** (a migration, a
 repair script, a hand-made developer row). Use a pbkdf2 hash of random bytes
 you discard when the password lives elsewhere, e.g. in Supabase Auth.
+
+### Activating a customer who has NOT installed anything yet
+
+This is the case that breaks, because on a brand-new machine there is:
+
+- no `cloud_url` in `app_settings` — that is written **by** activation;
+- nothing in `localStorage` — it has never talked to a portal;
+- an empty local control-plane store — it has never seen this code;
+- and the operator is on `http://127.0.0.1`, so the request's own origin is
+  useless as a fallback.
+
+**The activation code cannot carry the address.** It is
+`secrets.token_urlsafe(24)` — opaque. The endpoints live in the code's
+database ROW, readable only by asking the portal the machine does not yet
+know how to reach.
+
+So the address comes from the **shipped bundle**, and activation tries, in
+this order (`frontend/src/api.js`):
+
+```
+[ explicitCloud , storedCloud , CONTROL_PLANE_FALLBACK_URL ]
+  Portal address  what worked    DEFAULT_CONTROL_PLANE_URL
+  field           last time      (or VITE_TRUSTNODE_CONTROL_PLANE_URL)
+```
+
+Rules that keep a new customer able to come online:
+
+- **Never ship a bundle with no portal address.** On 2026-08-25 that list
+  came out EMPTY, the loop never ran, and the operator saw a bare
+  "activation failed" with no clue. `test_fresh_install_activation.py` now
+  checks the BUILT bundles, not just the source — source being right is not
+  evidence of what shipped.
+- **The operator's Portal address field wins over everything.** A stale
+  stored portal must never overrule someone who has typed the right one.
+- **An empty candidate list must say so, and name the field to fill in.**
+- **The backend never invents a host.** On localhost with nothing configured
+  `_resolve_cloud_control_plane_base` returns `""` by design — guessing would
+  send a customer's activation to someone else's deployment. The local
+  edge-link endpoint forwards upstream when its own store has never seen the
+  code, which is always true on a fresh machine.
+- Self-hosting: set `VITE_TRUSTNODE_CONTROL_PLANE_URL` at build time so the
+  installer ships pointing at the right portal.
