@@ -164,6 +164,9 @@ SOURCE_CHECKS = [
     ("a TCU test report renders", "smoke_tcu_test_report.py"),
     ("cycle trigger -> report", "smoke_cycle_trigger_report.py"),
     ("the schedule editor can set a cycle", "test_schedule_ui_contract.py"),
+    # 2026-10-14: the onboarding chain - customer, licence, edge, activation
+    # code, login. Every link has failed in production at least once.
+    ("onboarding: licence, activation, login", "test_onboarding_activation_login.py"),
 ]
 
 # --------------------------------------------------------------- containment

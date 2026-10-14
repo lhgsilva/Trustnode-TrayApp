@@ -173,3 +173,74 @@ bytes alongside, attach `storage_path` after. `ON CONFLICT` must COALESCE
 - A git pathspec is relative to the current directory. From a subdirectory, a
   repo-root path silently matches nothing — and a check that matches nothing
   passes.
+
+## 7. Activation codes — the chain, and why they fail
+
+`scripts/test_onboarding_activation_login.py` asserts all of this. Run it
+before shipping anything that touches onboarding.
+
+### The chain, in order
+
+A code cannot be issued unless every link exists and is joined up:
+
+```
+tenant -> customer -> licence (active, linked to that customer)
+                   -> edge    (linked to that customer)
+                   -> code    (carries tenant + customer + edge + licence
+                               + the infrastructure endpoints)
+```
+
+`issue_activation_code` refuses with a specific reason, and each one is a
+real mistake someone has made:
+
+| Reason | What it means |
+|---|---|
+| `customer_id_required` / `edge_id_required` / `license_id_required` | the portal sent an incomplete form |
+| `customer_not_found` / `edge_not_found` | created in a different tenant |
+| `edge_not_linked_to_customer` | the edge belongs to someone else — this is how an edge ends up reporting into the wrong customer |
+| `license_not_linked_to_customer` | the licence belongs to someone else |
+| `license_not_active` | suspended/expired: a lapsed customer must not activate new edges |
+
+### The rules that keep it working
+
+- **Issue under the CUSTOMER's tenant, never the issuer's.** The endpoint
+  forces this (`_customer_tenant_id(payload.customer_id)`) regardless of what
+  the portal sent. Issuing under the master's `default` puts the edge in the
+  wrong scope, and everything it writes afterwards lands there.
+- **The code carries the endpoints.** `metadata.infrastructure` is resolved
+  (per-tenant over global) at issue time, so a brand-new computer learns
+  where the portal lives from the code itself. Nobody types a URL. If you
+  re-host, update Portal → Infrastructure *first*, then issue new codes.
+- **Be liberal in what you accept.** A pasted code survives surrounding
+  whitespace, inner spaces, tabs, CRLF, line wrapping, and hyphens that a
+  mail client has typographed into en/em dashes. A wrong code still fails —
+  tolerance must never become acceptance.
+- **TTL has a 5-minute floor.** A shorter one expires before the operator
+  finishes typing.
+- **Re-applying a used code is idempotent** — a re-install must not be
+  blocked by its own previous activation. It returns the edge the code was
+  *issued for* and ignores the `edge_id` presented, so one code can never
+  license a second machine.
+- **`revoked` and `expired` are refused.** Expiry is also written back on
+  first sight, so a stale code stops looking valid.
+
+### Before blaming the code
+
+Activation failures are almost never the code itself. Check, in order:
+
+1. Which **tenant** did it get issued under? (`cp_edge_activation_codes.tenant_id`)
+2. Does the **customer/edge/licence** triple actually exist in that tenant?
+3. Is the licence **active**?
+4. Does `metadata.infrastructure.cloud_api_url` point at the portal the edge
+   can actually reach?
+5. Only then: is the code `issued`, `used`, `revoked` or `expired`?
+
+### Passwords, while you are in there
+
+**Never write a blank `cp_users.password_hash`.** `_verify_password` now
+rejects an empty stored hash outright, but the reason matters: its fallback
+is `hmac.compare_digest(password, raw)`, and `compare_digest("", "")` is
+`True` — a blank hash authenticated a blank password. `upsert_user` always
+hashes, so the exposure is any row written **directly** (a migration, a
+repair script, a hand-made developer row). Use a pbkdf2 hash of random bytes
+you discard when the password lives elsewhere, e.g. in Supabase Auth.

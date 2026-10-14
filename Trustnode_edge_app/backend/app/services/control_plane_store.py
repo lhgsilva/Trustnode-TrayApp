@@ -246,6 +246,15 @@ class ControlPlaneStore:
 
     def _verify_password(self, password: str, stored: str) -> bool:
         raw = str(stored or "")
+        # 2026-10-14: an EMPTY stored hash must never authenticate anything.
+        # The fallback below ends in hmac.compare_digest(password, raw), and
+        # compare_digest("", "") is True - so a row with a blank
+        # password_hash was an open door for an empty password. upsert_user
+        # always hashes, so no legitimate account is affected; the exposure
+        # is any row written directly into cp_users (a migration, a repair
+        # script, a hand-made developer row).
+        if not raw:
+            return False
         if raw.startswith("pbkdf2_sha256$"):
             try:
                 _, iter_txt, salt_txt, hash_txt = raw.split("$", 3)
