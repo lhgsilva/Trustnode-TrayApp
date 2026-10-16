@@ -3358,6 +3358,14 @@ function SectionEditor({
                 <input type="checkbox" checked={section.show_legend !== false} onChange={(e) => onChange({ show_legend: e.target.checked })} />
                 Show legend
               </label>
+              {/* 2026-10-16, requested: hide the timestamp X axis. On a short
+                  cycle every point carries the same date, so the stamps and
+                  the axis title are noise - and the space they free goes
+                  back to the plot. */}
+              <label className="tn-checkbox" title="Hides the start/end timestamps and the X-axis title. The plot keeps the reclaimed height.">
+                <input type="checkbox" checked={section.show_x_axis !== false} onChange={(e) => onChange({ show_x_axis: e.target.checked })} />
+                Show X axis (timestamps)
+              </label>
             </CollapsibleCard>
           ) : null}
 

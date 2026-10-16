@@ -2052,8 +2052,12 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
     def _axis_domain_preview(axis: str) -> tuple[float, float]:
         return axis_domain[axis]
 
-    X_TITLE_BAND = 12 if x_title else 0
-    TICK_BAND = 11
+    # 2026-10-16, requested: an option to hide the timestamp X axis. On a
+    # short cycle every point carries the same date, so the two stamps and
+    # the axis title are just noise taking vertical space off the plot.
+    show_x_axis = section.get("show_x_axis") is not False
+    X_TITLE_BAND = (12 if x_title else 0) if show_x_axis else 0
+    TICK_BAND = 11 if show_x_axis else 0
     page_width = _avail_width(section)
 
     # --- horizontal gutters first ---------------------------------------
@@ -2325,7 +2329,7 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
                                fontName="Helvetica", fontSize=7, textAnchor=anchor,
                                fillColor=colors.HexColor("#64748b")))
     # X axis a couple of timestamps
-    if max_len >= 2:
+    if show_x_axis and max_len >= 2:
         # Pick first and last timestamps from the series with the most points
         ref_pts = max(aligned, key=lambda p: len(p)) if aligned else []
         if ref_pts:
@@ -2336,7 +2340,7 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
             drawing.add(String(chart_right, ticks_y, xe[:19],
                                fontName="Helvetica", fontSize=7, textAnchor="end", fillColor=colors.HexColor("#64748b")))
     # Axis titles (resolved with their units further up)
-    if x_title:
+    if show_x_axis and x_title:
         drawing.add(String((chart_left + chart_right) / 2, x_title_y, x_title,
                            fontName="Helvetica-Bold", fontSize=8, textAnchor="middle", fillColor=colors.HexColor("#334155")))
     # ReportLab's String shape does NOT carry a transform attribute, so the

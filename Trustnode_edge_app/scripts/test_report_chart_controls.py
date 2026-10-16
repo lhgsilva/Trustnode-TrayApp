@@ -26,6 +26,7 @@ workspace; never the live store.
 """
 from __future__ import annotations
 
+import io
 import math
 import os
 import sys
@@ -293,6 +294,71 @@ check("the caption admits the window is not the section's",
       "without saying so is a wrong report, not a fallback")
 check("  and an ordinary section says nothing of the kind",
       not any("did not fire" in c for c in paragraph_texts(SECTION)))
+
+print()
+print("[the timestamp X axis can be hidden]")
+
+
+def x_texts(section):
+    return [str(s_.text) for s_ in shapes_of(section)
+            if isinstance(s_, String)]
+
+
+on = x_texts(SECTION)
+off = x_texts(dict(SECTION, show_x_axis=False))
+check("by default the X-axis title is drawn", "Time" in on)
+check("  and timestamps are drawn",
+      any(t.count(":") == 2 and t[:2].isdigit() is False or "-" in t for t in on),
+      "two stamps sit under the plot")
+check("show_x_axis=false removes the X-axis title", "Time" not in off, off[:6])
+check("  and removes the timestamps",
+      len([t for t in off if "-" in t and ":" in t]) == 0,
+      [t for t in off if "-" in t and ":" in t])
+check("  the series are still drawn",
+      len([s_ for s_ in shapes_of(dict(SECTION, show_x_axis=False))
+           if isinstance(s_, Line) and not s_.strokeDashArray]) > 10,
+      "hiding an axis must not hide the data")
+
+
+def drawing_height(section):
+    """Total height of the emitted Drawing. The plot itself is a fixed 72mm
+    by design - the canvas GROWS to fit the bands under it - so hiding the
+    axis gives the space back to the PAGE, not to the plot."""
+    story = []
+    _section_chart(dict(section), _build_styles(), story)
+    for f in story:
+        if isinstance(f, Drawing):
+            return f.height
+        for sub in getattr(f, "_content", []) or []:
+            if isinstance(sub, Drawing):
+                return sub.height
+    return 0
+
+
+_on_h = drawing_height(SECTION)
+_off_h = drawing_height(dict(SECTION, show_x_axis=False))
+check("  and the section gives the space back to the page",
+      _off_h < _on_h,
+      "%.0f -> %.0fpt: the plot is a fixed 72mm, so the saving is vertical "
+      "space in the report, not a bigger chart" % (_on_h, _off_h))
+# BOTH bands must go: the tick row AND the axis title. Losing only one
+# still shrinks the canvas, so a loose "it got smaller" assertion passes
+# while half the feature is broken.
+check("  BOTH the tick row and the title band are reclaimed",
+      (_on_h - _off_h) >= 20,
+      "%.0fpt freed; expected ~23 (11pt ticks + 12pt title). Less than that "
+      "means one band is still reserved." % (_on_h - _off_h))
+check("  and no more than that",
+      (_on_h - _off_h) < 40,
+      "%.0fpt - the plot is fixed at 72mm, only the bands are saved"
+      % (_on_h - _off_h))
+check("  the editor offers the switch",
+      "onChange={(e) => onChange({ show_x_axis: e.target.checked })}" in io.open(
+          os.path.join(ROOT, "frontend", "src", "components", "Reports",
+                       "ReportTemplateDesigner.jsx"), encoding="utf-8").read(),
+      "a renderer option with no checkbox is an option nobody can set")
+check("  the legend still works with it off",
+      legend_x(dict(SECTION, show_x_axis=False)) is not None)
 
 print()
 print("[nothing that already worked has changed]")
