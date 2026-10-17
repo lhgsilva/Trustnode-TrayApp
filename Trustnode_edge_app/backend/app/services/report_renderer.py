@@ -1238,7 +1238,8 @@ def styled_text_style(section: dict[str, Any], base: ParagraphStyle,
 
 def pill_band(text: str, styles, *, background: Any = None, color: Any = None,
               corners: str = "both", radius: Any = None, align: str = "left",
-              font_size: Any = None, bold: bool = True, width: float = 0.0):
+              font_size: Any = None, bold: bool = True, width: float = 0.0,
+              band_align: str = "LEFT"):
     """ONE rounded, filled band with text inside it.
 
     2026-10-09, clarified: "it need to be a header but just in a pill style
@@ -1292,7 +1293,10 @@ def pill_band(text: str, styles, *, background: Any = None, color: Any = None,
         ("RIGHTPADDING", (0, 0), (0, 0), size * 0.9),
         ("ROUNDEDCORNERS", radii),
     ]))
-    table.hAlign = "LEFT"
+    # 2026-10-17: this was hardcoded to LEFT, so `align` only moved the text
+    # INSIDE the pill and the pill itself could never sit anywhere but the
+    # left margin. Where the band sits is now the caller's decision.
+    table.hAlign = str(band_align or "LEFT").strip().upper()
     return table
 
 
@@ -1645,10 +1649,27 @@ def _section_pill_card(section: dict[str, Any], styles, story: list) -> None:
             if edge is not None:
                 cmds.append(("BOX", (c, r), (c, r), 0.6, edge))
 
-    table = Table(rows, colWidths=[per] * cols)
+    # 2026-10-17, reported: "we should be able to add a pill that is aligned
+    # to the right of the page, 1 pill per row but in the right of the full
+    # width row - at the moment they stay only on the left".
+    #
+    # They could not move because the grid STRETCHES: colWidths is
+    # avail/cols, so with one column each pill is the full page width and
+    # hAlign has nothing left to position. Sizing the table to its content
+    # is what gives alignment something to do.
+    #
+    #   pill_fit = "fill"    (default, unchanged) pills share the row evenly
+    #   pill_fit = "content" each pill is as wide as its text, and `align`
+    #                        then places the group left / centre / right
+    fit = str(section.get("pill_fit") or "fill").strip().lower()
+    col_widths = None if fit == "content" else [per] * cols
+    table = Table(rows, colWidths=col_widths)
     table.setStyle(TableStyle(cmds))
-    table.hAlign = ("LEFT" if as_header else _ALIGNMENTS.get(
-        str(section.get("align") or "").strip().lower(), "LEFT"))
+    # as_header used to force LEFT, which meant a pill heading could not be
+    # centred or right-aligned either. `align` is unset on existing
+    # templates, so they keep the left edge they have today.
+    table.hAlign = _ALIGNMENTS.get(
+        str(section.get("align") or "").strip().lower(), "LEFT")
     story.append(table)
     story.append(Spacer(1, 3 * mm))
 
@@ -1980,7 +2001,9 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
             return ("%s (%s)" % (label, unit)).strip() if label else unit
         return label
 
-    axis_title = {a: _axis_title(a) for a in AXES4}
+    # A title the operator has hidden must not reserve its 12pt gutter.
+    axis_title = {a: (_axis_title(a) if axis_shows(section, a, "title") else "")
+                  for a in AXES4}
     y_title = axis_title["left1"]
     y_right_title = axis_title["right1"]
 
@@ -2081,7 +2104,10 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
         # 4pt of air between the plot edge and the label, 4pt after it.
         return min(70.0, max(20.0, widest + 8.0))
 
-    axis_gutter = {a: _tick_gutter(a) for a in AXES4}
+    # Same for the numbers: hidden means no reserved width, so the plot gets
+    # the space back rather than leaving a blank margin.
+    axis_gutter = {a: (_tick_gutter(a) if axis_shows(section, a, "values") else 6.0)
+                   for a in AXES4}
 
     def _side_width(axes: tuple[str, ...]) -> float:
         total = 0.0
@@ -2320,6 +2346,8 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
     # ticks: appending it produced labels like "31.66C" where a number should
     # be.
     for axis, geom in axis_x.items():
+        if not axis_shows(section, axis, "values"):
+            continue
         lo, hi = axis_domain[axis]
         anchor = "end" if geom["anchor"] < 0 else "start"
         for i in range(0, tick_count + 1):
@@ -2388,6 +2416,13 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
             lx += w
 
     block.append(drawing)
+    # 2026-10-17, requested: hide "the number of the collected points in the
+    # series". It is useful while building a template and noise in a report
+    # that goes to a customer.
+    if section.get("show_sample_caption") is False:
+        _emit_block(section, block, story)
+        story.append(Spacer(1, 4 * mm))
+        return
     total_samples = sum(len(p) for p in aligned)
     n_series = len([s for s in series_meta if s.get("tag_name")])
     # 2026-10-11, asked: "I have two differen section that are using the same
@@ -4024,15 +4059,33 @@ def apply_window_override(template: dict[str, Any], from_utc: str, to_utc: str,
 # wrong rather than missing.
 AXES4 = ("left1", "left2", "right1", "right2")
 _AXIS_KEYS = {
+    # 2026-10-17, requested: hide the title and/or the tick numbers per axis.
+    # "show_title" is the rotated name beside the axis; "show_values" is the
+    # column of numbers. Both default ON, so every existing template draws
+    # exactly what it draws today.
     "left1":  {"label": "y_axis_label",       "unit": "y_axis_unit",
-               "min": "y_min",                "max": "y_max"},
+               "min": "y_min",                "max": "y_max",
+               "show_title": "y_axis_show_title",
+               "show_values": "y_axis_show_values"},
     "left2":  {"label": "y_left2_label",      "unit": "y_left2_unit",
-               "min": "y_left2_min",          "max": "y_left2_max"},
+               "min": "y_left2_min",          "max": "y_left2_max",
+               "show_title": "y_left2_show_title",
+               "show_values": "y_left2_show_values"},
     "right1": {"label": "y_axis_right_label", "unit": "y_axis_right_unit",
-               "min": "y_right_min",          "max": "y_right_max"},
+               "min": "y_right_min",          "max": "y_right_max",
+               "show_title": "y_axis_right_show_title",
+               "show_values": "y_axis_right_show_values"},
     "right2": {"label": "y_right2_label",     "unit": "y_right2_unit",
-               "min": "y_right2_min",         "max": "y_right2_max"},
+               "min": "y_right2_min",         "max": "y_right2_max",
+               "show_title": "y_right2_show_title",
+               "show_values": "y_right2_show_values"},
 }
+
+
+def axis_shows(section: dict[str, Any], axis: str, what: str) -> bool:
+    """Is this axis's title / value column drawn? Default yes."""
+    key = _AXIS_KEYS.get(axis, {}).get("show_%s" % what)
+    return bool(section.get(key, True)) if key else True
 
 
 def norm_axis4(value: Any) -> str:

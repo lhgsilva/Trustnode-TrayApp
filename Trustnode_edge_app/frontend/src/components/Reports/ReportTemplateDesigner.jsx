@@ -2460,6 +2460,27 @@ function SectionEditor({
                     <option value="none">Square</option>
                   </select>
                 </label>
+              {/* 2026-10-17, requested: one pill per row, sitting at the RIGHT
+                  of the full-width row. They could not move because the grid
+                  stretches each pill to fill its column - "Fit to content"
+                  sizes them to their text so Alignment can place them. */}
+              <label title="Fill: pills share the row evenly (current behaviour). Fit to content: each pill is as wide as its text, so Alignment can move the group.">
+                Pill width
+                <select value={section.pill_fit || "fill"}
+                        onChange={(e) => onChange({ pill_fit: e.target.value })}>
+                  <option value="fill">Fill the row</option>
+                  <option value="content">Fit to content</option>
+                </select>
+              </label>
+              <label title="Where the pills sit on the page. Needs Pill width = Fit to content to have any effect.">
+                Alignment
+                <select value={section.align || "left"}
+                        onChange={(e) => onChange({ align: e.target.value })}>
+                  <option value="left">Left</option>
+                  <option value="center">Centre</option>
+                  <option value="right">Right</option>
+                </select>
+              </label>
               </>
             ) : <><span /><span /><span /></>}
           </div>
@@ -3287,7 +3308,19 @@ function SectionEditor({
                   <label>Unit / suffix<TokenInput value={section.y_axis_unit || ""} placeholder="e.g. kW" gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_axis_unit: v })} /></label>
                   <label>Min<input type="number" step="any" value={section.y_min ?? ""} onChange={(e) => onChange({ y_min: e.target.value })} placeholder="auto" /></label>
                   <label>Max<input type="number" step="any" value={section.y_max ?? ""} onChange={(e) => onChange({ y_max: e.target.value })} placeholder="auto" /></label>
-                </div>
+                
+                <div className="tn-row tn-row-2">
+                  <label className="tn-checkbox" title="The rotated axis name beside the numbers.">
+                    <input type="checkbox" checked={section.y_axis_show_title !== false}
+                           onChange={(e) => onChange({ y_axis_show_title: e.target.checked })} />
+                    Show axis title
+                  </label>
+                  <label className="tn-checkbox" title="The column of tick numbers. Hiding it gives the width back to the plot.">
+                    <input type="checkbox" checked={section.y_axis_show_values !== false}
+                           onChange={(e) => onChange({ y_axis_show_values: e.target.checked })} />
+                    Show axis values
+                  </label>
+                </div></div>
               </fieldset>
               <fieldset className="tn-fieldset">
                 <legend>Y-axis 2 (right)</legend>
@@ -3296,7 +3329,19 @@ function SectionEditor({
                   <label>Unit / suffix<TokenInput value={section.y_axis_right_unit || ""} placeholder="e.g. °C" gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_axis_right_unit: v })} /></label>
                   <label>Min<input type="number" step="any" value={section.y_right_min ?? ""} onChange={(e) => onChange({ y_right_min: e.target.value })} placeholder="auto" /></label>
                   <label>Max<input type="number" step="any" value={section.y_right_max ?? ""} onChange={(e) => onChange({ y_right_max: e.target.value })} placeholder="auto" /></label>
-                </div>
+                
+                <div className="tn-row tn-row-2">
+                  <label className="tn-checkbox" title="The rotated axis name beside the numbers.">
+                    <input type="checkbox" checked={section.y_axis_right_show_title !== false}
+                           onChange={(e) => onChange({ y_axis_right_show_title: e.target.checked })} />
+                    Show axis title
+                  </label>
+                  <label className="tn-checkbox" title="The column of tick numbers. Hiding it gives the width back to the plot.">
+                    <input type="checkbox" checked={section.y_axis_right_show_values !== false}
+                           onChange={(e) => onChange({ y_axis_right_show_values: e.target.checked })} />
+                    Show axis values
+                  </label>
+                </div></div>
               </fieldset>
               <fieldset className="tn-fieldset">
                 <legend>Y-axis 3 (left, outer)</legend>
@@ -3305,7 +3350,19 @@ function SectionEditor({
                   <label>Unit / suffix<TokenInput value={section.y_left2_unit || ""} placeholder="e.g. bar" gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_left2_unit: v })} /></label>
                   <label>Min<input type="number" step="any" value={section.y_left2_min ?? ""} onChange={(e) => onChange({ y_left2_min: e.target.value })} placeholder="auto" /></label>
                   <label>Max<input type="number" step="any" value={section.y_left2_max ?? ""} onChange={(e) => onChange({ y_left2_max: e.target.value })} placeholder="auto" /></label>
-                </div>
+                
+                <div className="tn-row tn-row-2">
+                  <label className="tn-checkbox" title="The rotated axis name beside the numbers.">
+                    <input type="checkbox" checked={section.y_left2_show_title !== false}
+                           onChange={(e) => onChange({ y_left2_show_title: e.target.checked })} />
+                    Show axis title
+                  </label>
+                  <label className="tn-checkbox" title="The column of tick numbers. Hiding it gives the width back to the plot.">
+                    <input type="checkbox" checked={section.y_left2_show_values !== false}
+                           onChange={(e) => onChange({ y_left2_show_values: e.target.checked })} />
+                    Show axis values
+                  </label>
+                </div></div>
               </fieldset>
               <fieldset className="tn-fieldset">
                 <legend>Y-axis 4 (right, outer)</legend>
@@ -3314,7 +3371,19 @@ function SectionEditor({
                   <label>Unit / suffix<TokenInput value={section.y_right2_unit || ""} placeholder="e.g. l/min" gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_right2_unit: v })} /></label>
                   <label>Min<input type="number" step="any" value={section.y_right2_min ?? ""} onChange={(e) => onChange({ y_right2_min: e.target.value })} placeholder="auto" /></label>
                   <label>Max<input type="number" step="any" value={section.y_right2_max ?? ""} onChange={(e) => onChange({ y_right2_max: e.target.value })} placeholder="auto" /></label>
-                </div>
+                
+                <div className="tn-row tn-row-2">
+                  <label className="tn-checkbox" title="The rotated axis name beside the numbers.">
+                    <input type="checkbox" checked={section.y_right2_show_title !== false}
+                           onChange={(e) => onChange({ y_right2_show_title: e.target.checked })} />
+                    Show axis title
+                  </label>
+                  <label className="tn-checkbox" title="The column of tick numbers. Hiding it gives the width back to the plot.">
+                    <input type="checkbox" checked={section.y_right2_show_values !== false}
+                           onChange={(e) => onChange({ y_right2_show_values: e.target.checked })} />
+                    Show axis values
+                  </label>
+                </div></div>
               </fieldset>
               {/* 2026-10-11, requested: editable ticks, line thickness and
                   legend alignment. Tick count is per CHART, not per axis:
@@ -3365,6 +3434,11 @@ function SectionEditor({
               <label className="tn-checkbox" title="Hides the start/end timestamps and the X-axis title. The plot keeps the reclaimed height.">
                 <input type="checkbox" checked={section.show_x_axis !== false} onChange={(e) => onChange({ show_x_axis: e.target.checked })} />
                 Show X axis (timestamps)
+              </label>
+              <label className="tn-checkbox" title="The line under the chart reading '120 samples per series, 3 series'. Useful while building; noise in a customer report.">
+                <input type="checkbox" checked={section.show_sample_caption !== false}
+                       onChange={(e) => onChange({ show_sample_caption: e.target.checked })} />
+                Show sample count under the chart
               </label>
             </CollapsibleCard>
           ) : null}

@@ -361,6 +361,59 @@ check("  the legend still works with it off",
       legend_x(dict(SECTION, show_x_axis=False)) is not None)
 
 print()
+print("[per-axis: hide the title and/or the numbers]")
+from app.services.report_renderer import axis_shows                  # noqa: E402
+
+check("by default every axis shows both", axis_shows({}, "left1", "title")
+      and axis_shows({}, "right1", "values"),
+      "existing templates must draw exactly what they draw today")
+
+_t_off = dict(SECTION, y_axis_show_title=False)
+check("hiding the LEFT title removes it",
+      "Pressure (mbar)" not in [str(x.text) for x in shapes_of(_t_off)
+                                if isinstance(x, String)],
+      "the rotated name beside the numbers")
+check("  the other axis keeps its title",
+      "Temperature (C)" in [str(x.text) for x in shapes_of(_t_off)
+                            if isinstance(x, String)],
+      "per-axis means per-axis")
+
+_v_off = dict(SECTION, y_axis_show_values=False)
+check("hiding the LEFT values removes that tick column",
+      len(tick_columns(_v_off)) == 1,
+      "columns left: %s" % (tick_columns(_v_off),))
+check("  and the plot gets the width back",
+      max(r.width for r in shapes_of(_v_off) if isinstance(r, Rect) and r.width > 100)
+      > max(r.width for r in shapes_of(SECTION) if isinstance(r, Rect) and r.width > 100),
+      "a hidden column must not leave a blank margin")
+check("  the series are still drawn",
+      len([x for x in shapes_of(_v_off)
+           if isinstance(x, Line) and not x.strokeDashArray]) > 10)
+_all_off = dict(SECTION, y_axis_show_values=False, y_axis_right_show_values=False)
+check("  both axes' numbers can go", len(tick_columns(_all_off)) == 0,
+      tick_columns(_all_off))
+
+print()
+print("[the sample-count caption is optional]")
+_caps_on = [c for c in paragraph_texts(SECTION) if "samples" in c]
+_caps_off = [c for c in paragraph_texts(dict(SECTION, show_sample_caption=False))
+             if "samples" in c]
+check("it is shown by default", bool(_caps_on), _caps_on)
+check("  show_sample_caption=false removes it", not _caps_off, _caps_off)
+check("  the chart itself still renders",
+      len([x for x in shapes_of(dict(SECTION, show_sample_caption=False))
+           if isinstance(x, Line) and not x.strokeDashArray]) > 10)
+
+print()
+print("[the editor offers all of it]")
+_DES = io.open(os.path.join(ROOT, "frontend", "src", "components", "Reports",
+                            "ReportTemplateDesigner.jsx"), encoding="utf-8").read()
+for key in ("y_axis_show_title", "y_axis_show_values",
+            "y_axis_right_show_title", "y_left2_show_values",
+            "y_right2_show_title", "show_sample_caption"):
+    check("  %-28s has a control" % key, key in _DES)
+
+print()
 print("[nothing that already worked has changed]")
 base_shapes = shapes_of(SECTION)
 check("both axes are still drawn", len(tick_columns(SECTION)) == 2,

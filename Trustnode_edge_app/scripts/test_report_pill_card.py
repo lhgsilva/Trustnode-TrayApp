@@ -383,5 +383,62 @@ check("  and the corner choice", UI.count("Rounded left only") >= 2,
       "the header and the pill card each offer it")
 
 print()
+print("[a pill can sit on the RIGHT of the page]")
+# 2026-10-17, reported: "1 pill per row but this pill can be in the right of
+# the full width row - at the moment they stay only on the left".
+#
+# They could not move: the grid stretches each pill to avail/cols, so with
+# one column the pill IS the whole page width and hAlign has nothing to
+# position. Fitting to content is what gives alignment something to do.
+def _pill_table(section):
+    story = []
+    _section_pill_card(dict(section), _build_styles(), story)
+    from reportlab.platypus import Table as _T
+    for f in story:
+        if isinstance(f, _T):
+            return f
+    return None
+
+
+ONE = {"type": "pill_card", "title": "", "columns": 1,
+       "pills": [{"id": "p1", "text": "PASSED"}]}
+
+fill = _pill_table(ONE)
+check("the default still fills the row", fill is not None and fill.hAlign == "LEFT",
+      getattr(fill, "hAlign", None))
+
+right = _pill_table(dict(ONE, pill_fit="content", align="right"))
+check("fit-to-content + right puts the pill on the right",
+      right is not None and right.hAlign == "RIGHT", getattr(right, "hAlign", None))
+check("  and it is no longer stretched to the full width",
+      right is not None and right._argW != fill._argW,
+      "colWidths must be content-sized, not avail/cols")
+centre = _pill_table(dict(ONE, pill_fit="content", align="center"))
+check("  centre works too",
+      centre is not None and centre.hAlign == "CENTER", getattr(centre, "hAlign", None))
+
+hdr = _pill_table({"type": "pill_card", "as_header": True, "align": "right",
+                   "pill_fit": "content", "pills": [{"id": "h", "text": "TITLE"}]})
+check("a pill HEADER can be right-aligned too",
+      hdr is not None and hdr.hAlign == "RIGHT",
+      "as_header used to force LEFT whatever the operator chose")
+
+check("an unset alignment is still LEFT",
+      _pill_table(dict(ONE, pill_fit="content")).hAlign == "LEFT",
+      "existing templates must not move")
+
+SRC_R = io.open(os.path.join(ROOT, "backend", "app", "services",
+                             "report_renderer.py"), encoding="utf-8").read()
+check("pill_band no longer hardcodes its own position",
+      "band_align" in SRC_R,
+      "align only moved the TEXT inside the pill before; where the band "
+      "sits is now the caller's decision")
+
+DES_P = io.open(os.path.join(ROOT, "frontend", "src", "components", "Reports",
+                             "ReportTemplateDesigner.jsx"), encoding="utf-8").read()
+check("the editor offers Pill width", "pill_fit: e.target.value" in DES_P)
+check("  and Alignment", "align: e.target.value" in DES_P)
+
+print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))
 sys.exit(0 if not FAILS else 2)
