@@ -300,6 +300,12 @@ class ReportsStore:
         except Exception:
             cloud = None
         if not cloud:
+            # The caller logs the zero; say WHICH reason it was so the two
+            # cases (no target vs rows failing) are distinguishable.
+            import logging
+            logging.getLogger("trustnode.mirror").warning(
+                "report template mirror: no cloud database target resolved "
+                "for this edge's scope")
             return 0
         with self._connect() as conn:
             if tenant_id:
@@ -322,6 +328,7 @@ class ReportsStore:
         except Exception:
             return 0
         upserted = 0
+        failed: list[str] = []
         for r in rows:
             try:
                 with engine.begin() as conn:
@@ -353,9 +360,17 @@ class ReportsStore:
                         },
                     )
                 upserted += 1
-            except Exception:
-                # Skip one bad row; keep going for the rest.
+            except Exception as exc:  # noqa: BLE001
+                # Skip one bad row; keep going for the rest - but SAY so.
+                # Silently swallowing this is how Supabase sat on one
+                # template while the edge held fifteen (2026-10-17).
+                failed.append("%s: %s" % (type(exc).__name__, str(exc)[:120]))
                 continue
+        if failed:
+            import logging
+            logging.getLogger("trustnode.mirror").warning(
+                "report template mirror: %d of %d row(s) failed; first: %s",
+                len(failed), len(rows), failed[0])
         return upserted
 
     def seed_demo_templates(self, tenant_id: str, created_by: str = "system") -> int:

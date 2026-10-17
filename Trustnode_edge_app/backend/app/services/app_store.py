@@ -2932,6 +2932,8 @@ class AppStore:
         next_mirror_reconcile_mono = 0.0
         next_target_reconcile_mono = 0.0
         next_report_templates_reconcile_mono = 0.0
+        # Log "pushed nothing" once per outage, not every 30s for ever.
+        self._report_templates_zero_logged = False
         while not self._stop_event.is_set():
             try:
                 if self._is_cloud_auto_sync_enabled():
@@ -2987,11 +2989,29 @@ class AppStore:
                 # template row (only a few KB), and Lite reads cache for
                 # the operator session anyway.
                 if self._is_cloud_auto_sync_enabled() and now_mono >= next_report_templates_reconcile_mono:
+                    # 2026-10-17: this was `except Exception: pass`, and the
+                    # function it calls returns 0 just as silently when there
+                    # is no cloud target. Measured that day: Supabase held ONE
+                    # report_template while two edges held 15 and 269 - and
+                    # nothing anywhere said why. A mirror that can stop
+                    # without saying so is a mirror nobody can trust.
                     try:
                         from app.state import reports_store as _rs  # late import
-                        _rs.reconcile_templates_to_cloud()
-                    except Exception:
-                        pass
+                        pushed = _rs.reconcile_templates_to_cloud()
+                        if pushed == 0 and not self._report_templates_zero_logged:
+                            self._report_templates_zero_logged = True
+                            import logging
+                            logging.getLogger("trustnode.mirror").warning(
+                                "report template mirror pushed 0 templates - "
+                                "no cloud target resolved, or every row failed. "
+                                "Lite will show an empty Templates tab.")
+                        elif pushed:
+                            self._report_templates_zero_logged = False
+                    except Exception as exc:  # noqa: BLE001
+                        import logging
+                        logging.getLogger("trustnode.mirror").warning(
+                            "report template mirror failed: %s: %s",
+                            type(exc).__name__, exc)
                     next_report_templates_reconcile_mono = now_mono + 30.0  # every 30s
             except Exception as exc:
                 self._upsert_sync_target_state(enabled=True, config={}, last_error=f"Config sync loop error: {exc}")
@@ -9185,7 +9205,13 @@ class AppStore:
             try:
                 rows = conn.execute(sql, params).fetchall()
             except Exception as exc:
-                logger.warning("bucket_raw_historian_rows failed: %s", exc)
+                # 2026-10-17: `logger` is not bound at module scope in this
+                # file - this handler would have raised NameError and turned
+                # a handled failure into a crash. Found while making the
+                # template mirror say why it pushed nothing.
+                import logging
+                logging.getLogger("trustnode.historian").warning(
+                    "bucket_raw_historian_rows failed: %s", exc)
                 return []
         out: list[dict[str, Any]] = []
         for r in rows:
@@ -9304,7 +9330,9 @@ class AppStore:
                     params,
                 ).fetchall()
             except Exception as exc:
-                logger.warning("get_historian_agg_rows failed: %s", exc)
+                import logging
+                logging.getLogger("trustnode.historian").warning(
+                    "get_historian_agg_rows failed: %s", exc)
                 return []
         out: list[dict[str, Any]] = []
         for r in rows:

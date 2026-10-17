@@ -2009,6 +2009,62 @@ function ImageWidget({ widget }) {
   return h("img", { className: "widget-image", src: cfg.source_url, alt: widgetTitle(widget) || "image" });
 }
 
+// Storage bucket for generated PDFs (matches db/migrations/20260518_alarms_reports_queue.sql).
+const LITE_REPORTS_BUCKET = "lite-reports";
+
+// How a generated report becomes something a browser can open. Two
+// deployments, two answers, ONE definition - the Reporting tab and the
+// dashboard's Report Card both call these (2026-10-17; before that the
+// dashboard card did not exist on Lite at all and rendered as a grey
+// "report_card" box).
+//
+//   LAN   the edge serves the file itself; the shim puts local_file_url on
+//         the row and the session token rides in the query string, because
+//         an <iframe> cannot carry an Authorization header.
+//   cloud the PDF is in object storage and needs a short-lived signed URL.
+const liteReportLocalUrl = (r, inline) => {
+  if (!r || !r.local_file_url) return null;
+  let token = "";
+  try { token = sessionStorage.getItem("tn_lite_local_token") || ""; } catch (_) {}
+  const q = [`inline=${inline ? "true" : "false"}`];
+  if (token) q.push(`token=${encodeURIComponent(token)}`);
+  return `${r.local_file_url}?${q.join("&")}`;
+};
+
+// 2026-10-17, reported on the LAN surface: the Report Card showed a raw
+// {"detail":"invalid lite session"} where the PDF should be.
+//
+// A LAN session authenticates by EITHER a view-link token in the query
+// string OR the main app's JWT in an Authorization header - and an <iframe>
+// can only carry the first. A JWT-authenticated operator therefore asked for
+// the file with no credentials at all and the 401 body was rendered as the
+// "preview".
+//
+// Fetch it with whatever auth this session has and hand the <iframe> a blob
+// instead. Works for both auth paths, and for the cloud's signed URL (which
+// needs no auth) the caller keeps using that directly.
+const liteFetchReportBlob = async (url) => {
+  let jwt = "";
+  try { jwt = localStorage.getItem("trustnode_auth_token") || ""; } catch (_) {}
+  const res = await fetch(url, {
+    credentials: "omit",
+    headers: jwt ? { Authorization: `Bearer ${jwt}` } : {},
+  });
+  if (!res.ok) {
+    throw new Error(`report not available (HTTP ${res.status})`);
+  }
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
+};
+const liteReportSignedUrl = async (storagePath) => {
+  if (!storagePath) return { url: null, error: "" };
+  const { data, error: e } = await supabase
+    .storage.from(LITE_REPORTS_BUCKET)
+    .createSignedUrl(storagePath, 300);  // 5-minute link
+  return { url: data?.signedUrl || null, error: e ? e.message : "" };
+};
+const liteReportIsReady = (r) => Boolean(r && (r.storage_path || r.local_file_url));
+
 // The dashboard's Report Card, on the phone and the web client.
 //
 // 2026-10-17, reported: "the report card preview also is not being showed on
@@ -2060,7 +2116,19 @@ function ReportCardWidget({ widget }) {
       if (!r || viewMode !== "pdf_preview") { setUrl(""); return; }
       // inline=true: the preview is embedded, not downloaded.
       const local = liteReportLocalUrl(r, true);
-      if (local) { setUrl(local); return; }
+      if (local) {
+        // Through fetch, so the session's JWT can authenticate it; an
+        // <iframe> src cannot carry a header.
+        try {
+          const blob = await liteFetchReportBlob(local);
+          if (stop) { URL.revokeObjectURL(blob); return; }
+          setUrl((prev) => { if (prev.startsWith("blob:")) URL.revokeObjectURL(prev); return blob; });
+        } catch (err) {
+          setError(String(err?.message || err));
+          setUrl("");
+        }
+        return;
+      }
       const { url: signed, error: se } = await liteReportSignedUrl(r.storage_path);
       if (stop) return;
       if (se) setError(se);
@@ -2070,7 +2138,16 @@ function ReportCardWidget({ widget }) {
     // A report is generated on a schedule, so polling faster than the
     // operator's own refresh interval only costs battery.
     const t = refreshMin > 0 ? setInterval(load, refreshMin * 60000) : null;
-    return () => { stop = true; if (t) clearInterval(t); };
+    return () => {
+      stop = true;
+      if (t) clearInterval(t);
+      // The embedded preview holds an object URL; without this every refresh
+      // leaks one PDF's worth of memory on a screen that is left open.
+      setUrl((prev) => {
+        if (prev && prev.startsWith("blob:")) URL.revokeObjectURL(prev);
+        return "";
+      });
+    };
   }, [templateId, viewMode, refreshMin, pickedTenantId]);
 
   if (!templateId) {
@@ -4696,35 +4773,6 @@ function PowerView({ liveRows }) {
 // over the cloud. For v1 the catalogue alone is honest: customers see
 // which reports exist and can fall back to the desktop to actually run
 // them. We will wire generation through a cloud worker in a follow-up.
-// Storage bucket for generated PDFs (matches db/migrations/20260518_alarms_reports_queue.sql).
-const LITE_REPORTS_BUCKET = "lite-reports";
-
-// How a generated report becomes something a browser can open. Two
-// deployments, two answers, ONE definition - the Reporting tab and the
-// dashboard's Report Card both call these (2026-10-17; before that the
-// dashboard card did not exist on Lite at all and rendered as a grey
-// "report_card" box).
-//
-//   LAN   the edge serves the file itself; the shim puts local_file_url on
-//         the row and the session token rides in the query string, because
-//         an <iframe> cannot carry an Authorization header.
-//   cloud the PDF is in object storage and needs a short-lived signed URL.
-const liteReportLocalUrl = (r, inline) => {
-  if (!r || !r.local_file_url) return null;
-  let token = "";
-  try { token = sessionStorage.getItem("tn_lite_local_token") || ""; } catch (_) {}
-  const q = [`inline=${inline ? "true" : "false"}`];
-  if (token) q.push(`token=${encodeURIComponent(token)}`);
-  return `${r.local_file_url}?${q.join("&")}`;
-};
-const liteReportSignedUrl = async (storagePath) => {
-  if (!storagePath) return { url: null, error: "" };
-  const { data, error: e } = await supabase
-    .storage.from(LITE_REPORTS_BUCKET)
-    .createSignedUrl(storagePath, 300);  // 5-minute link
-  return { url: data?.signedUrl || null, error: e ? e.message : "" };
-};
-const liteReportIsReady = (r) => Boolean(r && (r.storage_path || r.local_file_url));
 
 function ReportingView() {
   const [section, setSection] = useState("generated");  // "generated" | "templates"

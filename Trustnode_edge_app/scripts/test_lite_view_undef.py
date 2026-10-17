@@ -149,6 +149,28 @@ check("  and the embedded frame is given a size",
       "an iframe with no height collapses to a sliver")
 
 print()
+print("[the embedded PDF carries the session's auth]")
+# 2026-10-17, reported on the LAN surface: the Report Card rendered a raw
+# {"detail":"invalid lite session"} where the PDF should be. A LAN session
+# authenticates by EITHER a view-link token in the query string OR the main
+# app's JWT in an Authorization header - and an <iframe src> can only carry
+# the first. A JWT-authenticated operator asked for the file with no
+# credentials and the 401 body became the "preview".
+check("the preview is fetched, not just pointed at",
+      "liteFetchReportBlob" in src,
+      "an <iframe src> cannot send an Authorization header")
+check("  it sends the Bearer token the shim also uses",
+      'localStorage.getItem("trustnode_auth_token")' in src
+      and "Authorization: `Bearer" in src.replace("'", "`"),
+      "both auth paths must work: view-link token OR main JWT")
+check("  a failed fetch becomes an error, not a rendered 401 body",
+      "report not available (HTTP" in src,
+      "showing the server's JSON as the preview is how this was reported")
+check("  and the object URL is revoked",
+      "revokeObjectURL" in src,
+      "a left-open dashboard would leak one PDF per refresh")
+
+print()
 print("[a changed shell is a new cache version]")
 sw = io.open(os.path.join(ROOT, "backend", "static", "lite_view", "sw.js"),
              encoding="utf-8").read()
