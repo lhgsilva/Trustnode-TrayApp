@@ -61,11 +61,32 @@ three = group_side_by_side([{"type": "line_chart", "title": "A"},
 check("a row takes at most three", len(three[0]["columns"]) == 3, three[0]["columns"])
 check("  the fourth starts a new section", three[1]["title"] == "D", three[1])
 
-check("a header is never paired with",
+# 2026-10-17: "header" used to be refused as the FIRST member of a row, to
+# keep the report banner full width. But a header is also how a title PILL is
+# written, and the operator asked for "two pill titles that are one aligned on
+# the left and other on the right ... on the same row, using the feature to
+# share the width of the previous". Ticking that after a title did nothing at
+# all - the two titles came out stacked, with no hint why. A header is
+# content, so it may now start a row; nothing pairs unless the NEXT section
+# explicitly asks to.
+check("a title section CAN start a row when the next one asks",
       [s["type"] for s in group_side_by_side(
           [{"type": "header"}, {"type": "table", "side_by_side": True}])]
-      == ["header", "table"],
-      "the banner must stay full width")
+      == ["row"],
+      "two pill titles side by side is the whole point of the control")
+check("  but a banner nobody asked to pair stays full width",
+      [s["type"] for s in group_side_by_side(
+          [{"type": "header"}, {"type": "table"}])] == ["header", "table"],
+      "pairing is opt-in, per section")
+check("  a page break still never starts a row",
+      [s["type"] for s in group_side_by_side(
+          [{"type": "page_break"}, {"type": "table", "side_by_side": True}])]
+      == ["page_break", "table"],
+      "a break and a spacer are not content")
+check("  nor does a spacer",
+      [s["type"] for s in group_side_by_side(
+          [{"type": "spacer"}, {"type": "table", "side_by_side": True}])]
+      == ["spacer", "table"])
 check("the first section cannot pair with nothing",
       group_side_by_side([{"type": "table", "side_by_side": True}])[0]["type"] == "table")
 

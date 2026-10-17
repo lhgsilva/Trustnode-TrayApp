@@ -51,11 +51,48 @@ if ($LASTEXITCODE -ne 0) {
 
 $env:VITE_TRUSTNODE_READONLY = $(if ($ReadOnly) { "true" } else { "false" })
 $env:VITE_TRUSTNODE_FORCE_CLOUD_URL = $CloudApiUrl
-& $npmCmd run build -- --outDir dist_cloud_readonly --base $BasePath
+
+# 2026-10-17: this was `npm run build -- --outDir dist_cloud_readonly --base /`.
+# `build` is a CHAIN now ("vite build && npm run lint:undef && npm run smoke"),
+# and npm appends forwarded args to the LAST command in the chain. From that
+# day's build log:
+#
+#   > vite build && npm run lint:undef && npm run smoke --outDir dist_cloud_readonly --base /
+#
+# So vite built with its DEFAULT output and overwrote frontend\dist - the edge
+# bundle the desktop app ships - with a cloud-configured one, while
+# dist_cloud_readonly was never written at all. The copy below then shipped
+# whatever stale bundle was left from an earlier run and the script printed
+# "Cloud web bundle created". Exit code 0 throughout.
+#
+# vite is invoked directly so no npm script chain can swallow the flags.
+$stamp = Get-Date
+& $npmCmd exec -- vite build --outDir dist_cloud_readonly --base $BasePath
 if ($LASTEXITCODE -ne 0) {
     Pop-Location
     throw "Cloud web build failed."
 }
+& $npmCmd run lint:undef
+if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    throw "Cloud web build failed the undefined-identifier lint."
+}
+
+# The build must have produced THIS bundle. Without this check a silent
+# mis-targeted build is indistinguishable from a successful one, which is
+# exactly how the stale copy shipped.
+$builtIndex = Join-Path $frontendRoot "dist_cloud_readonly\index.html"
+if (-not (Test-Path $builtIndex)) {
+    Pop-Location
+    throw "Cloud web build wrote no dist_cloud_readonly - refusing to ship a stale bundle."
+}
+$builtAt = (Get-Item $builtIndex).LastWriteTime
+if ($builtAt -lt $stamp) {
+    Pop-Location
+    throw ("dist_cloud_readonly is STALE (written {0}, build started {1}) - " +
+           "the output went somewhere else; refusing to ship it." -f $builtAt, $stamp)
+}
+Write-Host ("Cloud bundle built at {0} for {1}" -f $builtAt, $CloudApiUrl)
 Pop-Location
 
 if (Test-Path $outputRoot) {

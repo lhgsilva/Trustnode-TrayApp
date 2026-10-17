@@ -1797,19 +1797,43 @@ function rebuildTrayMenu() {
     }
   });
   const httpsUrls = (lanSharingState.https && lanSharingState.https.urls) || {};
-  const surfaceItems = (label, httpList, httpsList) => {
+  // 2026-10-17, asked: "what would be the other options than give users IPs
+  // for the lan sharing? can we create a url more user friendly?" - the
+  // backend has computed hostname URLs all along (lan_sharing /status returns
+  // hostname_urls for http AND https); the tray simply never showed them, so
+  // everyone was handed a raw 192.168.x.x to type on a phone keyboard.
+  //
+  // The machine name goes FIRST because it is the one a person can type and
+  // it survives a DHCP lease change. The IPs stay underneath as the fallback
+  // for a network where name resolution does not work.
+  const hostUrls = lanSharingState.hostname_urls || {};
+  const hostUrlsHttps =
+    (lanSharingState.https && lanSharingState.https.hostname_urls) || {};
+  const surfaceItems = (label, httpList, httpsList, hostHttp, hostHttps) => {
     const items = [{ label, enabled: false }];
-    (httpList || []).forEach((u) => items.push(urlItem(u)));
-    (httpsList || []).forEach((u) => items.push(urlItem(u)));
-    if (items.length === 1) items.push({ label: "  (no LAN IPs detected)", enabled: false });
+    const seen = new Set();
+    const push = (u) => {
+      if (!u || seen.has(u)) return;
+      seen.add(u);
+      items.push(urlItem(u));
+    };
+    (hostHttps || []).forEach(push);
+    (hostHttp || []).forEach(push);
+    (httpsList || []).forEach(push);
+    (httpList || []).forEach(push);
+    if (items.length === 1) items.push({ label: "  (no LAN address detected)", enabled: false });
     return items;
   };
   const liteSubmenu = [
-    ...surfaceItems("TrustNode Edge (full runtime):", lanSharingState.full_urls, httpsUrls.full),
+    ...surfaceItems("TrustNode Edge (full runtime):", lanSharingState.full_urls,
+                    httpsUrls.full, hostUrls.full, hostUrlsHttps.full),
     { type: "separator" },
-    ...surfaceItems("TrustNode Local View (read-only):", lanSharingState.view_urls, httpsUrls.view),
+    ...surfaceItems("TrustNode Local View (read-only):", lanSharingState.view_urls,
+                    httpsUrls.view, hostUrls.view, hostUrlsHttps.view),
     { type: "separator" },
-    ...surfaceItems("Lite (legacy read-only):", lanSharingState.lite_urls, httpsUrls.lite),
+    // 2026-10-17: "lite (legacy ...) should be called Web Lite".
+    ...surfaceItems("Web Lite:", lanSharingState.lite_urls,
+                    httpsUrls.lite, hostUrls.lite, hostUrlsHttps.lite),
   ];
   const lanSubmenu = [
     {

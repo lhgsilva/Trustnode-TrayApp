@@ -129,5 +129,43 @@ check("  and it still checks the importmap swap",
       "broken, because it only covered one of the two swaps")
 
 print()
+print("[the deploy actually ships it]")
+# 2026-10-17: this bundle was built and pushed BY HAND. The VPS was measured
+# serving tnlite-v51 while the source was at v54 - three rounds of phone and
+# web-client fixes sat in git and reached nobody, because the workflow built
+# the frontend and the client view and simply never touched Lite.
+_WF = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), ".github", "workflows", "deploy-vps.yml")
+if not os.path.isfile(_WF):
+    check("the deploy workflow was found", False, _WF)
+else:
+    wf = io.open(_WF, encoding="utf-8").read()
+    check("the workflow BUILDS the cloud Lite bundle",
+          "build_lite_cloud_bundle.py" in wf,
+          "a bundle nobody builds in CI is a bundle that drifts")
+    check("  and rsyncs it to the host",
+          "web_cloud_readonly/lite/" in wf and "/var/www/trustnode/lite/" in wf)
+    _lite_at = wf.find("Rsync cloud Lite bundle")
+    _dist_at = wf.find("Rsync frontend dist")
+    check("  AFTER the frontend dist rsync",
+          _dist_at > 0 and _lite_at > _dist_at,
+          "that step is --delete into /var/www/trustnode/, which removes "
+          "lite/ - shipping Lite first would publish it and then wipe it")
+    # Only THIS step: the next one (db + scripts) legitimately uses --delete,
+    # and a window wide enough to reach it fails for the wrong reason.
+    _seg = ""
+    if _lite_at > 0:
+        _end = wf.find("      - name:", _lite_at + 10)
+        _seg = wf[_lite_at:_end if _end > 0 else len(wf)]
+    check("  and WITHOUT --delete",
+          "--delete" not in _seg,
+          "build_lite_cloud_bundle.py leaves files it has no local copy of "
+          "to the VPS's own; --delete would remove them")
+    check("  the deploy verifies what the host actually serves",
+          "Verify the served Lite bundle" in wf and "CACHE_VERSION" in wf,
+          "a green deploy said nothing about the bundle - that is how v51 "
+          "survived three releases")
+
+print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))
 sys.exit(0 if not FAILS else 2)

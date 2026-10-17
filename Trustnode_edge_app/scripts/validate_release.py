@@ -177,6 +177,25 @@ SOURCE_CHECKS = [
     # 2026-10-17: Lite collapsed 4 Y axes to 2 and ignored every unit key, so
     # a dashboard profile rendered differently in the web client view.
     ("lite chart axes match the edge", "test_lite_chart_axes.py"),
+    # 2026-10-17: "fit to content" left colWidths unset and trusted ReportLab
+    # to size the column - it stretches a Paragraph cell to the full page
+    # instead, so every pill stayed page-wide and could only sit on the left.
+    # The header band read neither the width nor the position key at all.
+    ("a pill fits its text and can be placed", "test_report_pill_width.py"),
+    # 2026-10-17: the Data Export window was typed as local wall time and
+    # sent in a field called from_utc. On a UTC+1 machine the live store
+    # answered 0 rows for a window that held 27,234.
+    ("the export window is UTC", "test_export_window_utc.py"),
+    # 2026-10-17: "Clear All Alarms" only emptied React state. alarms_setup is
+    # a protected collection, so the save was refused server-side (12 times
+    # since 2026-08-26) and the catch block said nothing - the 300 stored
+    # alarms came back on every restart.
+    ("a cleared alarm list stays cleared", "test_alarm_clear_persists.py"),
+    # 2026-10-17: nothing has ever linted backend/static/lite_view - no build
+    # reads it - so an identifier declared in one function and used from
+    # another ships. buildManualY was doing exactly that, and the tag monitor
+    # threw before it drew anything.
+    ("lite view has no undefined names", "test_lite_view_undef.py"),
 ]
 
 # --------------------------------------------------------------- containment

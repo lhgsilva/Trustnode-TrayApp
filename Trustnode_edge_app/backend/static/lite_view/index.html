@@ -11,7 +11,7 @@
   <link rel="manifest" href="manifest.json" />
   <link rel="icon" href="trustnode_app_icon.png" type="image/png" />
   <link rel="apple-touch-icon" href="trustnode_app_icon_180.png" />
-  <link rel="stylesheet" href="styles.css?v=20260618" />
+  <link rel="stylesheet" href="styles.css?v=20261017" />
 
   <!-- Operator 2026-06-18: LAN-served fork of the cloud Lite.
        supabase-js is replaced by a local shim that routes all
@@ -1354,6 +1354,108 @@ const liteAxisId = (a) => {
   return v === "right" ? "right1" : "left1";
 };
 
+const LITE_AXIS_CFG = {
+  left1:  { label: "y_axis_label",       unit: "primary_unit",
+            mode: "y_axis_mode",         min: "y_min",
+            max: "y_max",                step: "y_tick_step" },
+  right1: { label: "y_axis_right_label", unit: "y_axis_right_unit",
+            mode: "y_right_axis_mode",   min: "y_right_min",
+            max: "y_right_max",          step: "y_right_tick_step" },
+  left2:  { label: "y_left2_label",      unit: "y_left2_unit",
+            mode: "y_left2_axis_mode",   min: "y_left2_min",
+            max: "y_left2_max",          step: "y_left2_tick_step" },
+  right2: { label: "y_right2_label",     unit: "y_right2_unit",
+            mode: "y_right2_axis_mode",  min: "y_right2_min",
+            max: "y_right2_max",         step: "y_right2_tick_step" },
+};
+const liteAxisUnit = (cfg, id) => String(cfg[LITE_AXIS_CFG[id].unit] || "").trim();
+const liteAxisLabel = (cfg, id) => {
+  const lbl = String(cfg[LITE_AXIS_CFG[id].label] || "").trim();
+  const u = liteAxisUnit(cfg, id);
+  if (lbl && u) return lbl + " (" + u + ")";
+  return lbl || u;
+};
+
+// Manual Y axis: an operator-typed [min, max] anchors the axis, otherwise
+// the auto domain is used; ticks are evenly spaced by the typed step.
+// Mirrors the edge's manual mode.
+//
+// MODULE scope, for the same reason as liteAxisId above: TagMonitor is a
+// separate top-level function and it calls this. Living inside ChartWidget
+// (where it sat until 2026-10-17) it was a ReferenceError there, so opening
+// the tag monitor threw before it drew anything. Nothing lints this file -
+// no build reads it - so only running it finds that.
+const buildManualY = (mode, lo, hi, step) => {
+  if (String(mode || "auto").toLowerCase() !== "manual") return null;
+  const a = Number(lo), b = Number(hi);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) return null;
+  const s = Number(step);
+  const ticks = Number.isFinite(s) && s > 0
+    ? (() => {
+        const out = [];
+        for (let v = a, i = 0; v <= b + s * 1e-9 && i < 50; v += s, i += 1) {
+          out.push(Number(v.toFixed(10)));
+        }
+        return out;
+      })()
+    : undefined;
+  // Honor operator-typed min verbatim. Earlier the lite chart forced
+  // min to 0 unless the typed value was negative — that ignored
+  // ranges like min=100 max=200 and the axis painted 0..200. Edge
+  // had the same bug; both layers now use the typed value as-is.
+  return { domain: [a, b], ticks };
+};
+
+// Which of the four axes something is actually drawn on. left1 is the
+// fallback so a chart always has one scale.
+const liteAxesUsed = (seriesDefs, limitLines) => {
+  const used = new Set();
+  (seriesDefs || []).forEach((sd) => used.add(liteAxisId(sd.axis)));
+  (limitLines || []).forEach((l) => used.add(liteAxisId(l.axis)));
+  if (!used.size) used.add("left1");
+  return ["left1", "left2", "right1", "right2"].filter((a) => used.has(a));
+};
+
+// The YAxis elements for a chart - ONE definition, used by the dashboard
+// widget and by the tag monitor.
+//
+// 2026-10-17: the monitor had its own pair of axes declared with the legacy
+// ids "left"/"right" while renderSeriesElement had moved to the four-way
+// ids. A Recharts series whose yAxisId matches no axis draws NOTHING, so the
+// monitor chart came up empty - "the charts are not working". A second copy
+// of the axis rules is what allowed the two to drift, so there is now one.
+const liteYAxes = (cfg, seriesDefs, limitLines, yProps) =>
+  liteAxesUsed(seriesDefs, limitLines).map((id) => {
+    const k = LITE_AXIS_CFG[id];
+    const isRight = id === "right1" || id === "right2";
+    // One scale per axis. A second axis on the same side used to borrow the
+    // first one's range, which is the whole of "the data is not showing
+    // respecting each Y axis ... and min and max".
+    const manual = buildManualY(cfg[k.mode], cfg[k.min], cfg[k.max], cfg[k.step]);
+    const base = manual
+      ? { ...yProps, domain: manual.domain, ticks: manual.ticks, allowDataOverflow: true }
+      : yProps;
+    const u = liteAxisUnit(cfg, id);
+    const lbl = liteAxisLabel(cfg, id);
+    return h(YAxis, {
+      ...base,
+      key: id,
+      yAxisId: id,
+      orientation: isRight ? "right" : "left",
+      // The second axis on a side sits OUTBOARD of the first, or the two
+      // draw on top of each other.
+      ...(id === "left2" || id === "right2" ? { mirror: false } : {}),
+      // The unit rides on the TICKS here (the edge does the same), so a
+      // reader can tell kW from degC without hunting for the legend.
+      tickFormatter: u ? ((v) => fmtVal(v) + u) : base.tickFormatter,
+      label: lbl
+        ? { value: lbl, angle: isRight ? 90 : -90,
+            position: isRight ? "insideRight" : "insideLeft",
+            fill: "var(--muted, #8a98ab)", fontSize: 11 }
+        : undefined,
+    });
+  });
+
 function ChartWidget({ widget, liveByKey }) {
   const cfg = widget?.config || {};
   const widgetType = String(widget?.type || "line_chart");
@@ -1412,28 +1514,15 @@ function ChartWidget({ widget, liveByKey }) {
   // This mirrors normSeriesAxis4() in DashboardWidgets.jsx so both surfaces
   // agree on what an axis is. Legacy "left"/"right" keep working.
   // Per-axis label + unit, using the SAME config keys the edge writes.
-  const LITE_AXIS_CFG = {
-    left1:  { label: "y_axis_label",       unit: "primary_unit" },
-    right1: { label: "y_axis_right_label", unit: "y_axis_right_unit" },
-    left2:  { label: "y_left2_label",      unit: "y_left2_unit" },
-    right2: { label: "y_right2_label",     unit: "y_right2_unit" },
-  };
-  const axisUnit = (id) => String(cfg[LITE_AXIS_CFG[id].unit] || "").trim();
-  const axisLabel = (id) => {
-    const lbl = String(cfg[LITE_AXIS_CFG[id].label] || "").trim();
-    const u = axisUnit(id);
-    if (lbl && u) return lbl + " (" + u + ")";
-    return lbl || u;
-  };
-  // Only draw an axis something is actually on; left1 is the fallback so a
-  // chart always has one scale.
-  const axesUsed = (() => {
-    const used = new Set();
-    seriesDefs.forEach((sd) => used.add(liteAxisId(sd.axis)));
-    limitLines.forEach((l) => used.add(liteAxisId(l.axis)));
-    if (!used.size) used.add("left1");
-    return ["left1", "left2", "right1", "right2"].filter((a) => used.has(a));
-  })();
+  //
+  // 2026-10-17: the scale was NOT per axis. There were two manual-range
+  // configs - manualLeft and manualRight - and each was applied to BOTH
+  // axes on its side, so left2 silently inherited left1's min/max and
+  // right2 inherited right1's. A 0..100 % axis and a 900..1100 mbar axis on
+  // the same side drew on one scale and the second series flat-lined off
+  // the top. Every axis now carries its own mode, min, max and tick step,
+  // read from the SAME keys the edge writes - see liteYAxes() above, which
+  // the tag monitor draws with too.
 
   const labelFmt = (v) => merged.find((p) => p.idx === v)?.ts || String(v);
   const hasRightAxis = seriesDefs.some((s) => s.axis === "right")
@@ -1451,37 +1540,7 @@ function ChartWidget({ widget, liveByKey }) {
     return t;
   })();
 
-  // Manual Y axis (left + right): operator-typed [min, max] anchors the
-  // axis; otherwise yProps' auto domain is used. ticks are evenly spaced
-  // by y_tick_step when provided. Mirrors the edge's manual mode.
-  const buildManualY = (mode, lo, hi, step) => {
-    if (String(mode || "auto").toLowerCase() !== "manual") return null;
-    const a = Number(lo), b = Number(hi);
-    if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) return null;
-    const s = Number(step);
-    const ticks = Number.isFinite(s) && s > 0
-      ? (() => {
-          const out = [];
-          for (let v = a, i = 0; v <= b + s * 1e-9 && i < 50; v += s, i += 1) {
-            out.push(Number(v.toFixed(10)));
-          }
-          return out;
-        })()
-      : undefined;
-    // Honor operator-typed min verbatim. Earlier the lite chart forced
-    // min to 0 unless the typed value was negative — that ignored
-    // ranges like min=100 max=200 and the axis painted 0..200. Edge
-    // had the same bug; both layers now use the typed value as-is.
-    return { domain: [a, b], ticks };
-  };
-  const manualLeft = buildManualY(cfg.y_axis_mode, cfg.y_min, cfg.y_max, cfg.y_tick_step);
-  const manualRight = buildManualY(cfg.y_right_axis_mode, cfg.y_right_min, cfg.y_right_max, cfg.y_right_tick_step);
-  const leftYProps = manualLeft
-    ? { ...yProps, domain: manualLeft.domain, ticks: manualLeft.ticks, allowDataOverflow: true }
-    : yProps;
-  const rightYProps = manualRight
-    ? { ...yProps, domain: manualRight.domain, ticks: manualRight.ticks, allowDataOverflow: true }
-    : yProps;
+
 
   // Optional axis labels rotated 90° on the inside of each axis.
   const leftAxisLabel = String(cfg.y_axis_label || cfg.primary_unit || "");
@@ -1497,29 +1556,7 @@ function ChartWidget({ widget, liveByKey }) {
     h(buildChartRoot(widgetType, seriesDefs.length), { data: merged, margin },
       h(CartesianGrid, { stroke: "var(--line, rgba(255,255,255,0.07))", strokeDasharray: "3 3" }),
       h(XAxis, buildXAxisProps(merged, cfg)),
-      ...axesUsed.map((id) => {
-        const isRight = id === "right1" || id === "right2";
-        const base = isRight ? rightYProps : leftYProps;
-        const lbl = axisLabel(id);
-        const u = axisUnit(id);
-        return h(YAxis, {
-          ...base,
-          key: id,
-          yAxisId: id,
-          orientation: isRight ? "right" : "left",
-          // The second axis on a side sits OUTBOARD of the first, or the
-          // two draw on top of each other.
-          ...(id === "left2" || id === "right2" ? { mirror: false } : {}),
-          // The unit rides on the TICKS here (the edge does the same), so a
-          // reader can tell kW from degC without hunting for the legend.
-          tickFormatter: u ? ((v) => fmtVal(v) + u) : base.tickFormatter,
-          label: lbl
-            ? { value: lbl, angle: isRight ? 90 : -90,
-                position: isRight ? "insideRight" : "insideLeft",
-                fill: "var(--muted, #8a98ab)", fontSize: 11 }
-            : undefined,
-        });
-      }),
+      ...liteYAxes(cfg, seriesDefs, limitLines, yProps),
       h(Tooltip, {
         ...chartTooltipProps,
         labelFormatter: labelFmt,
@@ -1963,6 +2000,113 @@ function ImageWidget({ widget }) {
   return h("img", { className: "widget-image", src: cfg.source_url, alt: widgetTitle(widget) || "image" });
 }
 
+// The dashboard's Report Card, on the phone and the web client.
+//
+// 2026-10-17, reported: "the report card preview also is not being showed on
+// lite version". It never was - the dispatch below had no branch for it, so
+// the widget fell through to the grey "unknown widget" box. The edge has had
+// this widget since the Reports group was added; Lite simply never drew it.
+//
+// Same three config keys the edge reads, so one dashboard profile means the
+// same thing on both surfaces:
+//   report_template_id      which template's output to show
+//   report_view_mode        "pdf_preview" embeds the PDF; anything else is
+//                           the summary card
+//   report_refresh_minutes  0 = only on mount
+//
+// The row comes from generated_reports, newest first for that template -
+// which on LAN is the edge's own store through the shim, and on the cloud is
+// Supabase. Neither needs a special case here.
+function ReportCardWidget({ widget }) {
+  const cfg = widget?.config || {};
+  const templateId = String(cfg.report_template_id || "").trim();
+  const viewMode = String(cfg.report_view_mode || "summary").toLowerCase();
+  const refreshMin = Math.max(0, Math.min(1440, Number(cfg.report_refresh_minutes || 0)));
+  const { pickedTenantId } = useContext(TenantScopeCtx);
+
+  const [row, setRow] = useState(null);
+  const [url, setUrl] = useState("");
+  const [error, setError] = useState("");
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let stop = false;
+    const load = async () => {
+      if (!templateId) { setLoaded(true); return; }
+      let q = supabase
+        .from("generated_reports")
+        .select("id, tenant_id, template_id, template_name, file_name, "
+                + "file_bytes, storage_path, created_utc");
+      q = applyTenantScope(q, pickedTenantId)
+        .eq("template_id", templateId)
+        .order("created_utc", { ascending: false })
+        .limit(1);
+      const { data, error: e } = await q;
+      if (stop) return;
+      setLoaded(true);
+      if (e) { setError(e.message); return; }
+      const r = (data || []).filter(scopedTo(pickedTenantId))[0] || null;
+      setRow(r);
+      setError("");
+      if (!r || viewMode !== "pdf_preview") { setUrl(""); return; }
+      // inline=true: the preview is embedded, not downloaded.
+      const local = liteReportLocalUrl(r, true);
+      if (local) { setUrl(local); return; }
+      const { url: signed, error: se } = await liteReportSignedUrl(r.storage_path);
+      if (stop) return;
+      if (se) setError(se);
+      setUrl(signed || "");
+    };
+    load();
+    // A report is generated on a schedule, so polling faster than the
+    // operator's own refresh interval only costs battery.
+    const t = refreshMin > 0 ? setInterval(load, refreshMin * 60000) : null;
+    return () => { stop = true; if (t) clearInterval(t); };
+  }, [templateId, viewMode, refreshMin, pickedTenantId]);
+
+  if (!templateId) {
+    return h("div", { className: "widget-empty muted" },
+      "Pick a report template for this card");
+  }
+  if (!loaded) return h("div", { className: "widget-empty muted" }, "loading…");
+  if (error) return h("div", { className: "widget-empty bad" }, error);
+  if (!row) {
+    return h("div", { className: "widget-empty muted" },
+      "No report generated from this template yet");
+  }
+
+  const when = fmtTs(row.created_utc);
+  const name = row.template_name || row.file_name || "Report";
+  if (viewMode === "pdf_preview" && url) {
+    // Full card area, the way the edge draws it: the title bar already
+    // names the widget, so the frame takes everything below it.
+    return h("div", { className: "rcw-preview" },
+      h("iframe", { className: "pdf-frame", src: url, title: name }));
+  }
+  // Summary: what it is, when it ran, how big - and a way to open it.
+  const openUrl = url || liteReportLocalUrl(row, true) || "";
+  return h("div", { className: "rcw-summary" },
+    h("div", { className: "rcw-name" }, name),
+    h("div", { className: "rcw-meta muted" }, when),
+    h("div", { className: "rcw-meta muted" }, fmtBytes(row.file_bytes)),
+    liteReportIsReady(row)
+      ? h("a", {
+          className: "btn btn-sm",
+          href: openUrl || "#",
+          target: "_blank",
+          rel: "noopener",
+          onClick: async (e) => {
+            if (openUrl) return;              // a LAN link is ready already
+            e.preventDefault();
+            const { url: signed, error: se } = await liteReportSignedUrl(row.storage_path);
+            if (se) { setError(se); return; }
+            if (signed) window.open(signed, "_blank", "noopener");
+          },
+        }, "Open PDF")
+      : h("span", { className: "muted" }, "uploading…")
+  );
+}
+
 function Widget({ widget, liveByKey, onOpen, onOpenWidget, gridStyle }) {
   const type = String(widget?.type || "");
   if (SKIPPED_TYPES.has(type)) return null;
@@ -1975,6 +2119,7 @@ function Widget({ widget, liveByKey, onOpen, onOpenWidget, gridStyle }) {
     type === "pie_chart"   ? h(PieWidget,   { widget, liveByKey }) :
     type === "table_list"  ? h(TableWidget, { widget }) :
     type === "image"       ? h(ImageWidget, { widget }) :
+    type === "report_card" ? h(ReportCardWidget, { widget }) :
     type === "fixed_text"  ? h("div", { className: "widget-text" }, widget?.config?.text || "") :
     type === "divider"     ? h("div", { className: "widget-divider" }, widget?.config?.text || "") :
                               h("div", { className: "widget-empty muted" }, type || "widget");
@@ -2266,14 +2411,7 @@ function TagMonitor({ open, payload, onClose }) {
   // the autoFit default when the widget is in auto mode or no widget
   // is bound (raw tag click).
   const monCfg = payload?.widget?.config || {};
-  const monManualLeft = buildManualY(monCfg.y_axis_mode, monCfg.y_min, monCfg.y_max, monCfg.y_tick_step);
-  const monManualRight = buildManualY(monCfg.y_right_axis_mode, monCfg.y_right_min, monCfg.y_right_max, monCfg.y_right_tick_step);
-  const monLeftYProps = monManualLeft
-    ? { ...monYProps, domain: monManualLeft.domain, ticks: monManualLeft.ticks, allowDataOverflow: true }
-    : monYProps;
-  const monRightYProps = monManualRight
-    ? { ...monYProps, domain: monManualRight.domain, ticks: monManualRight.ticks, allowDataOverflow: true }
-    : monYProps;
+
 
   return h("div", { className: "monitor-back", onClick: (e) => { if (e.target.classList.contains("monitor-back")) onClose(); } },
     h("div", { className: "monitor" },
@@ -2290,8 +2428,7 @@ function TagMonitor({ open, payload, onClose }) {
               h(buildChartRoot(widgetType, seriesDefs.length), { data, margin: getChartMargin() },
                 h(CartesianGrid, { stroke: "var(--line, rgba(255,255,255,0.07))", strokeDasharray: "3 3" }),
                 h(XAxis, buildXAxisProps(data, monCfg)),
-                h(YAxis, { ...monLeftYProps, yAxisId: "left" }),
-                hasRight ? h(YAxis, { ...monRightYProps, yAxisId: "right", orientation: "right" }) : null,
+                ...liteYAxes(monCfg, seriesDefs, [], monYProps),
                 h(Tooltip, { ...chartTooltipProps, labelFormatter: labelFmt, formatter: (v, n) => [fmtVal(v), n] }),
                 h(Legend, { wrapperStyle: { fontSize: 12, color: "var(--muted, #8a98ab)" } }),
                 ...seriesDefs.map((s) => renderSeriesElement(s, widgetType))
@@ -4214,7 +4351,16 @@ function AlarmRulesView({ liveRows }) {
 }
 
 // LEGACY app_logs alarm feed — kept until reports/alarm wiring is done.
+//
+// Nothing renders this (2026-10-17: zero references), which is the only
+// reason its missing tenant scope was never a live crash: it read
+// `pickedTenantId` twice without taking it from the context, so the first
+// render would have thrown "pickedTenantId is not defined". Found the day
+// this file was first linted. Left in place, and made correct, rather than
+// deleted - but it is dead, and it reads every row of app_logs when revived,
+// so scope it before wiring it to anything.
 function _LegacyAppLogsAlarmsView() {
+  const { pickedTenantId } = useContext(TenantScopeCtx);
   const [rows, setRows] = useState(null);
   const [error, setError] = useState("");
   const [levelFilter, setLevelFilter] = useState("");     // "", "info", "warning", "error", ...
@@ -4544,6 +4690,33 @@ function PowerView({ liveRows }) {
 // Storage bucket for generated PDFs (matches db/migrations/20260518_alarms_reports_queue.sql).
 const LITE_REPORTS_BUCKET = "lite-reports";
 
+// How a generated report becomes something a browser can open. Two
+// deployments, two answers, ONE definition - the Reporting tab and the
+// dashboard's Report Card both call these (2026-10-17; before that the
+// dashboard card did not exist on Lite at all and rendered as a grey
+// "report_card" box).
+//
+//   LAN   the edge serves the file itself; the shim puts local_file_url on
+//         the row and the session token rides in the query string, because
+//         an <iframe> cannot carry an Authorization header.
+//   cloud the PDF is in object storage and needs a short-lived signed URL.
+const liteReportLocalUrl = (r, inline) => {
+  if (!r || !r.local_file_url) return null;
+  let token = "";
+  try { token = sessionStorage.getItem("tn_lite_local_token") || ""; } catch (_) {}
+  const q = [`inline=${inline ? "true" : "false"}`];
+  if (token) q.push(`token=${encodeURIComponent(token)}`);
+  return `${r.local_file_url}?${q.join("&")}`;
+};
+const liteReportSignedUrl = async (storagePath) => {
+  if (!storagePath) return { url: null, error: "" };
+  const { data, error: e } = await supabase
+    .storage.from(LITE_REPORTS_BUCKET)
+    .createSignedUrl(storagePath, 300);  // 5-minute link
+  return { url: data?.signedUrl || null, error: e ? e.message : "" };
+};
+const liteReportIsReady = (r) => Boolean(r && (r.storage_path || r.local_file_url));
+
 function ReportingView() {
   const [section, setSection] = useState("generated");  // "generated" | "templates"
   return h("div", null,
@@ -4601,23 +4774,13 @@ function GeneratedReportsView() {
   // local_file_url served by the edge itself. Without this every row sat
   // disabled at "UPLOADING" forever, because storage_path is only ever set
   // by the cloud uploader.
-  const localUrl = (r, inline) => {
-    if (!r.local_file_url) return null;
-    let token = "";
-    try { token = sessionStorage.getItem("tn_lite_local_token") || ""; } catch (_) {}
-    const q = [`inline=${inline ? "true" : "false"}`];
-    if (token) q.push(`token=${encodeURIComponent(token)}`);
-    return `${r.local_file_url}?${q.join("&")}`;
-  };
-  const isReady = (r) => Boolean(r.storage_path || r.local_file_url);
+  const localUrl = liteReportLocalUrl;
+  const isReady = liteReportIsReady;
 
   const signedUrl = async (storagePath) => {
-    if (!storagePath) return null;
-    const { data, error: e } = await supabase
-      .storage.from(LITE_REPORTS_BUCKET)
-      .createSignedUrl(storagePath, 300);  // 5-minute link
-    if (e) { setError(e.message); return null; }
-    return data?.signedUrl || null;
+    const { url, error: e } = await liteReportSignedUrl(storagePath);
+    if (e) { setError(e); return null; }
+    return url;
   };
 
   const onPreview = async (r) => {

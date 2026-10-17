@@ -1236,10 +1236,23 @@ def styled_text_style(section: dict[str, Any], base: ParagraphStyle,
     )
 
 
+def pill_position(section: dict[str, Any]) -> str:
+    """Where a pill or band SITS on the page - "LEFT" / "CENTER" / "RIGHT".
+
+    2026-10-17: `align` already meant "text alignment" on a section (that is
+    what the layout control writes), so the pill's own position gets its own
+    key. `align` is still read so templates saved before this keep the
+    placement they were given.
+    """
+    want = (str(section.get("pill_align") or "").strip().lower()
+            or str(section.get("align") or "").strip().lower())
+    return _ALIGNMENTS.get(want, "LEFT")
+
+
 def pill_band(text: str, styles, *, background: Any = None, color: Any = None,
               corners: str = "both", radius: Any = None, align: str = "left",
               font_size: Any = None, bold: bool = True, width: float = 0.0,
-              band_align: str = "LEFT"):
+              band_align: str = "LEFT", fit: str = "fill"):
     """ONE rounded, filled band with text inside it.
 
     2026-10-09, clarified: "it need to be a header but just in a pill style
@@ -1281,9 +1294,27 @@ def pill_band(text: str, styles, *, background: Any = None, color: Any = None,
         alignment=_ALIGN_CODES.get(str(align or "left").strip().lower(), 0),
         fontName="Helvetica-Bold" if bold else "Helvetica",
     )
-    safe = (str(text or "")
-            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-    table = Table([[Paragraph(safe, para)]], colWidths=[width or None])
+    raw = str(text or "")
+    safe = raw.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # 2026-10-17: "it can be set as full width or not ... only to fit the
+    # text and be aligned center, left and right".
+    #
+    # Fit-to-text has to be MEASURED. A ReportLab column holding a Paragraph
+    # auto-sizes to the whole available width - measured here: a 140pt string
+    # in a colWidths=None table wrapped to 510.2pt, the full text block - so
+    # leaving the width unset does not shrink the band, it fills the page and
+    # leaves hAlign nothing to move.
+    if str(fit or "fill").strip().lower() == "content":
+        pad = size * 0.9
+        text_w = max((stringWidth(line, para.fontName, size)
+                      for line in raw.splitlines() or [""]), default=0.0)
+        band_w = text_w + 2 * pad
+        if width:
+            band_w = min(band_w, width)          # never wider than the page
+        band_w = max(band_w, size * 3)           # a readable minimum
+    else:
+        band_w = width or None
+    table = Table([[Paragraph(safe, para)]], colWidths=[band_w])
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (0, 0), bg),
         ("VALIGN", (0, 0), (0, 0), "MIDDLE"),
@@ -1326,6 +1357,12 @@ def _section_header(section: dict[str, Any], styles, story: list) -> None:
             font_size=section.get("title_font_size") or 13,
             bold=section.get("title_bold") is not False,
             width=_avail_width(section),
+            # 2026-10-17: the editor had offered "Pill width" and a position
+            # for a week, and this call ignored both - the band was always the
+            # full page width, pinned to the left margin. That is the whole of
+            # "the pill report section it is still not working".
+            fit=section.get("pill_fit"),
+            band_align=pill_position(section),
         ))
     else:
         story.append(Paragraph(
@@ -1531,6 +1568,7 @@ def _section_pill_card(section: dict[str, Any], styles, story: list) -> None:
 
     cells: list = []
     styles_for: list = []
+    measure: list[tuple[str, str, float]] = []
     for pill in pills:
         if not isinstance(pill, dict):
             continue
@@ -1603,6 +1641,11 @@ def _section_pill_card(section: dict[str, Any], styles, story: list) -> None:
             body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"),
             para))
         styles_for.append(pill)
+        # Kept for the content fit below: a Paragraph cannot be measured once
+        # it is in the table, and the escaped text is wider than what prints.
+        # A header pill prints at size * 1.35, so measuring with `size`
+        # under-sizes the column and the heading wraps onto a second line.
+        measure.append((body, para.fontName, para.fontSize))
 
     if not cells:
         story.append(Paragraph("No pills configured.", styles["section_caption"]))
@@ -1659,17 +1702,85 @@ def _section_pill_card(section: dict[str, Any], styles, story: list) -> None:
     # is what gives alignment something to do.
     #
     #   pill_fit = "fill"    (default, unchanged) pills share the row evenly
-    #   pill_fit = "content" each pill is as wide as its text, and `align`
-    #                        then places the group left / centre / right
+    #   pill_fit = "content" each pill is as wide as its text, and the pill
+    #                        position places the group left / centre / right
+    #
+    # 2026-10-17, second pass: leaving colWidths unset was not enough. A
+    # ReportLab column holding a Paragraph auto-sizes to the FULL available
+    # width (measured: 510.2pt either way), so the table came out page-wide
+    # and hAlign had nothing to move - the pills still sat on the left. The
+    # fit has to be measured from the text.
+    #
+    # 2026-10-17, third pass, reported: "I should be able to add many pills in
+    # the same row and decide their positions ... the left one aligned on the
+    # left, the right one on the right and the two centre ones centralised in
+    # the columns."
+    #
+    # Fitting the whole TABLE to its contents could never do that: it gave one
+    # position to the whole group. So a fitted pill is now its own small
+    # table, placed inside a full-width column by ITS OWN alignment. Four
+    # pills across the page are four equal columns, and each pill sits where
+    # it was told to sit inside its own quarter.
+    #
+    #   pill.align      wins, per pill
+    #   section         `pill_align` (or the legacy `align`) is the default
+    #
+    # `fill` is untouched: every report that has not opted into the fit keeps
+    # the exact table it has today.
     fit = str(section.get("pill_fit") or "fill").strip().lower()
-    col_widths = None if fit == "content" else [per] * cols
-    table = Table(rows, colWidths=col_widths)
-    table.setStyle(TableStyle(cmds))
-    # as_header used to force LEFT, which meant a pill heading could not be
-    # centred or right-aligned either. `align` is unset on existing
-    # templates, so they keep the left edge they have today.
-    table.hAlign = _ALIGNMENTS.get(
-        str(section.get("align") or "").strip().lower(), "LEFT")
+    if fit == "content":
+        pad = size * 0.8                      # matches LEFT/RIGHTPADDING
+        group_align = pill_position(section)
+        fitted: list[list] = []
+        for r, row_cells in enumerate(rows):
+            out_row: list = []
+            for c, cell in enumerate(row_cells):
+                i = r * cols + c
+                if not isinstance(cell, Paragraph) or i >= len(measure):
+                    out_row.append("")        # the padding of a short last row
+                    continue
+                txt, font, pt = measure[i]
+                inner_w = min(stringWidth(txt, font, pt) + 2 * pad, per)
+                inner = Table([[cell]], colWidths=[inner_w])
+                icmds = [
+                    ("VALIGN", (0, 0), (0, 0), "MIDDLE"),
+                    ("TOPPADDING", (0, 0), (0, 0), size * (0.8 if as_header else 0.45)),
+                    ("BOTTOMPADDING", (0, 0), (0, 0), size * (0.8 if as_header else 0.45)),
+                    ("LEFTPADDING", (0, 0), (0, 0), pad),
+                    ("RIGHTPADDING", (0, 0), (0, 0), pad),
+                    ("ROUNDEDCORNERS", corners),
+                ]
+                # The fill and the border belong to the PILL now, not to the
+                # column it sits in - a column-wide background would paint the
+                # whole quarter of the page.
+                pill = styling[r][c] if isinstance(styling[r][c], dict) else {}
+                bg = _hex_colour(pill.get("background"), None)
+                if bg is not None:
+                    icmds.append(("BACKGROUND", (0, 0), (0, 0), bg))
+                edge = _hex_colour(pill.get("border_color"), None)
+                if edge is not None:
+                    icmds.append(("BOX", (0, 0), (0, 0), 0.6, edge))
+                inner.setStyle(TableStyle(icmds))
+                inner.hAlign = _ALIGNMENTS.get(
+                    str(pill.get("align") or "").strip().lower(), group_align)
+                out_row.append(inner)
+            fitted.append(out_row)
+        table = Table(fitted, colWidths=[per] * cols)
+        table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        table.hAlign = "LEFT"                 # the columns already span the page
+    else:
+        table = Table(rows, colWidths=[per] * cols)
+        table.setStyle(TableStyle(cmds))
+        # as_header used to force LEFT, which meant a pill heading could not be
+        # centred or right-aligned either. Both keys are unset on existing
+        # templates, so they keep the left edge they have today.
+        table.hAlign = pill_position(section)
     story.append(table)
     story.append(Spacer(1, 3 * mm))
 
@@ -4278,8 +4389,14 @@ def group_side_by_side(sections: list) -> list:
                 if len(prev.get("columns") or []) < 3:
                     prev["columns"].append(dict(sec, side_by_side=False))
                     continue
+            # 2026-10-17: "header" was in this exclusion list, so a title
+            # section could never be the FIRST member of a row - ticking
+            # "place beside the previous section" after one did nothing at
+            # all, and the two pill titles the operator wanted side by side
+            # came out stacked on separate lines. A header is content; a page
+            # break and a spacer are not, and they stay excluded.
             elif str(prev.get("type") or "").strip().lower() not in {
-                    "header", "page_break", "spacer"}:
+                    "page_break", "spacer"}:
                 out[-1] = {"type": "row",
                            "columns": [prev, dict(sec, side_by_side=False)]}
                 continue

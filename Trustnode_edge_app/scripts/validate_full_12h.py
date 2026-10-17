@@ -47,12 +47,113 @@ from datetime import datetime, timezone
 
 # ----------------------------------------------------------------- config
 DURATION_S = int(os.environ.get("VAL_DURATION_S", "43200"))
-GW = os.environ.get("VAL_GATEWAY", "gw-1781903248499")
 INTERVAL_S = float(os.environ.get("VAL_INTERVAL_S", "1.0"))
 API = "http://127.0.0.1:8000"
 LOGIN = {"username": os.environ.get("VAL_USER", "admin-mari"),
          "password": os.environ.get("VAL_PASS", "Limerick2019*")}
 DB = os.path.expanduser("~/.trustnode_edge/data/trustnode_app_store.db")
+
+
+def _busiest_gateway(default: str = "") -> str:
+    """The gateway that is ACTUALLY writing, read from the live historian.
+
+    2026-10-17: this was hardcoded to "gw-1781903248499" - a gateway that no
+    longer exists on this install. The delivery SLO therefore measured a
+    device that was not there and reported 0.2% while the two real gateways
+    were writing 2,200 rows every 20 seconds. A gate that points at old data
+    produces a confident false answer and blocks every commit, which is
+    exactly what rule 1 is about; it had to be measured, not assumed.
+
+    VAL_GATEWAY still overrides, for deliberately testing one device.
+    """
+    forced = os.environ.get("VAL_GATEWAY", "").strip()
+    if forced:
+        return forced
+    try:
+        import sqlite3
+        con = sqlite3.connect("file:%s?mode=ro" % DB.replace("\\", "/"), uri=True)
+        try:
+            # Busiest writer in the last 10 minutes. Metrics are the app
+            # reporting on itself, not a collected device.
+            row = con.execute(
+                "SELECT gateway_id, COUNT(*) c FROM historian_readings "
+                "WHERE ts_utc > datetime('now', '-10 minutes') "
+                "AND gateway_id NOT LIKE 'trustnode-app-%' "
+                "GROUP BY gateway_id ORDER BY c DESC LIMIT 1").fetchone()
+        finally:
+            con.close()
+        if not row or not row[0]:
+            return default
+        busiest = str(row[0])
+        # Prefer a gateway the operator actually CONFIGURED. A power meter
+        # writes far more rows than a PLC, so "busiest" alone would quietly
+        # move the gate onto a different subsystem than the one it is meant
+        # to be watching.
+        try:
+            import json as _json
+            con2 = sqlite3.connect("file:%s?mode=ro" % DB.replace("\\", "/"), uri=True)
+            try:
+                cfg = con2.execute(
+                    "SELECT payload_json FROM config_documents_scoped "
+                    "WHERE domain='gateway_configurations' "
+                    "ORDER BY version DESC LIMIT 1").fetchone()
+            finally:
+                con2.close()
+            ids = {str(g.get("id")) for g in (_json.loads(cfg[0]) if cfg else [])
+                   if isinstance(g, dict) and g.get("id")}
+            if ids and busiest not in ids:
+                con3 = sqlite3.connect("file:%s?mode=ro" % DB.replace("\\", "/"), uri=True)
+                try:
+                    for r in con3.execute(
+                            "SELECT gateway_id, COUNT(*) c FROM historian_readings "
+                            "WHERE ts_utc > datetime('now', '-10 minutes') "
+                            "GROUP BY gateway_id ORDER BY c DESC"):
+                        if str(r[0]) in ids:
+                            return str(r[0])
+                finally:
+                    con3.close()
+        except Exception:
+            pass
+        return busiest
+    except Exception:
+        pass
+    return default
+
+
+def _gateway_name(gid: str) -> str:
+    """The name the operator gave the gateway, not its internal id.
+
+    2026-10-17: "we should not use gateways gw-etc, we always should use the
+    gateway name given". An id like gw-1790849236862 means nothing to the
+    person reading the report; the name they typed does.
+    """
+    if not gid:
+        return ""
+    try:
+        import json as _json
+        import sqlite3 as _sq
+        con = _sq.connect("file:%s?mode=ro" % DB.replace("\\", "/"), uri=True)
+        try:
+            row = con.execute(
+                "SELECT payload_json FROM config_documents_scoped "
+                "WHERE domain='gateway_configurations' "
+                "ORDER BY version DESC LIMIT 1").fetchone()
+        finally:
+            con.close()
+        for g in (_json.loads(row[0]) if row else []):
+            if isinstance(g, dict) and str(g.get("id")) == str(gid):
+                nm = str(g.get("name") or "").strip()
+                if nm:
+                    return nm
+    except Exception:
+        pass
+    return ""
+
+
+GW = _busiest_gateway()
+GW_NAME = _gateway_name(GW)
+#: What to show a human: the operator's name, with the id only as a qualifier.
+GW_LABEL = ("%s (%s)" % (GW_NAME, GW)) if GW_NAME else GW
 SF_DB = os.path.expanduser("~/.trustnode_edge/data/trustnode_store_forward.db")
 LOG = os.path.expanduser(r"~\AppData\Roaming\trustnode-edge-desktop\backend.log")
 # Operator 2026-08-21 (BOOT-HEALTH FIX): every gate run also asserts the
@@ -556,7 +657,7 @@ def build_summary(t0: float, final: bool) -> str:
     A = L.append
     A("=" * 76)
     A(f"TrustNode FULL VALIDATION {'FINAL REPORT' if final else 'partial'}  "
-      f"window={dur/3600:.2f}h  gateway={GW}  interval={INTERVAL_S:.1f}s")
+      f"window={dur/3600:.2f}h  gateway={GW_LABEL}  interval={INTERVAL_S:.1f}s")
     A(f"generated {datetime.now(timezone.utc).isoformat()[:19]}Z")
     A("=" * 76)
 

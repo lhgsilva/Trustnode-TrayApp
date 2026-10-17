@@ -145,7 +145,7 @@ SURFACE_FEATURES = [
      "module": "remote_admin_lan", "group": "Remote access", "pages": []},
     {"key": "access_client", "label": "TrustNode Local View (read-only over LAN)",
      "module": "local_web_app", "group": "Remote access", "pages": []},
-    {"key": "access_lite", "label": "Lite (legacy read-only)",
+    {"key": "access_lite", "label": "Web Lite (read-only)",
      "module": "local_web_app", "group": "Remote access", "pages": []},
 ]
 

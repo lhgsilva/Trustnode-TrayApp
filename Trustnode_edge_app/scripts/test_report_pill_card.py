@@ -50,7 +50,8 @@ def check(name, ok, detail=""):
 from reportlab.platypus import Paragraph, Table            # noqa: E402
 from app.state import app_store                            # noqa: E402
 from app.services.report_renderer import (                 # noqa: E402
-    _build_styles, _section_pill_card, _fetch_kpi_value, _draw_section)
+    _build_styles, _section_pill_card, _fetch_kpi_value, _draw_section,
+    _FULL_WIDTH)
 
 ST = _build_styles()
 BASE = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
@@ -407,25 +408,52 @@ fill = _pill_table(ONE)
 check("the default still fills the row", fill is not None and fill.hAlign == "LEFT",
       getattr(fill, "hAlign", None))
 
-right = _pill_table(dict(ONE, pill_fit="content", align="right"))
-check("fit-to-content + right puts the pill on the right",
-      right is not None and right.hAlign == "RIGHT", getattr(right, "hAlign", None))
-check("  and it is no longer stretched to the full width",
-      right is not None and right._argW != fill._argW,
-      "colWidths must be content-sized, not avail/cols")
-centre = _pill_table(dict(ONE, pill_fit="content", align="center"))
-check("  centre works too",
-      centre is not None and centre.hAlign == "CENTER", getattr(centre, "hAlign", None))
+# 2026-10-17, third pass. These used to read the OUTER table's hAlign,
+# because a fitted section shrank the whole table and moved it as one. That
+# could only ever give the group a single position, and the operator asked
+# for "the left one aligned on the left, the right one on the right and the
+# two centre ones centralised in the columns". A fitted pill is now its own
+# small table inside a full-width column, so the position lives on the PILL -
+# which is what these now read. The behaviour on screen is the same for one
+# pill and newly possible for several.
+def _fitted(section):
+    """(alignment, inner width) for each fitted pill, before wrap()."""
+    table = _pill_table(section)
+    if table is None:
+        return []
+    out = []
+    for row in table._cellvalues:
+        for cell in row:
+            if isinstance(cell, Table):
+                out.append((cell.hAlign, cell.wrap(_FULL_WIDTH, 999)[0]))
+    return out
 
-hdr = _pill_table({"type": "pill_card", "as_header": True, "align": "right",
-                   "pill_fit": "content", "pills": [{"id": "h", "text": "TITLE"}]})
+
+right = _fitted(dict(ONE, pill_fit="content", align="right"))
+check("fit-to-content + right puts the pill on the right",
+      len(right) == 1 and right[0][0] == "RIGHT", right)
+check("  and it is no longer stretched to the full width",
+      len(right) == 1 and right[0][1] < _FULL_WIDTH * 0.6,
+      "%s - the pill must be content-sized, not avail/cols" % (right,))
+centre = _fitted(dict(ONE, pill_fit="content", align="center"))
+check("  centre works too", len(centre) == 1 and centre[0][0] == "CENTER", centre)
+
+hdr = _fitted({"type": "pill_card", "as_header": True, "align": "right",
+               "pill_fit": "content", "pills": [{"id": "h", "text": "TITLE"}]})
 check("a pill HEADER can be right-aligned too",
-      hdr is not None and hdr.hAlign == "RIGHT",
+      len(hdr) == 1 and hdr[0][0] == "RIGHT",
       "as_header used to force LEFT whatever the operator chose")
 
 check("an unset alignment is still LEFT",
-      _pill_table(dict(ONE, pill_fit="content")).hAlign == "LEFT",
+      _fitted(dict(ONE, pill_fit="content")) == [("LEFT", _fitted(
+          dict(ONE, pill_fit="content"))[0][1])],
       "existing templates must not move")
+check("  and a pill may now override it",
+      [a for a, _w in _fitted(dict(
+          ONE, pill_fit="content",
+          pills=[{"id": "p1", "text": "PASSED", "align": "right"}]))] == ["RIGHT"],
+      "one position for the whole section could not put one pill left and "
+      "another right on the same row")
 
 SRC_R = io.open(os.path.join(ROOT, "backend", "app", "services",
                              "report_renderer.py"), encoding="utf-8").read()

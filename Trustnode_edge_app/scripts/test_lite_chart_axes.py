@@ -73,9 +73,18 @@ print()
 print("[2. all four axes can be drawn]")
 for axis in ("left1", "left2", "right1", "right2"):
     check("  %-6s is a known axis" % axis, '"%s"' % axis in LITE)
+# 2026-10-17: these helpers moved to MODULE scope and gained the "lite"
+# prefix, because the tag monitor is a separate top-level function and has to
+# draw its axes from the same place - it had its own pair declared with the
+# legacy left/right ids, so every series asked for an axis that did not exist
+# and the monitor chart drew nothing.
 check("only the axes in use are drawn",
-      "const axesUsed" in LITE and "used.add(liteAxisId(sd.axis))" in LITE,
+      "const liteAxesUsed" in LITE and "used.add(liteAxisId(sd.axis))" in LITE,
       "an axis nobody is on must not steal width")
+check("  and ONE builder draws them for both charts",
+      LITE.count("liteYAxes(") >= 3,
+      "the widget and the tag monitor must not keep separate axis rules: "
+      "found %d reference(s)" % LITE.count("liteYAxes("))
 check("  left1 is the fallback so a chart always has a scale",
       'if (!used.size) used.add("left1")' in LITE)
 check("  the second axis on a side is oriented correctly",
@@ -87,7 +96,7 @@ for key in ("primary_unit", "y_axis_right_unit", "y_left2_unit", "y_right2_unit"
     check("  Lite reads %-20s" % key, key in LITE,
           "the edge writes this key; Lite ignored every one of them")
 check("the unit is shown on the axis",
-      "axisUnit(" in LITE and "tickFormatter: u ?" in LITE,
+      "liteAxisUnit(" in LITE and "tickFormatter: u ?" in LITE,
       "a reader cannot tell kW from degC otherwise")
 check("  and folded into the axis label when both are set",
       'lbl + " (" + u + ")"' in LITE)
@@ -131,6 +140,33 @@ check("  and every one of them is below the definition",
       all(i > defs[0] for i, l in enumerate(lines)
           if "liteAxisId(" in l and not l.startswith("const liteAxisId")),
       "a const is in the temporal dead zone above its own declaration")
+
+print()
+print("[5b. each axis has its OWN scale]")
+# 2026-10-17, reported: "the data is not showing respecting each Y axis ...
+# and min and max and units". There were exactly two manual-range configs -
+# manualLeft and manualRight - and each was applied to BOTH axes on its side,
+# so left2 inherited left1's min/max and right2 inherited right1's. A 0..100%
+# axis and a 900..1100 mbar axis on the same side drew on one scale and the
+# second series flat-lined off the top.
+for key in ("y_axis_mode", "y_right_axis_mode",
+            "y_left2_axis_mode", "y_right2_axis_mode"):
+    check("  Lite reads %-20s" % key, key in LITE,
+          "without its own mode an axis cannot be manual on its own")
+for key in ("y_left2_min", "y_left2_max", "y_right2_min", "y_right2_max"):
+    check("  and %-20s" % key, key in LITE,
+          "the edge writes this key for the second axis on that side")
+check("the scale is built per axis, not per side",
+      "buildManualY(cfg[k.mode], cfg[k.min], cfg[k.max], cfg[k.step])" in LITE,
+      "one call per axis, reading that axis's own keys")
+check("  the two side-wide scales are gone",
+      "manualLeft" not in LITE.replace("manualLeft and manualRight", "")
+      and "monManualRight" not in LITE,
+      "a side-wide range is what made the second axis borrow the first's")
+check("  every axis key set is complete",
+      all(LITE.count(k) >= 1 for k in
+          ("y_left2_tick_step", "y_right2_tick_step")),
+      "a manual axis with no tick step still needs the key to exist")
 
 print()
 print("[6. the edge side is unchanged]")

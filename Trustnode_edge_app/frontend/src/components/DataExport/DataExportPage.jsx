@@ -145,11 +145,45 @@ export default function DataExportPage({ api, isCloudClient = false, onError }) 
   const one = (key) => (Array.isArray(spec[key]) && spec[key].length === 1 ? spec[key][0] : "");
   const setOne = (key) => (v) => patch({ [key]: v ? [v] : [] });
 
+  // 2026-10-17, reported: "the historian export is not working, not loading,
+  // preview, export". It was running - and correctly returning nothing.
+  //
+  // <input type="datetime-local"> yields LOCAL wall time ("2026-10-17T17:08:40")
+  // and it was written straight into a field named `from_utc`, then compared
+  // against the historian's UTC timestamps. On a UTC+1 machine the window was
+  // an hour in the future: 0 rows for a range that held 27,234. The field name
+  // is what hid it.
+  //
+  // The inputs keep showing local time, which is what an operator wants; only
+  // what goes to the server is converted.
+  //
+  // The same convention is already written down in OEE/OeePeriod.jsx
+  // (toLocalInput / fromLocalInput): "convert at the edge so no UTC stamp is
+  // ever built from a local-time string by accident". It is kept here rather
+  // than imported because that pair returns "" for anything it cannot parse,
+  // and a silently dropped window is how this went unnoticed for weeks.
+  // NOTE: a report section's Custom range (ReportTemplateDesigner) still
+  // writes time_range.from_utc from a datetime-local box with no conversion -
+  // same defect, but changing it moves every ALREADY-SAVED custom range by
+  // the machine's offset, so it needs a decision, not a quiet fix.
+  const toUtcStamp = (local) => {
+    const raw = String(local || "").trim();
+    if (!raw) return "";                       // empty means "everything"
+    const d = new Date(raw);                   // parsed in the browser's zone
+    if (Number.isNaN(d.getTime())) return raw; // never silently drop a typo
+    return d.toISOString().slice(0, 19).replace("T", " ");
+  };
+  const wireSpec = useCallback(() => ({
+    ...spec,
+    from_utc: toUtcStamp(spec.from_utc),
+    to_utc: toUtcStamp(spec.to_utc),
+  }), [spec]);
+
   const runPreview = useCallback(async () => {
     setBusy(true);
     setStatus("Running preview…");
     try {
-      const res = await api.exportPreview(spec);
+      const res = await api.exportPreview(wireSpec());
       setPreview(res || null);
       setStatus(res?.ok === false
         ? `Preview failed: ${res.error || "unknown error"}`
@@ -161,7 +195,7 @@ export default function DataExportPage({ api, isCloudClient = false, onError }) 
     } finally {
       setBusy(false);
     }
-  }, [api, spec, onError]);
+  }, [api, spec, wireSpec, onError]);
 
   const runExport = useCallback(async () => {
     setBusy(true);
@@ -171,9 +205,9 @@ export default function DataExportPage({ api, isCloudClient = false, onError }) 
       // because the stream would cross the internet twice to reach this same
       // browser. The operator's rule, 2026-08-31.
       const result = isCloudClient
-        ? await api.exportClientSide(spec, format, (n) =>
+        ? await api.exportClientSide(wireSpec(), format, (n) =>
             setStatus(`Exporting… ${n.toLocaleString()} row(s)`))
-        : await api.exportServerSide(spec, format);
+        : await api.exportServerSide(wireSpec(), format);
       setStatus(result?.message || "Export complete.");
     } catch (err) {
       setStatus(`Export failed: ${String(err?.message || err)}`);
@@ -181,7 +215,7 @@ export default function DataExportPage({ api, isCloudClient = false, onError }) 
     } finally {
       setBusy(false);
     }
-  }, [api, spec, format, isCloudClient, onError]);
+  }, [api, spec, wireSpec, format, isCloudClient, onError]);
 
   const clearAll = useCallback(() => {
     setSpec({ ...EMPTY_SPEC, columns: options?.default_columns || [] });

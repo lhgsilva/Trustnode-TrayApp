@@ -54,6 +54,22 @@ jobs:
           npm run build
           npm run build:clientview
 
+      # 2026-10-17: the cloud Lite bundle was NOT built or shipped by this
+      # workflow, so it only ever reached the VPS when somebody ran
+      # scripts/push_lite_to_vps.py by hand. Measured that day: the VPS was
+      # serving tnlite-v51 while the source was at v54 - three rounds of
+      # phone/web-client fixes (4-way chart axes, per-axis min/max and units,
+      # the Report Card) sat in git and reached nobody.
+      #
+      # The cloud app and the LAN app are ONE source
+      # (backend/static/lite_view); this converts it. config.json is merged
+      # from whatever the host already serves, and the script exits non-zero
+      # rather than invent one, because it holds the Supabase URL and anon
+      # key.
+      - name: Build cloud Lite bundle
+        working-directory: Trustnode_edge_app
+        run: python3 scripts/build_lite_cloud_bundle.py
+
       - name: Install ssh key
         run: |
           mkdir -p ~/.ssh
@@ -79,6 +95,16 @@ jobs:
           rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
             Trustnode_edge_app/frontend/dist_client_view/ \
             ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/var/www/trustnode-clientview/
+
+      # MUST come after the frontend rsync above: that one is `--delete` into
+      # /var/www/trustnode/, which removes anything not in frontend/dist -
+      # including lite/. And NO --delete here: build_lite_cloud_bundle.py
+      # deliberately leaves files it has no local copy of to the VPS's own.
+      - name: Rsync cloud Lite bundle
+        run: |
+          rsync -az -e "ssh -i ~/.ssh/id_ed25519" \
+            Trustnode_edge_app/web_cloud_readonly/lite/ \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/var/www/trustnode/lite/
 
       - name: Rsync db migrations + scripts
         run: |
@@ -113,3 +139,27 @@ jobs:
           done
           echo "Health check FAILED — public endpoint not responding 200"
           exit 1
+
+      # 2026-10-17: a green deploy told us nothing about the Lite bundle,
+      # which is how the VPS sat on tnlite-v51 while the repo was at v54.
+      # Compare what the host serves against what this commit built - an
+      # exit code is not evidence that the right bytes arrived.
+      - name: Verify the served Lite bundle is this one
+        run: |
+          sw=Trustnode_edge_app/web_cloud_readonly/lite/sw.js
+          want=$(grep -o 'CACHE_VERSION = "[^"]*"' "$sw" | head -1)
+          base="${{ secrets.PUBLIC_HEALTH_URL }}"
+          base="${base%/api/health}"
+          served=$(curl -fsS --max-time 30 "$base/lite/sw.js" || echo "")
+          got=$(printf '%s' "$served" | grep -o 'CACHE_VERSION = "[^"]*"' | head -1)
+          echo "built:  $want"
+          echo "served: $got"
+          if [ -z "$got" ]; then
+            echo "Could not read the served Lite service worker"
+            exit 1
+          fi
+          if [ "$want" != "$got" ]; then
+            echo "The VPS is serving a DIFFERENT Lite bundle than this deploy built"
+            exit 1
+          fi
+          echo "Lite bundle verified"

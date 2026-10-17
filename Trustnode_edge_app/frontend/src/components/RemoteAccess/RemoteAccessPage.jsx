@@ -32,7 +32,7 @@ export const REMOTE_ACCESS_WIZARD_DONE_KEY = "tn_remote_access_wizard_done";
 export const PRODUCT_NAMES = {
   full: "TrustNode Edge",
   client: "TrustNode Local View",
-  lite: "TrustNode Lite (legacy)",
+  lite: "TrustNode Web Lite",
 };
 
 const SURFACE_LABELS = {
@@ -43,8 +43,8 @@ const SURFACE_LABELS = {
   client: "TrustNode Local View",
   lan_client: "TrustNode Local View",
   view: "TrustNode Local View",
-  lite: "Lite (legacy)",
-  lan_lite: "Lite (legacy)",
+  lite: "Web Lite",
+  lan_lite: "Web Lite",
   api: "API",
 };
 
@@ -292,7 +292,7 @@ export function RemoteAccessPage({ canEdit = false, role = "", onOpenUsers = nul
       <p className="muted" style={{ marginTop: 0 }}>
         When ON, this edge listens on the local network so other PCs, panels and phones can open
         <strong> {PRODUCT_NAMES.full}</strong> (full configuration, admin or engineer login),
-        <strong> {PRODUCT_NAMES.client}</strong> (read-only dashboards and reports) or the legacy Lite page
+        <strong> {PRODUCT_NAMES.client}</strong> (read-only dashboards and reports) or the Web Lite page
         from their browser. Each user still needs an account with the matching LAN Web Access flag.
       </p>
 

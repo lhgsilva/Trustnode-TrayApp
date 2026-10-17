@@ -74,7 +74,12 @@ if (-not $WebBasePath) {
 }
 $webCloudUrl = $CloudApiUrl
 if (-not $webCloudUrl) {
-    $webCloudUrl = "https://api.example.com"
+    # 2026-10-17: this used to fall back to "https://api.example.com", so a
+    # build with no CloudApiUrl produced a cloud bundle pointing at a
+    # placeholder host - and said so in a WARNING nobody reads at the end of a
+    # fifteen-minute build. The real address is in
+    # docs/CONTROL_PLANE_DEPLOY_CHECKLIST_2026-04-23.md; use it.
+    $webCloudUrl = "https://trustnode.lsapps.app"
 }
 
 Write-Host "Building cloud web bundle (admin-capable by default)..."
@@ -85,6 +90,6 @@ if ($LASTEXITCODE -ne 0) {
     throw "Cloud web bundle build failed (exit code: $LASTEXITCODE)."
 }
 if (-not $CloudApiUrl) {
-    Write-Host "WARNING: CloudApiUrl not provided. Web build used placeholder https://api.example.com"
-    Write-Host "Set -CloudApiUrl or env TRUSTNODE_CLOUD_API_URL for production-ready web output."
+    Write-Host "NOTE: CloudApiUrl not provided. Web build used the documented default $webCloudUrl"
+    Write-Host "Set -CloudApiUrl or env TRUSTNODE_CLOUD_API_URL to build for a different deployment."
 }

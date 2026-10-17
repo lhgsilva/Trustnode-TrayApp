@@ -2298,7 +2298,7 @@ const PERMISSION_LABELS = {
   trustnode_intelligence: "TrustNode Intelligence",
   access_full: "TrustNode Edge (full app over LAN)",
   access_client: "TrustNode Local View (read-only over LAN)",
-  access_lite: "Lite (legacy read-only)",
+  access_lite: "Web Lite (read-only)",
 };
 
 // Owner-approved product names (plan 2026-08-21 §0/§7). Maps package_key
@@ -3043,7 +3043,7 @@ function UserClientViewCell({ row, tenantScope, edgeId, isAdminViewer }) {
         <>
           {variantBtn("full", "Edge",   canFull,   `Copy the TrustNode Edge link (/trustnode/full/?token=…) for ${userId}`)}
           {variantBtn("client","Local View",canClient, `Copy the TrustNode Local View link (/trustnode/client/?token=…) for ${userId}`)}
-          {variantBtn("lite", "Lite",   canLite,   `Copy the legacy Lite link (/trustnode/lite/?token=…) for ${userId}`)}
+          {variantBtn("lite", "Web Lite", canLite, `Copy the Web Lite link (/trustnode/lite/?token=…) for ${userId}`)}
         </>
       )}
       <button
@@ -5386,6 +5386,19 @@ function AppShell() {
   const alarmsDomainSaveTimerRef = useRef(null);
   const alarmsDomainPersistInFlightRef = useRef(false);
   const alarmsDomainLastPersistSignatureRef = useRef("");
+  // 2026-10-17, reported: "when we clear the alarms it is not cleared and we
+  // restart the app". It never was. alarms_setup is a PROTECTED collection,
+  // so the server refuses an empty list unless the caller says the emptying
+  // was deliberate - and this save said nothing. The live log held 12 of
+  // these, the first on 2026-08-26:
+  //
+  //   Refused to clear 300 saved item(s) in 'alarms_setup': the request
+  //   carried an empty list.
+  //
+  // The guard is right; the clear was mute. This ref carries the operator's
+  // intent from the button to the save, so only an explicit Clear may empty
+  // the list - a half-hydrated page still cannot.
+  const alarmsClearIntentRef = useRef(false);
   const triggersDomainSaveTimerRef = useRef(null);
   const triggersDomainPersistInFlightRef = useRef(false);
   const triggersDomainLastPersistSignatureRef = useRef("");
@@ -7782,12 +7795,35 @@ function AppShell() {
       if (!appStorePayloadEverHydratedRef.current) return;
       if ((!Array.isArray(payload.alarms) || payload.alarms.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === alarmsDomainLastPersistSignatureRef.current) return;
+      // Same shape as dashboard_configurations above: an empty list is only
+      // persisted when the operator actually emptied it. Any other route to
+      // an empty list is refused by the server, which keeps the stored log.
+      const emptyIsIntentional =
+        payload.alarms.length === 0 ? alarmsClearIntentRef.current === true : false;
       alarmsDomainPersistInFlightRef.current = true;
       try {
-        await saveAppStoreDomain("alarms_setup", payload, currentUser?.username || "system");
+        // allowEmpty alone, deliberately: it is what the blank-write guard
+        // asks for, and it is enough. base_version is NOT sent here the way
+        // dashboard_configurations sends it - alarms append every few
+        // seconds, and versioning a save at that rate adds a 409 path (two
+        // surfaces, or the cloud mirror, overtaking each other) to a domain
+        // that has never had one. Smallest change that makes Clear stick.
+        await saveAppStoreDomain(
+          "alarms_setup", payload, currentUser?.username || "system",
+          { allowEmpty: emptyIsIntentional });
         alarmsDomainLastPersistSignatureRef.current = signature;
-      } catch (_) {
-        // Bootstrap save loop still tries periodically — non-fatal.
+        if (emptyIsIntentional) alarmsClearIntentRef.current = false;
+      } catch (err) {
+        // SAY IT. This used to swallow the error with "bootstrap save loop
+        // still tries periodically", and that is exactly how twelve refusals
+        // went unnoticed from 2026-08-26 to today. The signature is
+        // deliberately NOT recorded, so the next change retries.
+        addAppLog({ level: "error", category: "config",
+                    message: `Alarms not saved: ${String(err?.message || err)}` });
+        if (emptyIsIntentional) {
+          alarmsClearIntentRef.current = false;
+          setError(`Alarms could not be cleared: ${String(err?.message || err)}`);
+        }
       } finally {
         alarmsDomainPersistInFlightRef.current = false;
       }
@@ -16253,6 +16289,9 @@ const getGatewayHealth = (gateway) => {
   const clearSelectedAlarms = () => {
     if (!canEditPage("alarms") || !selectedAlarmIds.length) return;
     const selected = new Set(selectedAlarmIds);
+    // Selecting every row empties the list, which the server refuses unless
+    // the save says it was asked for. See alarmsClearIntentRef.
+    alarmsClearIntentRef.current = true;
     setAlarms((prev) => prev.filter((a) => !selected.has(a.id)));
     setSelectedAlarmIds([]);
   };
@@ -16260,6 +16299,7 @@ const getGatewayHealth = (gateway) => {
   const clearAllAlarms = () => {
     if (!canEditPage("alarms")) return;
     withConfirm("Clear All Alarms", "Remove all alarms from the list?", () => {
+      alarmsClearIntentRef.current = true;
       setAlarms([]);
       setSelectedAlarmIds([]);
     });
@@ -32169,7 +32209,7 @@ const getGatewayHealth = (gateway) => {
                       <span style={{ minWidth: 120, flexShrink: 0 }}>LAN view interface</span>
                       <select value={newUserForm.view_ui} onChange={(e) => setNewUserForm({ ...newUserForm, view_ui: e.target.value })} style={{ marginLeft: 8 }}>
                         <option value="app_readonly">TrustNode app (read-only)</option>
-                        <option value="lite">Lite (legacy)</option>
+                        <option value="lite">Web Lite</option>
                       </select>
                     </label>
                   ) : null}
@@ -32329,7 +32369,7 @@ const getGatewayHealth = (gateway) => {
                         <span style={{ minWidth: 120, flexShrink: 0 }}>LAN view interface</span>
                         <select value={editUserForm.view_ui || "app_readonly"} onChange={(e) => setEditUserForm({ ...editUserForm, view_ui: e.target.value })} disabled={!canManageUsers} style={{ marginLeft: 8 }}>
                           <option value="app_readonly">TrustNode app (read-only)</option>
-                          <option value="lite">Lite (legacy)</option>
+                          <option value="lite">Web Lite</option>
                         </select>
                       </label>
                     ) : null}

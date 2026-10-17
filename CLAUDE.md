@@ -286,3 +286,92 @@ Rules that keep a new customer able to come online:
   code, which is always true on a fresh machine.
 - Self-hosting: set `VITE_TRUSTNODE_CONTROL_PLANE_URL` at build time so the
   installer ships pointing at the right portal.
+
+## 8. Two traps that make working code look broken — 2026-10-17
+
+Both of these cost a day each because the code read correctly. Neither was a
+crash, and neither logged anything.
+
+### A name can hide a timezone bug
+
+`<input type="datetime-local">` returns LOCAL wall time with no zone
+(`2026-10-17T17:08:40`). The Data Export page wrote that straight into a
+field called `from_utc`, which the service compares against the historian's
+`ts_utc`. On a UTC+1 machine every query asked about an hour that had not
+happened yet, so Preview and Export were both empty — the correct answer to
+the wrong question. Measured on the live store: the typed window returned
+**0 rows**, the same window shifted −1 h returned **27,234**.
+
+- An input shows the clock on the wall. Convert at the API boundary, once,
+  and run every path through that one conversion — Preview and the two export
+  routes were three separate calls.
+- When a field is named `*_utc`, check what actually reaches it. The name is
+  what stops you looking.
+
+### ReportLab does not shrink a Paragraph to its text
+
+"Fit to content" for a report pill was implemented by leaving `colWidths`
+unset and trusting the Table to size itself. For a cell holding a
+`Paragraph` it does the opposite: measured, a 140 pt string in a
+`colWidths=None` table wrapped to **510.2 pt** — the whole text block. So the
+pill was page-wide either way and `hAlign` had nothing left to move, which
+is exactly how it was reported: "it is only working for left".
+
+- A content fit has to be measured with `stringWidth`, at the size the cell
+  actually prints — a header pill prints at `font_size * 1.35`, and measuring
+  it at `font_size` makes the heading wrap.
+- Cap the measured width at the page width, or a long pill runs off it.
+
+### And: two controls on one key look like a broken control
+
+The pill's position and the layout card's "Text alignment" both wrote
+`section.align`, while the pill-card editor offered a position but no width
+at all. Nothing could move, and the control that could not work was the one
+the operator kept pressing. A pill's own placement now lives on `pill_align`
+(`align` is still read, so saved templates do not shift) and `pill_fit` is
+offered everywhere a pill is.
+
+### A protected collection refuses a legitimate clear, silently
+
+`_PROTECTED_COLLECTIONS` in `routers/app_store.py` refuses to replace a saved
+collection with an empty list. It exists because a headless check once blanked
+three dashboard widgets. But some of those collections are things an operator
+is *allowed* to empty — `alarms_setup` is an event log — and "Clear All
+Alarms" only emptied React state, so the save that followed said nothing about
+intent and was refused. The frontend's `catch (_) {}` swallowed the refusal:
+
+```
+app_logs: "Refused to clear 300 saved item(s) in 'alarms_setup': the request
+           carried an empty list."
+  12 of them, 2026-08-26 -> 2026-10-17, nobody saw one
+```
+
+- A clear must carry the operator's intent to the request: an `*IntentRef` set
+  by the button, read by the save, forwarded as `allowEmpty`, and only ever
+  for an EMPTY payload. `dashboard_configurations` has done this since
+  2026-08-31 — copy that shape rather than inventing a second one.
+- **Never swallow a failed config save.** A guard that refuses correctly and a
+  save that never happened look identical on screen.
+- Checking this is one query: `SELECT ... FROM app_logs WHERE message LIKE
+  '%Refused to clear%'` tells you whether a guard is eating someone's work.
+
+### `npm run build -- --flag` goes to the LAST command in the chain
+
+`frontend`'s `build` script is a chain (`vite build && npm run lint:undef &&
+npm run smoke`). npm appends forwarded arguments to the end of the whole
+string, so `build-web-cloud-readonly.ps1`'s
+`npm run build -- --outDir dist_cloud_readonly` handed the flags to
+`npm run smoke`. vite built with its DEFAULT output and overwrote
+`frontend\dist` — the bundle the desktop app ships — with a cloud-configured
+one, while `dist_cloud_readonly` was never written. The script then copied
+whatever stale bundle was left from an earlier run and printed "Cloud web
+bundle created". Exit code 0 the whole way.
+
+- Invoke the tool directly (`npm exec -- vite build ...`) when you need to pass
+  it flags. Never forward through a chained script.
+- **A build step must assert its own output exists and is newer than the run.**
+  Without that check, a mis-targeted build is indistinguishable from a
+  successful one — and the stale copy ships.
+- A placeholder default (`https://api.example.com`) plus a WARNING at the end
+  of a fifteen-minute build is not a safeguard. Default to the documented
+  address.

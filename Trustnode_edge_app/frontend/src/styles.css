@@ -9463,10 +9463,13 @@ textarea {
    editable on one line or a card of six becomes a wall of stacked inputs. */
 .tn-pill-row {
   display: grid;
+  /* 2026-10-17: a twelfth control (the pill's own position) joined this row.
+     The count here must match the children exactly - a short list silently
+     wraps every pill onto two lines. */
   grid-template-columns:
     minmax(70px, 1fr) minmax(90px, 1.2fr) minmax(76px, .9fr)
     minmax(76px, .9fr) minmax(64px, .7fr) minmax(44px, .45fr)
-    minmax(84px, .9fr) 38px 38px auto auto;
+    minmax(84px, .9fr) 38px 38px minmax(92px, .9fr) auto auto;
   gap: var(--space-2);
   align-items: center;
   margin-bottom: var(--space-2);

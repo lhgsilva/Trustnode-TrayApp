@@ -75,6 +75,39 @@ const TIME_PRESETS = [
   { value: "segment", label: "One test / cycle (segment)" },
 ];
 
+// A section's Custom range, in UTC on the wire and local on the screen.
+//
+// 2026-10-17: these two boxes wrote `time_range.from_utc` straight from a
+// <input type="datetime-local">, which emits LOCAL wall time. Every stamp in
+// this product is UTC, so a custom range was off by the machine's offset -
+// the same defect as the Data Export window, found the same afternoon, where
+// a typed window returned 0 rows out of 27,234.
+//
+// Converting means any range SAVED before today now renders an hour away
+// from where it did (approved 2026-10-17, UTC+1 machine). The alternative
+// was leaving every new one wrong.
+//
+// Both directions are needed. Showing a stored UTC stamp in a local-time box
+// without converting it back would re-convert it on the next save and walk
+// the range an hour further every time it was edited.
+const utcToLocalInput = (stamp) => {
+  const raw = String(stamp || "").trim();
+  if (!raw) return "";
+  const d = new Date(raw.replace(" ", "T") + (/[zZ]|[+-]\d\d:?\d\d$/.test(raw) ? "" : "Z"));
+  if (Number.isNaN(d.getTime())) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+    + `T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
+const localInputToUtc = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return "";                        // empty means "not set"
+  const d = new Date(raw);                    // parsed in the browser's zone
+  if (Number.isNaN(d.getTime())) return raw;  // never silently drop a typo
+  return d.toISOString().slice(0, 19).replace("T", " ");
+};
+
+
 // Picker shown when a section's time-range preset is "batch". Lets the user
 // bind the section to a specific batch, or to "the latest batch of a type"
 // (so a scheduled report always covers the most recent run of that type).
@@ -2468,14 +2501,19 @@ function SectionEditor({
                 Pill width
                 <select value={section.pill_fit || "fill"}
                         onChange={(e) => onChange({ pill_fit: e.target.value })}>
-                  <option value="fill">Fill the row</option>
-                  <option value="content">Fit to content</option>
+                  <option value="fill">Full page width</option>
+                  <option value="content">Fit to the text</option>
                 </select>
               </label>
-              <label title="Where the pills sit on the page. Needs Pill width = Fit to content to have any effect.">
-                Alignment
-                <select value={section.align || "left"}
-                        onChange={(e) => onChange({ align: e.target.value })}>
+              {/* Deliberately NOT called "Alignment": the layout card at the
+                  bottom already has "Text alignment" writing `align`, so a
+                  second control on the same key is why moving this did
+                  nothing. This one places the band; the text inside it
+                  follows Title style. */}
+              <label title="Where the band sits on the page. Needs Pill width = Fit to content to have any effect - a full-width band has nowhere to move.">
+                Band position
+                <select value={section.pill_align || section.align || "left"}
+                        onChange={(e) => onChange({ pill_align: e.target.value })}>
                   <option value="left">Left</option>
                   <option value="center">Centre</option>
                   <option value="right">Right</option>
@@ -2606,10 +2644,22 @@ function SectionEditor({
             onChange={(v) => onChange({ title: v })}
             gatewayOptions={gatewayOptions} tagList={tagList}
             formatTagForDisplay={formatTagForDisplay} />
-          <div className="tn-row tn-row-3">
-            <label>Alignment
-              <select value={String(section.align || "left")}
-                      onChange={(e) => onChange({ align: e.target.value })}>
+          <div className="tn-row tn-row-4">
+            {/* 2026-10-17: this row offered a position but no width, and a
+                pill stretched to its whole column has nowhere to move - so
+                "Alignment" looked broken. The two belong together. */}
+            <label title="Full page width: the pills share the row evenly, as before. Fit to the text: each pill is only as wide as what it says, which is what lets Position move it.">
+              Pill width
+              <select value={String(section.pill_fit || "fill")}
+                      onChange={(e) => onChange({ pill_fit: e.target.value })}>
+                <option value="fill">Full page width</option>
+                <option value="content">Fit to the text</option>
+              </select>
+            </label>
+            <label title="Where the pills sit, for every pill that does not set its own position below. Needs Pill width = Fit to the text.">
+              Position (default)
+              <select value={String(section.pill_align || section.align || "left")}
+                      onChange={(e) => onChange({ pill_align: e.target.value })}>
                 <option value="left">Left</option>
                 <option value="center">Centre</option>
                 <option value="right">Right</option>
@@ -2702,6 +2752,23 @@ function SectionEditor({
               <input type="color" title="Background"
                      value={String(pill.background || "#14a89a")}
                      onChange={(e) => updatePill(pill.id, { background: e.target.value })} />
+              {/* 2026-10-17, requested: "I should be able to add many pills in
+                  the same row and decide their positions ... the left one
+                  aligned on the left, the right one on the right and the two
+                  centre ones centralised in the columns". One position for
+                  the whole section could never express that. Needs Pill
+                  width = Fit to the text: a pill stretched to fill its
+                  column has nowhere to move inside it. */}
+              <select className="tn-pill-align" value={pill.align || ""}
+                      title={["Where this pill sits inside its own column.",
+                              "Needs Pill width = Fit to the text.",
+                              "Blank follows the section's Position."].join("\n")}
+                      onChange={(e) => updatePill(pill.id, { align: e.target.value })}>
+                <option value="">Position: section</option>
+                <option value="left">Left of its column</option>
+                <option value="center">Centre of its column</option>
+                <option value="right">Right of its column</option>
+              </select>
               <button type="button" title="Bold"
                       className={`btn btn-sm ${pill.bold ? "btn-primary" : "btn-secondary"}`}
                       onClick={() => updatePill(pill.id, { bold: !pill.bold })}>
@@ -3119,10 +3186,10 @@ function SectionEditor({
             {section.time_range?.preset === "custom" ? (
               <div className="tn-row tn-row-2 tn-row-tight">
                 <label>From (UTC)
-                  <input type="datetime-local" step="1" value={section.time_range?.from_utc || ""} onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), from_utc: e.target.value } })} />
+                  <input type="datetime-local" step="1" value={utcToLocalInput(section.time_range?.from_utc)} onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), from_utc: localInputToUtc(e.target.value) } })} />
                 </label>
                 <label>To (UTC)
-                  <input type="datetime-local" step="1" value={section.time_range?.to_utc || ""} onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), to_utc: e.target.value } })} />
+                  <input type="datetime-local" step="1" value={utcToLocalInput(section.time_range?.to_utc)} onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), to_utc: localInputToUtc(e.target.value) } })} />
                 </label>
               </div>
             ) : null}
