@@ -13,7 +13,7 @@
 // so a browser that has visited before keeps running the old app until
 // the version changes - a new index.html was pushed to the VPS on
 // 2026-09-30 under the old version and could not reach anyone.
-const CACHE_VERSION = "tnlite-v54-report-card";
+const CACHE_VERSION = "tnlite-v55-four-way-series";
 const SHELL = [
   "./",
   "./index.html",

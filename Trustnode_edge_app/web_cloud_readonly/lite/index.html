@@ -886,6 +886,20 @@ function buildYAxisProps(autoFit) {
   }
   return base;
 }
+// One of the four canonical axes. Mirrors normSeriesAxis4() in
+// DashboardWidgets.jsx so the edge and the web view agree on what an axis
+// is; legacy configs that stored only "left"/"right" keep working.
+//
+// MODULE scope on purpose: renderSeriesElement() below is a separate
+// top-level function, and a copy living inside ChartWidget would be a
+// ReferenceError there - the exact "X is not defined" class that only
+// shows up at runtime (2026-10-17).
+const liteAxisId = (a) => {
+  const v = String(a || "left1").trim().toLowerCase();
+  if (v === "left2" || v === "right2" || v === "right1" || v === "left1") return v;
+  return v === "right" ? "right1" : "left1";
+};
+
 
 // Resolve the full series list for a chart widget: primary + every
 // non-limit `cfg.series_extra` row. Each series carries gw/tag/color/axis/
@@ -953,7 +967,13 @@ function widgetAllSeries(widget) {
       tag_name: String(s.tag_name),
       label: String(s.label || s.tag_name),
       color: String(s.color || pickPaletteColor(i + 1)),
-      axis: String(s.axis || "left").toLowerCase() === "right" ? "right" : "left",
+      // 2026-10-17 (second pass): this collapsed EVERY axis to left/right
+      // before the chart ever saw it, so a series the operator put on Left 2
+      // arrived as "left" and "right2" - not matching "right" exactly - landed
+      // on the LEFT. Making the renderer four-way was not enough while the
+      // series definitions were flattened here first. liteAxisId mirrors
+      // normSeriesAxis4() on the edge; legacy "left"/"right" still work.
+      axis: liteAxisId(s.axis),
       chart_type: String(s.chart_type || primaryKind).toLowerCase() || primaryKind,
       multiplier: cleanMul(s.multiplier),
       offset: cleanOff(s.offset),
@@ -1017,7 +1037,9 @@ function widgetLimitLines(widget, liveByKey, liveRows) {
       id: String(s.id || `limit${idx + 1}`),
       value,
       color: String(s.color || "#e2585d"),
-      axis: String(s.axis || "left").toLowerCase() === "right" ? "right" : "left",
+      // Same collapse as the series above: a limit drawn against the wrong
+      // scale is worse than no limit at all.
+      axis: liteAxisId(s.axis),
       label: String(s.label || s.tag_name || `Limit ${idx + 1}`),
       dash: dashByStyle[style] || "4 4",
       width: (() => { const n = Number(s.line_width); return Number.isFinite(n) && n > 0 ? n : 2; })(),
@@ -1339,19 +1361,6 @@ function bucketMergedRows(merged, seriesDefs, groupKey, aggKey) {
   return out;
 }
 
-// One of the four canonical axes. Mirrors normSeriesAxis4() in
-// DashboardWidgets.jsx so the edge and the web view agree on what an axis
-// is; legacy configs that stored only "left"/"right" keep working.
-//
-// MODULE scope on purpose: renderSeriesElement() below is a separate
-// top-level function, and a copy living inside ChartWidget would be a
-// ReferenceError there - the exact "X is not defined" class that only
-// shows up at runtime (2026-10-17).
-const liteAxisId = (a) => {
-  const v = String(a || "left1").trim().toLowerCase();
-  if (v === "left2" || v === "right2" || v === "right1" || v === "left1") return v;
-  return v === "right" ? "right1" : "left1";
-};
 
 const LITE_AXIS_CFG = {
   left1:  { label: "y_axis_label",       unit: "primary_unit",

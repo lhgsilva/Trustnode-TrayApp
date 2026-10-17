@@ -169,6 +169,31 @@ check("  every axis key set is complete",
       "a manual axis with no tick step still needs the key to exist")
 
 print()
+print("[5c. the axis survives the SERIES BUILDER, not just the renderer]")
+# 2026-10-17, third pass. Making renderSeriesElement four-way was not enough:
+# widgetAllSeries() and the limit-line extractor both did
+#     axis: String(s.axis || "left").toLowerCase() === "right" ? "right" : "left"
+# so every series was flattened to left/right BEFORE the chart saw it. "left2"
+# arrived as "left", and "right2" - which is not exactly "right" - landed on
+# the LEFT. The renderer was correct and the data reaching it was not.
+_collapse = '=== "right" ? "right" : "left"'
+_code = chr(10).join(ln for ln in LITE.splitlines()
+                     if not ln.strip().startswith("//"))
+check("no series is collapsed to two axes any more",
+      _collapse not in _code,
+      "a four-way renderer fed two-way data still draws on the wrong scale")
+check("  the series builder normalises four-way",
+      "axis: liteAxisId(s.axis)" in LITE,
+      "widgetAllSeries must keep left2/right2")
+check("  and so does the limit-line builder",
+      LITE.count("axis: liteAxisId(s.axis)") >= 2,
+      "a limit drawn against the wrong scale is worse than no limit: found %d"
+      % LITE.count("axis: liteAxisId(s.axis)"))
+check("  the series live under series_extra, which is what the edge writes",
+      "cfg.series_extra" in LITE,
+      "the saved widgets carry their extra series there, not under `series`")
+
+print()
 print("[6. the edge side is unchanged]")
 check("the edge still normalises 4-way", "function normSeriesAxis4(" in EDGE)
 check("  and still carries its per-axis unit map",
