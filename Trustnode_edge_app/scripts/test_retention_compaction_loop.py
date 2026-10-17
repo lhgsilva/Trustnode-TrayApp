@@ -162,5 +162,67 @@ check("  and the engine runs incremental_vacuum after a prune",
       "this is what stops the freelist growing back")
 
 print()
+print("[7. a NEW database can give its pages back]")
+# 2026-10-17, asked: "check if with a new install the database is sanitized
+# and lighter". It was not: nothing set auto_vacuum, so a fresh install was
+# created with auto_vacuum=NONE and would bloat exactly like the one that
+# reached 14.87 GB. auto_vacuum can only be set BEFORE the first table
+# exists, so it has to happen at creation.
+import tempfile as _tf                                               # noqa: E402
+_fresh = os.path.join(_tf.mkdtemp(prefix="tn-fresh-"), "new_store.db")
+os.environ["TRUSTNODE_APP_STORE_PATH"] = _fresh
+from app.services.app_store import AppStore                          # noqa: E402
+
+_store = AppStore()
+_c = sqlite3.connect(f"file:{_fresh}?mode=ro", uri=True)
+_av = int(_c.execute("PRAGMA auto_vacuum").fetchone()[0] or 0)
+_c.close()
+check("a newly created store is auto_vacuum=INCREMENTAL", _av == 2,
+      "got %d (0=NONE, 1=FULL, 2=INCREMENTAL) - NONE means deleted pages sit "
+      "on a freelist for ever and only a full rewrite reclaims them" % _av)
+
+# A POPULATED database must be left alone: VACUUMing a 14 GB store at boot
+# would be far worse than the bloat. Asserted behaviourally, not by grepping
+# for an implementation detail.
+_pop = os.path.join(_tf.mkdtemp(prefix="tn-pop-"), "existing.db")
+_pc = sqlite3.connect(_pop)
+_pc.execute("CREATE TABLE already_here(x)")
+_pc.executemany("INSERT INTO already_here VALUES (?)", [(i,) for i in range(200)])
+_pc.commit(); _pc.close()
+_before = os.path.getsize(_pop)
+_s2 = AppStore.__new__(AppStore)
+_s2._db_path = _pop
+AppStore._ensure_incremental_autovacuum(_s2)
+_pc = sqlite3.connect(f"file:{_pop}?mode=ro", uri=True)
+_av2 = int(_pc.execute("PRAGMA auto_vacuum").fetchone()[0] or 0)
+_rows = _pc.execute("SELECT COUNT(*) FROM already_here").fetchone()[0]
+_pc.close()
+# The case the VACUUM exists for: the file was already created and put into
+# WAL by an aborted start, but has no tables yet. page_count is then 1, and
+# SQLite ACCEPTS the auto_vacuum pragma while silently IGNORING it - so the
+# pragma alone is not enough and only the VACUUM makes it stick.
+_wal = os.path.join(_tf.mkdtemp(prefix="tn-wal-"), "halfborn.db")
+_wc = sqlite3.connect(_wal)
+_wc.execute("PRAGMA journal_mode=WAL")
+_wc.commit(); _wc.close()
+_s3 = AppStore.__new__(AppStore)
+_s3._db_path = _wal
+AppStore._ensure_incremental_autovacuum(_s3)
+_wc = sqlite3.connect(f"file:{_wal}?mode=ro", uri=True)
+_av3 = int(_wc.execute("PRAGMA auto_vacuum").fetchone()[0] or 0)
+_wc.close()
+check("  a WAL-touched but tableless file still converts", _av3 == 2,
+      "page_count is already 1 there, so the pragma alone is ignored - this "
+      "is what the VACUUM is for (auto_vacuum=%d)" % _av3)
+
+check("  a POPULATED database is left untouched", _av2 == 0,
+      "rewriting a 14 GB store at boot would be worse than the bloat "
+      "(auto_vacuum=%d)" % _av2)
+check("    and its rows are intact", _rows == 200, _rows)
+check("  and the compaction sets it on the copy it builds",
+      "PRAGMA auto_vacuum=INCREMENTAL" in SRC,
+      "that is how an EXISTING install gets it")
+
+print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))
 sys.exit(0 if not FAILS else 2)

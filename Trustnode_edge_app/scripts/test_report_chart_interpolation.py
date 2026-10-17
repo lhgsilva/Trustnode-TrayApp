@@ -135,6 +135,10 @@ def ser(tag, axis):
 
 
 def caption(section):
+    # 2026-10-17: the sample count is opt-IN now ("as default should
+    # be hidden"). These checks are ABOUT that caption's wording, so
+    # they ask for it explicitly.
+    section = dict(section, show_sample_caption=True)
     story: list = []
     _section_chart(dict(section), _build_styles(), story)
     out: list[str] = []

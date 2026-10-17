@@ -3436,7 +3436,7 @@ function SectionEditor({
                 Show X axis (timestamps)
               </label>
               <label className="tn-checkbox" title="The line under the chart reading '120 samples per series, 3 series'. Useful while building; noise in a customer report.">
-                <input type="checkbox" checked={section.show_sample_caption !== false}
+                <input type="checkbox" checked={section.show_sample_caption === true}
                        onChange={(e) => onChange({ show_sample_caption: e.target.checked })} />
                 Show sample count under the chart
               </label>

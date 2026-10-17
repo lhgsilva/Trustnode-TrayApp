@@ -2419,32 +2419,43 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
     # 2026-10-17, requested: hide "the number of the collected points in the
     # series". It is useful while building a template and noise in a report
     # that goes to a customer.
-    if section.get("show_sample_caption") is False:
-        _emit_block(section, block, story)
-        story.append(Spacer(1, 4 * mm))
-        return
+    # 2026-10-17, requested: "as default should be hidden". Opt-IN now, so a
+    # template that never sets the flag produces a clean report - nobody has
+    # to find a checkbox to stop a customer report carrying build-time
+    # diagnostics.
+    # 2026-10-17: the sample count is opt-IN ("as default should be
+    # hidden") - it is build-time detail, not something a customer report
+    # should carry.
+    #
+    # But two WARNINGS used to ride on the same line, and they are not
+    # detail: a chart drawn from almost no readings, and a section whose
+    # own trigger never fired so it is showing the REPORT's window instead.
+    # The second one under a heading like "Heating phase" is a wrong report
+    # unless it says so. Hiding the count must never hide those.
     total_samples = sum(len(p) for p in aligned)
-    n_series = len([s for s in series_meta if s.get("tag_name")])
-    # 2026-10-11, asked: "I have two differen section that are using the same
-    # main schedule report trigger but are loggin different number os samples
-    # why?" - they were not. Both had ten readings per series; one had three
-    # series and the other two, and this line reported the TOTAL, so the same
-    # data read as "30 samples" beside "20 samples". Say per series.
+    n_series = len([s_ for s_ in series_meta if s_.get("tag_name")])
     per = [len(p) for p in aligned if p]
-    if per and min(per) == max(per):
-        caption = (f"{per[0]} samples per series, {n_series} series "
-                   f"({total_samples} readings)")
-    else:
-        caption = (f"{total_samples} readings across {n_series} series "
-                   f"({min(per) if per else 0}-{max(per) if per else 0} each)")
-    if total_samples < 3:
-        caption += " - too few readings for a meaningful trend"
+    warnings: list[str] = []
+    if total_samples and total_samples < 3:
+        warnings.append("too few readings for a meaningful trend")
     if section.get("_trigger_fell_back"):
-        # Set by apply_section_triggers when the section's own trigger never
-        # became true: the chart then covers the SCHEDULE's window, and saying
-        # so is the difference between a trusted report and a wrong one.
-        caption += " (section trigger did not fire; showing the report window)"
-    block.append(Paragraph(caption, styles["section_caption"]))
+        warnings.append("section trigger did not fire; showing the report window")
+
+    if section.get("show_sample_caption") is True:
+        if per and min(per) == max(per):
+            caption = (f"{per[0]} samples per series, {n_series} series "
+                       f"({total_samples} readings)")
+        else:
+            caption = (f"{total_samples} readings across {n_series} series "
+                       f"({min(per) if per else 0}-{max(per) if per else 0} each)")
+        if warnings:
+            caption += " - " + "; ".join(warnings)
+    elif warnings:
+        caption = "; ".join(warnings)
+    else:
+        caption = ""
+    if caption:
+        block.append(Paragraph(caption, styles["section_caption"]))
     _emit_block(section, block, story)
     story.append(Spacer(1, 4 * mm))
 

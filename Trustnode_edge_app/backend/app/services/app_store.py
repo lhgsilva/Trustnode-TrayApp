@@ -4449,7 +4449,46 @@ class AppStore:
             except Exception:
                 pass
 
+    def _ensure_incremental_autovacuum(self) -> None:
+        """Make a NEW store reclaim deleted pages. No-op on a populated one."""
+        try:
+            path = self._db_path
+            if not path or path == ":memory:":
+                return
+            conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
+            try:
+                tables = int(conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+                ).fetchone()[0] or 0)
+                if tables:
+                    return          # populated: the compaction path owns it
+                if int(conn.execute("PRAGMA auto_vacuum").fetchone()[0] or 0) == 2:
+                    return
+                conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                conn.execute("VACUUM")
+            finally:
+                conn.close()
+        except Exception:
+            # Never let this stop the store opening.
+            pass
+
     def _ensure_schema(self) -> None:
+        # 2026-10-17: a BRAND-NEW database is created with
+        # auto_vacuum=INCREMENTAL so deletes give their pages back. Without
+        # it SQLite parks every deleted page on a freelist for ever and only
+        # a full rewrite reclaims them - which is how a live install reached
+        # 14.87 GB with 13.23 GB of free pages and a pegged backend.
+        #
+        # This runs on its OWN connection, before the schema transaction:
+        #   * `with self._connect()` is a TRANSACTION context and VACUUM
+        #     cannot run inside one - it raises and the setting never sticks;
+        #   * journal_mode=WAL takes the file to one page, after which SQLite
+        #     ACCEPTS the auto_vacuum pragma and silently IGNORES it. The
+        #     VACUUM is what makes it stick, and on an empty file it is
+        #     instant.
+        # Existing installs get INCREMENTAL from the retention engine's
+        # compaction, which sets it on the copy it builds.
+        self._ensure_incremental_autovacuum()
         with self._lock:
             with self._connect() as conn:
                 # OEE module tables (2026-08-27). Created in the SAME
@@ -4469,6 +4508,18 @@ class AppStore:
                 # "no such column: tenant_id". Run these ALTERs first so the
                 # whole executescript can assume tenant_id is always present.
                 self._pre_migrate_tenant_columns(conn)
+                # 2026-10-17: a BRAND-NEW database is created with
+                # auto_vacuum=INCREMENTAL so deletes can give their pages
+                # back. Without it SQLite keeps every deleted page on a
+                # freelist for ever and only a full rewrite reclaims them -
+                # which is how a live install reached 14.87 GB with 13.23 GB
+                # of free pages and a backend pegged servicing it.
+                #
+                # auto_vacuum can ONLY be set before the first table exists;
+                # on a populated file the PRAGMA is silently ignored, so this
+                # is deliberately a new-file-only measure. Existing installs
+                # get INCREMENTAL from the retention engine's compaction,
+                # which sets it on the copy it builds.
                 conn.executescript(
                     """
                     PRAGMA journal_mode=WAL;

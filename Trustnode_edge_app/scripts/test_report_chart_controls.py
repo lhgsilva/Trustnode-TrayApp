@@ -398,8 +398,32 @@ print("[the sample-count caption is optional]")
 _caps_on = [c for c in paragraph_texts(SECTION) if "samples" in c]
 _caps_off = [c for c in paragraph_texts(dict(SECTION, show_sample_caption=False))
              if "samples" in c]
-check("it is shown by default", bool(_caps_on), _caps_on)
-check("  show_sample_caption=false removes it", not _caps_off, _caps_off)
+# 2026-10-17: "as default should be hidden". Opt-IN, so a template that
+# never sets the flag produces a clean report without anyone hunting for a
+# checkbox.
+check("it is HIDDEN by default", not _caps_on,
+      "a report going to a customer should not carry build-time diagnostics: "
+      "%s" % (_caps_on,))
+_caps_on_explicit = [c for c in paragraph_texts(dict(SECTION, show_sample_caption=True))
+                     if "samples" in c]
+check("  show_sample_caption=true brings it back", bool(_caps_on_explicit),
+      _caps_on_explicit)
+check("  and false keeps it hidden", not _caps_off, _caps_off)
+
+# The count is detail. These two are WARNINGS and must survive it being
+# hidden - a chart of the whole report window under a heading like "Heating
+# phase" is a wrong report unless it says so.
+_thin = paragraph_texts(lone)
+check("  a thin-data warning still shows with the count hidden",
+      any("too few readings" in c for c in _thin),
+      "hiding build-time detail must not hide a correctness warning: %s"
+      % (_thin,))
+_fell = paragraph_texts(dict(SECTION, _trigger_fell_back=True))
+check("  so does the fallen-back-trigger warning",
+      any("did not fire" in c for c in _fell), _fell)
+check("    and a healthy chart stays silent",
+      not [c for c in paragraph_texts(SECTION) if "too few" in c or "did not fire" in c],
+      "a warning on every chart is a warning nobody reads")
 check("  the chart itself still renders",
       len([x for x in shapes_of(dict(SECTION, show_sample_caption=False))
            if isinstance(x, Line) and not x.strokeDashArray]) > 10)
