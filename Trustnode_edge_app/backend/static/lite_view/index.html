@@ -1340,6 +1340,20 @@ function bucketMergedRows(merged, seriesDefs, groupKey, aggKey) {
   return out;
 }
 
+// One of the four canonical axes. Mirrors normSeriesAxis4() in
+// DashboardWidgets.jsx so the edge and the web view agree on what an axis
+// is; legacy configs that stored only "left"/"right" keep working.
+//
+// MODULE scope on purpose: renderSeriesElement() below is a separate
+// top-level function, and a copy living inside ChartWidget would be a
+// ReferenceError there - the exact "X is not defined" class that only
+// shows up at runtime (2026-10-17).
+const liteAxisId = (a) => {
+  const v = String(a || "left1").trim().toLowerCase();
+  if (v === "left2" || v === "right2" || v === "right1" || v === "left1") return v;
+  return v === "right" ? "right1" : "left1";
+};
+
 function ChartWidget({ widget, liveByKey }) {
   const cfg = widget?.config || {};
   const widgetType = String(widget?.type || "line_chart");
@@ -1385,6 +1399,41 @@ function ChartWidget({ widget, liveByKey }) {
     fmtByKey[s.id] = fmt;
   }
   const fmtDefault = (v) => fmtVal(v);
+
+  // 2026-10-17, reported: "the configuration of multiple Y axis and units
+  // are not replicating to the web client view".
+  //
+  // They could not: Lite mapped every series with
+  // `s.axis === "right" ? "right" : "left"`, so a series the operator put on
+  // Left 2 or Right 2 silently landed on Left 1 - sharing a scale it has
+  // nothing to do with and drawing a plausible, wrong line. Units were not
+  // read at all (zero references to any *_unit key in this file).
+  //
+  // This mirrors normSeriesAxis4() in DashboardWidgets.jsx so both surfaces
+  // agree on what an axis is. Legacy "left"/"right" keep working.
+  // Per-axis label + unit, using the SAME config keys the edge writes.
+  const LITE_AXIS_CFG = {
+    left1:  { label: "y_axis_label",       unit: "primary_unit" },
+    right1: { label: "y_axis_right_label", unit: "y_axis_right_unit" },
+    left2:  { label: "y_left2_label",      unit: "y_left2_unit" },
+    right2: { label: "y_right2_label",     unit: "y_right2_unit" },
+  };
+  const axisUnit = (id) => String(cfg[LITE_AXIS_CFG[id].unit] || "").trim();
+  const axisLabel = (id) => {
+    const lbl = String(cfg[LITE_AXIS_CFG[id].label] || "").trim();
+    const u = axisUnit(id);
+    if (lbl && u) return lbl + " (" + u + ")";
+    return lbl || u;
+  };
+  // Only draw an axis something is actually on; left1 is the fallback so a
+  // chart always has one scale.
+  const axesUsed = (() => {
+    const used = new Set();
+    seriesDefs.forEach((sd) => used.add(liteAxisId(sd.axis)));
+    limitLines.forEach((l) => used.add(liteAxisId(l.axis)));
+    if (!used.size) used.add("left1");
+    return ["left1", "left2", "right1", "right2"].filter((a) => used.has(a));
+  })();
 
   const labelFmt = (v) => merged.find((p) => p.idx === v)?.ts || String(v);
   const hasRightAxis = seriesDefs.some((s) => s.axis === "right")
@@ -1448,18 +1497,29 @@ function ChartWidget({ widget, liveByKey }) {
     h(buildChartRoot(widgetType, seriesDefs.length), { data: merged, margin },
       h(CartesianGrid, { stroke: "var(--line, rgba(255,255,255,0.07))", strokeDasharray: "3 3" }),
       h(XAxis, buildXAxisProps(merged, cfg)),
-      h(YAxis, {
-        ...leftYProps, yAxisId: "left",
-        label: leftAxisLabel
-          ? { value: leftAxisLabel, angle: -90, position: "insideLeft", fill: "var(--muted, #8a98ab)", fontSize: 11 }
-          : undefined,
+      ...axesUsed.map((id) => {
+        const isRight = id === "right1" || id === "right2";
+        const base = isRight ? rightYProps : leftYProps;
+        const lbl = axisLabel(id);
+        const u = axisUnit(id);
+        return h(YAxis, {
+          ...base,
+          key: id,
+          yAxisId: id,
+          orientation: isRight ? "right" : "left",
+          // The second axis on a side sits OUTBOARD of the first, or the
+          // two draw on top of each other.
+          ...(id === "left2" || id === "right2" ? { mirror: false } : {}),
+          // The unit rides on the TICKS here (the edge does the same), so a
+          // reader can tell kW from degC without hunting for the legend.
+          tickFormatter: u ? ((v) => fmtVal(v) + u) : base.tickFormatter,
+          label: lbl
+            ? { value: lbl, angle: isRight ? 90 : -90,
+                position: isRight ? "insideRight" : "insideLeft",
+                fill: "var(--muted, #8a98ab)", fontSize: 11 }
+            : undefined,
+        });
       }),
-      hasRightAxis ? h(YAxis, {
-        ...rightYProps, yAxisId: "right", orientation: "right",
-        label: rightAxisLabel
-          ? { value: rightAxisLabel, angle: 90, position: "insideRight", fill: "var(--muted, #8a98ab)", fontSize: 11 }
-          : undefined,
-      }) : null,
       h(Tooltip, {
         ...chartTooltipProps,
         labelFormatter: labelFmt,
@@ -1477,7 +1537,7 @@ function ChartWidget({ widget, liveByKey }) {
         h(ReferenceLine, {
           key: ll.id,
           y: ll.value,
-          yAxisId: ll.axis,
+          yAxisId: liteAxisId(ll.axis),
           stroke: ll.color,
           strokeWidth: ll.width,
           strokeDasharray: ll.dash,
@@ -1517,7 +1577,7 @@ function renderSeriesElement(s, widgetType, interpolation = "monotone") {
   if (s.chart_type === "bar" || (widgetType === "bar_chart" && s.chart_type === "")) {
     const barProps = {
       key: s.id, dataKey: s.id, name: s.label,
-      yAxisId: s.axis === "right" ? "right" : "left",
+      yAxisId: liteAxisId(s.axis),
       isAnimationActive: false, fill: s.color,
     };
     if (Number.isFinite(s.bar_width) && s.bar_width > 0) barProps.barSize = s.bar_width;
@@ -1526,7 +1586,7 @@ function renderSeriesElement(s, widgetType, interpolation = "monotone") {
   if (s.chart_type === "area" || (widgetType === "line_area_chart" && s.chart_type === "")) {
     return h(Area, {
       key: s.id, dataKey: s.id, name: s.label,
-      yAxisId: s.axis === "right" ? "right" : "left",
+      yAxisId: liteAxisId(s.axis),
       type: interpolation, stroke: s.color, fill: s.color + "33",
       strokeWidth, dot: dotProp, isAnimationActive: false, connectNulls: false,
     });
@@ -1534,7 +1594,7 @@ function renderSeriesElement(s, widgetType, interpolation = "monotone") {
   // default: line
   return h(Line, {
     key: s.id, dataKey: s.id, name: s.label,
-    yAxisId: s.axis === "right" ? "right" : "left",
+    yAxisId: liteAxisId(s.axis),
     type: interpolation, stroke: s.color, strokeWidth,
     dot: dotProp, isAnimationActive: false, connectNulls: false,
   });

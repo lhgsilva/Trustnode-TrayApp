@@ -174,6 +174,9 @@ SOURCE_CHECKS = [
     # 2026-10-17: compaction deleted its own staged result every tick, so the
     # store never shrank, the engine ran continuously and collection starved.
     ("compaction keeps its result", "test_retention_compaction_loop.py"),
+    # 2026-10-17: Lite collapsed 4 Y axes to 2 and ignored every unit key, so
+    # a dashboard profile rendered differently in the web client view.
+    ("lite chart axes match the edge", "test_lite_chart_axes.py"),
 ]
 
 # --------------------------------------------------------------- containment
