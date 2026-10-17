@@ -171,6 +171,9 @@ SOURCE_CHECKS = [
     # localStorage and an empty local store. The shipped bundle is the only
     # thing that knows where to send the code.
     ("fresh install can activate", "test_fresh_install_activation.py"),
+    # 2026-10-17: compaction deleted its own staged result every tick, so the
+    # store never shrank, the engine ran continuously and collection starved.
+    ("compaction keeps its result", "test_retention_compaction_loop.py"),
 ]
 
 # --------------------------------------------------------------- containment

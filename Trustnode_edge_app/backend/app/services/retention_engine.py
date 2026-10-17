@@ -62,7 +62,12 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
 
 
 RETENTION_BOOT_DELAY_S = _env_int("TRUSTNODE_RETENTION_BOOT_DELAY_S", 300, 5, 3600)
-RETENTION_TICK_S = _env_int("TRUSTNODE_RETENTION_TICK_S", 60, 10, 3600)
+# 2026-10-17: was 60s. Retention deletes data that is hours or days old -
+# there is nothing a minute-by-minute tick can do that a half-hourly one
+# cannot, and each tick costs a rollup pass plus a freelist check on the
+# whole file. At 60s a 44s compaction left the engine running essentially
+# continuously. Still env-overridable for a site that wants it tighter.
+RETENTION_TICK_S = _env_int("TRUSTNODE_RETENTION_TICK_S", 1800, 10, 86400)
 # Rollup reads one source chunk at a time so a single statement stays short.
 ROLLUP_CHUNK_S = _env_int("TRUSTNODE_RETENTION_ROLLUP_CHUNK_S", 3600, 60, 86400)
 # Adaptive delete batch bounds. Start small; grow while batches stay fast.
@@ -1130,6 +1135,28 @@ def apply_pending_db_swap(db_path: str) -> Optional[str]:
                     pass
             note = f"{kind} applied at startup"
             print(f"[trustnode][retention] {note} ({os.path.basename(candidate)})", flush=True)
+            # 2026-10-17: the superseded database is kept as `.pre_<kind>_<stamp>`
+            # so a bad swap can be undone - but nothing ever removed the older
+            # ones. On a live install two were found holding 11.8 GB and 5.3 GB,
+            # more disk than the database itself. Keep the newest (the one just
+            # made) and drop the rest.
+            try:
+                folder = os.path.dirname(db_path) or "."
+                stem = os.path.basename(db_path) + f".pre_{kind}_"
+                olds = sorted(
+                    (f for f in os.listdir(folder) if f.startswith(stem)),
+                    reverse=True)
+                for name in olds[1:]:
+                    victim = os.path.join(folder, name)
+                    try:
+                        freed = os.path.getsize(victim)
+                        os.remove(victim)
+                        print("[trustnode][retention] removed superseded %s "
+                              "(%.2f GB reclaimed)" % (name, freed / 1e9), flush=True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
     except Exception as exc:  # pragma: no cover - defensive
         print(f"[trustnode][retention] pending swap check failed: {exc}", flush=True)
     return note
@@ -2069,12 +2096,34 @@ class RetentionEngine:
         except Exception:
             pass
         target = self.store.db_path + ".compacted"
-        for stale in (target, target + ".part"):
+
+        # 2026-10-17: this used to delete `target` before every run - so each
+        # tick DESTROYED the compaction the previous tick had staged for the
+        # next start. With a 60s tick and a 44s compaction the file could
+        # never survive long enough to be applied: the database stayed at
+        # 14.87 GB (89% free pages), every tick rebuilt a 1.6 GB copy, and
+        # the process burned a core continuously while collection starved.
+        #
+        # A staged copy is WORK ALREADY DONE. Leave it alone and say so.
+        if os.path.exists(target):
             try:
-                if os.path.exists(stale):
-                    os.remove(stale)
+                staged_size = os.path.getsize(target)
             except Exception:
-                pass
+                staged_size = 0
+            return {
+                "ok": True, "staged": True, "already_staged": True,
+                "size_before_bytes": src_size, "size_after_bytes": staged_size,
+                "reclaimed_bytes": max(0, src_size - staged_size),
+                "message": ("A compacted copy is already staged (%.2f GB). It is "
+                            "applied the next time TrustNode starts - restart to "
+                            "reclaim the space." % (staged_size / 1e9)),
+            }
+        # Only a half-written attempt is safe to clear.
+        try:
+            if os.path.exists(target + ".part"):
+                os.remove(target + ".part")
+        except Exception:
+            pass
         t0 = time.time()
         try:
             conn = self.store.connect(readonly=True, timeout=60.0)
