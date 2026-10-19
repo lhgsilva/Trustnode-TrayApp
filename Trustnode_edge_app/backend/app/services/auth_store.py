@@ -88,13 +88,57 @@ def _resolve_db_path() -> Path:
     data_dir_env = os.environ.get("TRUSTNODE_DATA_DIR", "").strip()
     if data_dir_env:
         data_dir = Path(data_dir_env)
-    elif sys.platform == "win32":
-        program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
-        data_dir = Path(program_data) / "TrustNode" / "edge"
     else:
-        data_dir = Path.home() / ".trustnode_edge" / "data"
+        data_dir = _data_dir_of_the_live_app_store()
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir / _AUTH_DB_NAME
+
+
+def _data_dir_of_the_live_app_store() -> Path:
+    """The directory holding the app store this install actually uses.
+
+    2026-10-19, reported: "Your session has ended" on every start, and
+    "Configuration not loaded ... Session expired".
+
+    The JWT signing secret lives in the auth DB. This function used to default
+    straight to %ProgramData%/TrustNode/edge on Windows, while app_store
+    defaults there and then calls _adopt_legacy_store(), which moves it to the
+    workspace the operator is really on. So the two could land in DIFFERENT
+    directories, each with its OWN secret - measured on this machine:
+
+        ~/.trustnode_edge/data/trustnode_auth.db        8dc55a10305fa266
+        %ProgramData%/TrustNode/edge/trustnode_auth.db  9db5478113af8789
+
+    A token signed by one is rejected by the other, so a restart that
+    resolved differently invalidated every session - which is exactly what
+    "sign in again" at startup is. The app kept collecting because only the
+    SCREEN lost its session.
+
+    The auth DB must therefore sit beside the app store that is LIVE, not
+    beside a path we hope is live. Both candidates routinely exist (a
+    re-activated install has both), so pick by which app store was written
+    most recently - the same question rule 1 asks about any .db here.
+    """
+    candidates: list[Path] = []
+    if sys.platform == "win32":
+        program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+        candidates.append(Path(program_data) / "TrustNode" / "edge")
+    candidates.append(Path.home() / ".trustnode_edge" / "data")
+
+    best: Path | None = None
+    best_mtime = -1.0
+    for d in candidates:
+        store = d / "trustnode_app_store.db"
+        try:
+            if store.is_file():
+                mtime = store.stat().st_mtime
+                if mtime > best_mtime:
+                    best, best_mtime = d, mtime
+        except OSError:
+            continue
+    # No app store anywhere yet (a genuinely fresh install): keep the
+    # platform default so first-run behaviour is unchanged.
+    return best or candidates[0]
 
 
 def _utc_now() -> str:
