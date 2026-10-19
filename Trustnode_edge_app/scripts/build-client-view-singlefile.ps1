@@ -54,7 +54,7 @@ try {
     Pop-Location
 }
 
-$builtIndex = Join-Path $frontendRoot "dist_client_view\index.html"
+$builtIndex = Join-Path (Join-Path $frontendRoot "dist_client_view") "index.html"
 if (-not (Test-Path $builtIndex)) {
     throw "Expected single-file output at $builtIndex but it was not produced."
 }

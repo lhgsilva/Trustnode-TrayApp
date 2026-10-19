@@ -167,6 +167,29 @@ def main() -> int:
     (OUT / "config.json").write_text(
         json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="")
 
+    # config.json.example is what CI ships and what a self-hoster copies.
+    # build-web-cloud-readonly.ps1 deletes the whole web_cloud_readonly tree
+    # on every release build, so it has to be REWRITTEN here or it quietly
+    # disappears - which is what happened in 582a402. The CI job has failed on
+    # `git show HEAD:.../config.json.example` ever since, and because
+    # deploy-vps `needs: build-and-test`, EVERY deploy was skipped. The VPS
+    # went stale for months and nothing said why.
+    #
+    # Redacted on purpose: the anon key is public by design, but a template
+    # should never carry a live one.
+    example = dict(cfg)
+    example["_comment"] = (
+        "Copy this file to config.json and fill in real values. Both "
+        "supabase_url and supabase_anon_key are PUBLIC by design - security "
+        "comes from RLS, not from hiding these. customer_label is shown in "
+        "the header. tenant_id is informational only (RLS still enforces it "
+        "from the user's lite_profiles row).")
+    example["supabase_anon_key"] = "REPLACE_WITH_YOUR_ANON_KEY"
+    (OUT / "config.json.example").write_text(
+        json.dumps(example, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8", newline="")
+    print("  + config.json.example (redacted template)")
+
     print("\nBundle ready at %s" % OUT)
     return 0
 

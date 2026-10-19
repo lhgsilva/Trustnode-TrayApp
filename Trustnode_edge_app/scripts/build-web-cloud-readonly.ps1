@@ -81,7 +81,7 @@ if ($LASTEXITCODE -ne 0) {
 # The build must have produced THIS bundle. Without this check a silent
 # mis-targeted build is indistinguishable from a successful one, which is
 # exactly how the stale copy shipped.
-$builtIndex = Join-Path $frontendRoot "dist_cloud_readonly\index.html"
+$builtIndex = Join-Path (Join-Path $frontendRoot "dist_cloud_readonly") "index.html"
 if (-not (Test-Path $builtIndex)) {
     Pop-Location
     throw "Cloud web build wrote no dist_cloud_readonly - refusing to ship a stale bundle."
@@ -99,7 +99,7 @@ if (Test-Path $outputRoot) {
     Remove-Item -Recurse -Force $outputRoot
 }
 New-Item -ItemType Directory -Path $outputRoot | Out-Null
-Copy-Item -Recurse -Force (Join-Path $frontendRoot "dist_cloud_readonly\*") $outputRoot
+Copy-Item -Recurse -Force (Join-Path (Join-Path $frontendRoot "dist_cloud_readonly") "*") $outputRoot
 
 # Create dedicated standalone portal entry path, outside the main app route flow.
 # Operator 2026-06-21: rewrite relative asset paths (./assets/...) to absolute
