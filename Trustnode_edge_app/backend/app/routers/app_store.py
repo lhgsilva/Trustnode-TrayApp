@@ -295,7 +295,10 @@ class RetentionPolicyPayload(BaseModel):
     minute_keep_minutes: int = 0
     hour_keep_minutes: int = 0
     day_keep_minutes: int = 0
-    backup_before_cleanup: bool = True
+    # 2026-10-19: default OFF. A cleanup used to copy the whole
+    # database first without being asked - 13.85 GB on one install.
+    # Turning it on is now a deliberate choice in the backup policy.
+    backup_before_cleanup: bool = False
     max_delete_rows_per_run: int = 50000
 
 

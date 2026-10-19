@@ -4824,7 +4824,7 @@ class AppStore:
                       minute_keep_minutes INTEGER NOT NULL DEFAULT 0,
                       hour_keep_minutes INTEGER NOT NULL DEFAULT 0,
                       day_keep_minutes INTEGER NOT NULL DEFAULT 0,
-                      backup_before_cleanup INTEGER NOT NULL DEFAULT 1,
+                      backup_before_cleanup INTEGER NOT NULL DEFAULT 0,
                       max_delete_rows_per_run INTEGER NOT NULL DEFAULT 50000,
                       updated_utc TEXT NOT NULL
                     );
@@ -5960,7 +5960,7 @@ class AppStore:
                         "minute_keep_minutes": 0,
                         "hour_keep_minutes": 0,
                         "day_keep_minutes": 0,
-                        "backup_before_cleanup": True,
+                        "backup_before_cleanup": False,
                         "max_delete_rows_per_run": 50000,
                     }
                 # Tolerate older rows that predate the *_keep_minutes columns
@@ -6006,7 +6006,7 @@ class AppStore:
                 "minute_keep_minutes": _nonneg("minute_keep_minutes"),
                 "hour_keep_minutes": _nonneg("hour_keep_minutes"),
                 "day_keep_minutes": _nonneg("day_keep_minutes"),
-                "backup_before_cleanup": bool(payload.get("backup_before_cleanup", current.get("backup_before_cleanup", True))),
+                "backup_before_cleanup": bool(payload.get("backup_before_cleanup", current.get("backup_before_cleanup", False))),
                 "max_delete_rows_per_run": max(1000, int(payload.get("max_delete_rows_per_run", current.get("max_delete_rows_per_run", 50000)))),
             },
         }
@@ -6239,7 +6239,12 @@ class AppStore:
 
         try:
             with self._lock:
-                if not dry_run and bool(policy.get("backup_before_cleanup", True)):
+                # 2026-10-19: this copied the ENTIRE database before every
+                # cleanup unless the policy explicitly said otherwise - the
+                # opposite of what an operator expects, and the default was
+                # True in four separate places. A backup is now something you
+                # ask for, so an absent flag means NO.
+                if not dry_run and bool(policy.get("backup_before_cleanup", False)):
                     backup_dir = os.path.join(os.path.dirname(self._db_path), "backups")
                     os.makedirs(backup_dir, exist_ok=True)
                     backup_path = os.path.join(backup_dir, f"trustnode_app_store_{now_dt.strftime('%Y%m%d_%H%M%S')}.db")

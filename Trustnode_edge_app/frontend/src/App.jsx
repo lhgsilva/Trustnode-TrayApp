@@ -4392,7 +4392,10 @@ function AppShell() {
     minute_keep_days: 30,
     hour_keep_days: 180,
     day_keep_days: 730,
-    backup_before_cleanup: true,
+    // 2026-10-19: default OFF, matching the backend. With this true the UI
+    // sent "back up first" on every save whether or not anyone asked, and a
+    // cleanup copied the whole database - 13.85 GB on one install.
+    backup_before_cleanup: false,
     max_delete_rows_per_run: 50000
   });
   const [retentionPresetKey, setRetentionPresetKey] = useState("week");

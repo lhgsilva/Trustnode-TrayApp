@@ -110,82 +110,56 @@ function describePolicyPlain(policy) {
 
 /* What the databases actually weigh. Kept deliberately blunt: a size, how much
    of it is dead space, and whether anything is cleaning up on its own. */
-function StorageStatusCard({ status, onRefresh, busy }) {
+// The CLOUD copy only.
+//
+// 2026-10-19, reported: "the database and retention page is not showing all
+// the information correct ... no duplicated data ... has to be minimum
+// information for the users to not get confused".
+//
+// This card used to repeat four things the Storage table below already
+// shows - database size, reading count, dead space and whether a policy is
+// active - from a SECOND endpoint. When that endpoint was slow or failed the
+// page said "0 MB / 0 readings / no policy" directly above a table reading
+// "13.49 GB / 17,306,633 readings / Lean - Active". Two sources for one fact
+// is how a page contradicts itself.
+//
+// The edge's own numbers now come from one place (the Storage table). What
+// is left here is the only thing that table does NOT know: the cloud
+// database, which lives on another machine entirely. It renders nothing at
+// all when no cloud database is configured.
+function CloudSizeStrip({ status, onRefresh, busy }) {
+  const cloud = status?.cloud || {};
+  if (!status || cloud.configured === false) return null;
   const gb = (n) => {
     const v = Number(n || 0);
     if (!Number.isFinite(v) || v <= 0) return "0 MB";
     return v >= 1e9 ? `${(v / 1e9).toFixed(2)} GB` : `${Math.round(v / 1e6)} MB`;
   };
-  const local = status?.local || {};
-  const cloud = status?.cloud || {};
-  const ret = status?.retention || {};
-  const deadPct = Number(local.dead_pct || 0);
   return (
     <section className="card" style={{ marginBottom: 12 }}>
       <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
-        <h4 className="wcfg-card-title" style={{ margin: 0 }}>Database size</h4>
+        <h4 className="wcfg-card-title" style={{ margin: 0 }}>Cloud database</h4>
         <button type="button" className="btn btn-sm" onClick={onRefresh} disabled={busy}>
           {busy ? "Checking…" : "Refresh"}
         </button>
       </div>
-
-      <div className="trigger-form-grid" style={{ marginTop: 8 }}>
-        <div>
-          <strong>This edge</strong>
-          <div>{local.error ? local.error : gb(local.file_bytes)}</div>
-          {local.error ? null : (
-            <div className="dashboard-query-hint">
-              {Number(local.historian_rows || 0).toLocaleString()} readings
-              {local.oldest ? ` · from ${String(local.oldest).slice(0, 16)}` : ""}
-            </div>
-          )}
-        </div>
-        <div>
-          <strong>Dead space</strong>
-          <div style={deadPct >= 25 ? { color: "var(--warning, #d97706)" } : undefined}>
-            {gb(local.dead_bytes)} ({deadPct}%)
-          </div>
-          <div className="dashboard-query-hint">
-            {deadPct >= 25
-              ? "A compact would return this to the disk."
-              : "Deleted pages SQLite reuses; nothing to reclaim yet."}
-          </div>
-        </div>
-        <div>
-          <strong>Cloud database</strong>
-          <div>
-            {cloud.configured === false ? "not configured"
-              : cloud.error ? cloud.error : gb(cloud.database_bytes)}
-          </div>
-          {cloud.configured && !cloud.error ? (
-            <div className="dashboard-query-hint">
-              {Number(cloud.historian_rows || 0).toLocaleString()} readings in the historian
-            </div>
-          ) : null}
-        </div>
-        <div>
-          <strong>Automatic cleanup</strong>
-          <div>{ret.active ? (ret.raw_keep ? `keeps ${ret.raw_keep}` : "on") : "no policy"}</div>
-          <div className="dashboard-query-hint">
-            {ret.auto_compact ? "reclaims disk" : "disk reclaim OFF"}
-            {" · "}
-            {ret.cloud_enabled ? `cloud keeps ${ret.cloud_keep || "?"}` : "cloud never pruned"}
-          </div>
-        </div>
+      <div style={{ marginTop: 6 }}>
+        {cloud.error ? cloud.error : gb(cloud.database_bytes)}
+        {cloud.error ? null : (
+          <span className="dashboard-query-hint">
+            {" · "}{Number(cloud.historian_rows || 0).toLocaleString()} readings
+          </span>
+        )}
       </div>
-
       {/* The historian is the usual culprit but not always: on 2026-08-31 the
           cloud database was still 20 GB with the historian emptied. */}
       {Array.isArray(cloud.tables) && cloud.tables.length ? (
-        <div style={{ marginTop: 8 }}>
-          <div className="dashboard-query-hint">Largest cloud tables</div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 4 }}>
-            {cloud.tables.slice(0, 6).map((t) => (
-              <span key={t.name} className="pill" title={t.name}>
-                {t.name}: {gb(t.bytes)}
-              </span>
-            ))}
-          </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 6 }}>
+          {cloud.tables.slice(0, 6).map((t) => (
+            <span key={t.name} className="pill" title={t.name}>
+              {t.name}: {gb(t.bytes)}
+            </span>
+          ))}
         </div>
       ) : null}
     </section>
@@ -380,7 +354,7 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
     <>
       {/* The sizes, above the settings that control them: "your database is
           large" and "here is the switch that keeps it small" belong together. */}
-      <StorageStatusCard status={storage} onRefresh={loadStorage} busy={storageBusy} />
+      <CloudSizeStrip status={storage} onRefresh={loadStorage} busy={storageBusy} />
       {/* ---------------------------------------------------- 1. STORAGE */}
       <section className="card">
         <div className="row backup-card-header">
@@ -634,7 +608,7 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
           report templates and licence — small enough to keep many.{" "}
           <strong>Full</strong> backups add the recorded history.
           {!active
-            ? " Settings are backed up daily by default (14 kept), even without a retention policy."
+            ? " Automatic backups are OFF until you turn them on in a retention policy — nothing is written on its own."
             : active.backups?.enabled
               ? ` Automatic: settings daily (keeping ${active.backups.config_daily_keep})${
                   active.backups.historian_weekly_keep

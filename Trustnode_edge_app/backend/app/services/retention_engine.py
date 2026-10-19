@@ -213,8 +213,16 @@ DEFAULT_CLOUD = {
     "max_batches_per_run": 50,
 }
 
+# 2026-10-19, reported: "it should not making backups automatcly unless set
+# in the policy of backups (need to have these option)".
+#
+# `enabled` was True with no policy anywhere - the page even said so out
+# loud: "Settings are backed up daily by default (14 kept), even without a
+# retention policy." An operator who had never opened this page was still
+# having copies written for them. Automatic backups are now something you
+# switch ON; the keep-counts below only apply once you have.
 DEFAULT_BACKUPS = {
-    "enabled": True,
+    "enabled": False,
     "config_daily_keep": 14,         # small (MB) — safe to keep many
     "historian_weekly_keep": 0,      # 0 = off (a full historian copy is GBs)
     "location": "",                  # "" = <data_dir>/backups
@@ -348,7 +356,9 @@ def validate_policy(raw: Dict[str, Any]) -> Dict[str, Any]:
     bk_in = raw.get("backups") if isinstance(raw.get("backups"), dict) else {}
     backups = dict(DEFAULT_BACKUPS)
     backups.update({
-        "enabled": bool(bk_in.get("enabled", True)),
+        # Absent means OFF here too: a policy saved before this flag existed
+        # must not silently keep writing daily copies.
+        "enabled": bool(bk_in.get("enabled", False)),
         "config_daily_keep": _norm_int(bk_in.get("config_daily_keep"), 14, 0, 365),
         "historian_weekly_keep": _norm_int(bk_in.get("historian_weekly_keep"), 0, 0, 52),
         "location": str(bk_in.get("location") or "").strip(),
@@ -1080,6 +1090,63 @@ class BackupManager:
             return {"filename": "(unknown)", "kind": "?"}
 
 
+def _drop_proven_safety_copies(db_path: str) -> None:
+    """Remove `.pre_<kind>_<stamp>` copies the live database has outlived.
+
+    2026-10-19, reported: "it should not be making backups automatically
+    unless set in the policy of backups". One of these was 13.85 GB on a disk
+    with 35 GB free - more than the live database itself.
+
+    A swap keeps the displaced database so a bad one can be undone. That undo
+    is worth having for minutes, not for ever: once the app has STARTED again
+    on the swapped file, the swap has proven itself and the copy is dead
+    weight. This runs at boot, before anything opens the database, and only
+    when:
+
+      * no swap is pending (we are not mid-operation), and
+      * the live database passes an integrity check - if it does NOT, the
+        copy is the only way back and must be kept.
+
+    Nothing here is the operator's data: each file is a superseded copy of
+    the database that is still sitting right beside it.
+    """
+    folder = os.path.dirname(db_path) or "."
+    base = os.path.basename(db_path)
+    # Mid-operation? Then this boot is the swap, and the copy it makes is the
+    # one thing standing between us and a bad database.
+    for suffix in (".restore_pending", ".compacted"):
+        if os.path.exists(db_path + suffix):
+            return
+    if not os.path.exists(db_path):
+        return
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db_path.replace("\\", "/"),
+                              uri=True, timeout=10.0)
+        try:
+            if str(con.execute("PRAGMA quick_check(1)").fetchone()[0]).lower() != "ok":
+                return          # keep every copy: the live file is suspect
+        finally:
+            con.close()
+    except Exception:
+        return                  # cannot verify -> keep them
+    freed = 0
+    for name in sorted(os.listdir(folder)):
+        if not name.startswith(base + ".pre_"):
+            continue
+        victim = os.path.join(folder, name)
+        try:
+            size = os.path.getsize(victim)
+            os.remove(victim)
+            freed += size
+            print("[trustnode][retention] removed proven safety copy %s "
+                  "(%.2f GB reclaimed)" % (name, size / 1e9), flush=True)
+        except OSError:
+            pass
+    if freed:
+        print("[trustnode][retention] %.2f GB returned to the disk"
+              % (freed / 1e9), flush=True)
+
+
 def apply_pending_db_swap(db_path: str) -> Optional[str]:
     """Called at BOOT, before anything opens the database.
 
@@ -1089,6 +1156,10 @@ def apply_pending_db_swap(db_path: str) -> Optional[str]:
     the app from starting on the existing database.
     """
     note: Optional[str] = None
+    try:
+        _drop_proven_safety_copies(db_path)
+    except Exception:
+        pass            # reclaiming disk must never stop the app from starting
     try:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         for suffix, kind in ((".restore_pending", "restore"), (".compacted", "compaction")):
@@ -2003,7 +2074,10 @@ class RetentionEngine:
         cfg = dict(DEFAULT_BACKUPS)
         if policy:
             cfg.update(policy.get("backups") or {})
-        if not cfg.get("enabled", True):
+        # Absent means OFF, matching DEFAULT_BACKUPS. `enabled` defaulting to
+        # True here would have kept the old behaviour for every policy saved
+        # before the flag existed.
+        if not cfg.get("enabled", False):
             return []
         done: List[Dict[str, Any]] = []
         location = str(cfg.get("location") or "")
