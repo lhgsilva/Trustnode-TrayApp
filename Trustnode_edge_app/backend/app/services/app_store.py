@@ -64,6 +64,50 @@ def _thread_connection(db_path: str, *, readonly: bool = False,
     return conn
 
 
+def _store_is_writable(db_path: str) -> bool:
+    """Can SQLite actually WRITE this database?
+
+    Not the directory, and not the file's read-only attribute. In WAL mode
+    SQLite must also write the -wal and -shm sidecars, and on 2026-10-19
+    those two were the ones refusing the tray user while the directory AND
+    the .db itself both accepted writes:
+
+        create a file in the dir : ok
+        open the .db   r+b       : ok
+        open -wal/-shm r+b       : PermissionError [Errno 13]
+        sqlite write             : attempt to write a readonly database
+
+    os.access() saw none of it - on Windows it reports the read-only
+    attribute and ignores the ACL. BEGIN IMMEDIATE takes a real write lock
+    and changes nothing, which is the honest question to ask.
+    """
+    folder = os.path.dirname(db_path)
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        return False
+    if not os.path.exists(db_path):
+        # Nothing there yet, so the directory is the only thing that decides.
+        probe = os.path.join(folder, ".tn_write_probe")
+        try:
+            with open(probe, "wb") as fh:
+                fh.write(b"x")
+            os.remove(probe)
+            return True
+        except OSError:
+            return False
+    try:
+        con = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("ROLLBACK")
+            return True
+        finally:
+            con.close()
+    except Exception:
+        return False
+
+
 class AppStore:
     REQUIRED_CONFIG_DOMAINS: Dict[str, Any] = {
         "app_settings": {},
@@ -1122,6 +1166,26 @@ class AppStore:
                     data_dir = os.path.join(program_data, "TrustNode", "edge")
                 else:
                     data_dir = os.path.join(os.path.expanduser("~"), ".trustnode_edge", "data")
+                # 2026-10-19: the installer creates %ProgramData%\TrustNode\edge
+                # with "Authenticated Users:(OI)(CI)RX" so a customer's regular
+                # user cannot edit the SQLite. The tray app RUNS as that user,
+                # so the default store path is one it can read but never write:
+                # every start without TRUSTNODE_DATA_DIR died in _ensure_schema
+                # with "attempt to write a readonly database", before serving
+                # anything. Measured on the operator's machine 2026-10-19.
+                #
+                # os.access() cannot see this - on Windows it reports the
+                # read-only ATTRIBUTE, not the ACL, and it answered True for a
+                # directory that refused every write. The only honest test is
+                # to write a file.
+                if defaulted and not _store_is_writable(
+                        os.path.join(data_dir, "trustnode_app_store.db")):
+                    fallback = os.path.join(os.path.expanduser("~"),
+                                            ".trustnode_edge", "data")
+                    print("[trustnode] WARN: default store dir %s is not "
+                          "writable (installer ACL); using %s instead"
+                          % (data_dir, fallback), flush=True)
+                    data_dir = fallback
             os.makedirs(data_dir, exist_ok=True)
             base = os.path.join(data_dir, "trustnode_app_store.db")
             if sys.platform == "win32" and defaulted:
