@@ -17,7 +17,53 @@ from app.tenant import get_current_tenant, normalize_tenant_id
 # enrichment path tripped NameError → 500 on the license-check route.
 logger = logging.getLogger("trustnode.control_plane")
 
+import time as _time
+from collections import defaultdict as _defaultdict
+
+from app.services import recovery_codes
+
 router = APIRouter(prefix="/api/control-plane", tags=["control-plane"])
+
+#: One reply for every outcome of a public reset request. A response that
+#: differs for "no such user" is a free account-enumeration oracle, and this
+#: endpoint takes no credentials.
+_GENERIC_RESET_REPLY = (
+    "If that account exists and has a registered email, a code has been sent to it."
+)
+
+#: Public, unauthenticated and it sends email - so it is rate limited per IP.
+_PUBLIC_RESET_HITS: dict[str, list[float]] = _defaultdict(list)
+_PUBLIC_RESET_WINDOW_S = 300.0
+_PUBLIC_RESET_MAX = 5
+
+
+def _registered_email(tenant_id: str, username: str) -> str:
+    """The address this user registered, within their OWN tenant.
+
+    Scoped on purpose: looking a username up across tenants would let a
+    recovery request in one customer resolve another customer's address.
+    """
+    uname = str(username or "").strip().lower()
+    if not uname:
+        return ""
+    for row in control_plane_store.list_users(tenant_id=tenant_id) or []:
+        if str(row.get("username") or "").strip().lower() == uname:
+            return str(row.get("email") or "")
+    return ""
+
+
+def _check_public_reset_rate(request: Request) -> None:
+    ip = str(getattr(request.client, "host", "") or "unknown")
+    now = _time.time()
+    hits = [t for t in _PUBLIC_RESET_HITS[ip] if now - t < _PUBLIC_RESET_WINDOW_S]
+    if len(hits) >= _PUBLIC_RESET_MAX:
+        _PUBLIC_RESET_HITS[ip] = hits
+        raise HTTPException(
+            status_code=429,
+            detail="Too many recovery requests. Try again in a few minutes.")
+    hits.append(now)
+    _PUBLIC_RESET_HITS[ip] = hits
+
 
 
 def _is_same_origin_as_request(base_url: str, request: Request) -> bool:
@@ -1867,6 +1913,7 @@ def apply_password_reset(payload: PasswordResetApplyRequest, request: Request, t
 
 @router.post("/password-reset/public/issue")
 def issue_password_reset_public(payload: PasswordResetPublicIssueRequest, request: Request) -> dict[str, Any]:
+    _check_public_reset_rate(request)
     username = str(payload.username or "").strip()
     if not username:
         raise HTTPException(status_code=400, detail="username_required")
@@ -1885,8 +1932,33 @@ def issue_password_reset_public(payload: PasswordResetPublicIssueRequest, reques
         correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
         details={"username": username},
     )
-    # Local edge flow uses this verification code in-app.
-    return {"ok": True, "tenant_id": tid, "row": row}
+    # 2026-10-20 (SECURITY): this used to `return {"row": row}`, and row
+    # carries "reset_token". The endpoint takes NO credentials, so anyone who
+    # could reach the portal could ask for any username's token and hand it
+    # straight to /password-reset/public/apply - account takeover in two
+    # requests, `master` included. Confirmed reachable on the public
+    # internet.
+    #
+    # A reset code is only a secret while it travels to the ACCOUNT OWNER.
+    # It now goes out by email and never back to the caller, and the reply is
+    # identical whether or not the user exists so this cannot be used to
+    # discover usernames either.
+    email = ""
+    try:
+        email = _registered_email(tid, username)
+    except Exception:
+        email = ""
+    sent, reason = recovery_codes.send_code(email, otp_type=recovery_codes.OTP_RECOVERY)
+    control_plane_store.audit(
+        actor_type="system",
+        actor_id="public",
+        tenant_id=tid,
+        action="password_reset.public_issue.delivery",
+        outcome="ok" if sent else "error",
+        correlation_id=request.headers.get("X-Correlation-Id", "") or "-",
+        details={"username": username, "delivered": bool(sent), "reason": reason},
+    )
+    return {"ok": True, "message": _GENERIC_RESET_REPLY}
 
 
 @router.post("/password-reset/public/apply")
@@ -1896,7 +1968,38 @@ def apply_password_reset_public(payload: PasswordResetPublicApplyRequest, reques
     new_password = str(payload.new_password or "")
     if not username or not reset_token or not new_password:
         raise HTTPException(status_code=400, detail="username_reset_token_new_password_required")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="password_too_short")
     tid = normalize_tenant_id(str(payload.tenant_id or get_current_tenant()))
+    _check_public_reset_rate(request)
+
+    # 2026-10-20: the code the operator received came from Supabase, so
+    # Supabase is what verifies it. Succeeding returns an access token for
+    # that user, which is what authorises the new password - the change is
+    # authorised by the code itself, not by anything this process holds.
+    try:
+        email = _registered_email(tid, username)
+    except Exception:
+        email = ""
+    if recovery_codes.is_deliverable(email):
+        ok, access_token, reason = recovery_codes.verify_code(
+            email, reset_token, otp_type=recovery_codes.OTP_RECOVERY)
+        if ok and access_token:
+            set_ok, set_reason = recovery_codes.set_password_with_token(
+                access_token, new_password)
+            control_plane_store.audit(
+                actor_type="system", actor_id="public", tenant_id=tid,
+                action="password_reset.public_apply",
+                outcome="ok" if set_ok else "error",
+                correlation_id=request.headers.get("X-Correlation-Id", "") or "-",
+                details={"username": username, "via": "supabase_otp",
+                         "reason": set_reason},
+            )
+            if set_ok:
+                return {"ok": True, "tenant_id": tid}
+            raise HTTPException(status_code=400, detail="password_not_set")
+        # Fall through: an edge-issued token still verifies locally below.
+
     try:
         row = control_plane_store.reset_password_with_token(
             tenant_id=tid,
@@ -1905,6 +2008,7 @@ def apply_password_reset_public(payload: PasswordResetPublicApplyRequest, reques
             new_password=new_password,
         )
         row.pop("password_hash", None)
+        row.pop("reset_token", None)
         control_plane_store.audit(
             actor_type="system",
             actor_id="public",
@@ -1914,7 +2018,7 @@ def apply_password_reset_public(payload: PasswordResetPublicApplyRequest, reques
             correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
             details={"username": username},
         )
-        return {"ok": True, "tenant_id": tid, "row": row}
+        return {"ok": True, "tenant_id": tid}
     except Exception as exc:
         control_plane_store.audit(
             actor_type="system",
