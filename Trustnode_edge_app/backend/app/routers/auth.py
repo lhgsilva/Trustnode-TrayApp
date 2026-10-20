@@ -683,7 +683,9 @@ def forgot_password(payload: _ForgotPasswordPayload, request: Request) -> Dict[s
             pass
         return {"ok": True, "message": "If a matching account exists, a reset email has been sent."}
     username = str(u.get("username") or "")
-    email = str(u.get("email") or "")
+    # 2026-10-20: was u["email"], which skipped the company fallback - so a
+    # user with no address of their own got neither a code nor a link.
+    email = _recovery_address(u)
     # 2026-10-20: a code by default, the link only when asked for. The link
     # still exists because an edge with no internet cannot be reached by
     # Supabase, and that is exactly the machine whose operator is locked out.
@@ -745,14 +747,60 @@ _GENERIC_CODE_REPLY = (
 
 
 def _lookup_user_email(identifier: str) -> tuple[Optional[Dict[str, Any]], str]:
-    """(user_row, email) for a username or email, or (None, "")."""
+    """(user_row, where a code for them should go) or (None, "").
+
+    The user's own address first; failing that, the COMPANY address on this
+    edge's customer record.
+
+    2026-10-20, decided: "every user locally or in the cloud ... need a email
+    for future recovery ... when users doesn't have email registered the
+    recovery should go to the company email registered." Without this an
+    edge user created without an address simply cannot be recovered, which
+    on the day this was written was almost all of them.
+    """
     try:
         u = auth_store.find_user_by_email_or_username(identifier)
     except Exception:
         u = None
     if not u:
         return None, ""
-    return u, str(u.get("email") or "")
+    return u, _recovery_address(u)
+
+
+def _recovery_address(u: Dict[str, Any]) -> str:
+    """The address a code for this user should go to, or "".
+
+    Split out of _lookup_user_email so /forgot-password shares it. That
+    endpoint read u["email"] directly, so a user with no address of their
+    own silently got no code and no link - the exact case this fallback
+    exists for. One rule, one place.
+    """
+    from app.services import recovery_codes
+    own = str(u.get("email") or "").strip()
+    if recovery_codes.is_deliverable(own):
+        return own
+    # Fall back to the company this edge belongs to. The tenant and customer
+    # come from app_store.site_scope_key() - `tenant|customer|edge`, with a
+    # missing customer written as the literal "-". That is THE implementation
+    # of this rule (CLAUDE.md 1b); re-deriving it here is how an earlier
+    # change read another scope's document.
+    try:
+        from app.state import app_store as _store, control_plane_store as _cp
+        parts = str(_store.site_scope_key() or "").split("|")
+        if len(parts) >= 3:
+            tenant = parts[0].strip()
+            customer = parts[1].strip()
+            if customer == "-":
+                customer = ""
+            for row in _cp.list_customers(tenant_id=tenant) or []:
+                if customer and str(row.get("customer_id") or "").strip().lower() != customer:
+                    continue
+                company = str(row.get("contact_email") or "").strip()
+                if recovery_codes.is_deliverable(company):
+                    return company
+    except Exception:
+        pass
+    return own
 
 
 @router.post("/login-code/request")

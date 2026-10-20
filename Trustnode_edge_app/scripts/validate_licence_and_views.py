@@ -27,7 +27,11 @@ import urllib.request
 
 API = os.environ.get("VAL_API", "http://127.0.0.1:8000")
 USER = os.environ.get("VAL_USER", "admin-mari")
-PASSWORD = os.environ.get("VAL_PASS", "Limerick2019*")
+# 2026-10-20: no literal default. A real operator credential in a
+# committed script lives in every clone and the whole git history.
+PASSWORD = os.environ.get("VAL_PASS", "")
+if not PASSWORD:
+    raise SystemExit("Set VAL_PASS before running this - the password is not stored in this file.")
 FAILS: list[str] = []
 WARNS: list[str] = []
 

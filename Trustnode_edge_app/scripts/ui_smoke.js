@@ -32,10 +32,20 @@ const PAGES = [
   ["POWER MANAGEMENT", "power configuration"],
 ];
 
+// 2026-10-20: the password was a literal default in two places here.
+// A real credential in a committed script is in every clone and the
+// whole git history. One source now, and it stops rather than
+// silently trying a password that is no longer right.
+const VAL_PASS = process.env.VAL_PASS || "";
+if (!VAL_PASS) {
+  console.log("Set VAL_PASS before running ui_smoke - the password is not stored in this file.");
+  process.exit(2);
+}
+
 (async () => {
   const token = (await (await fetch(`${API}/api/auth/login`, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: process.env.VAL_USER || "admin-mari", password: process.env.VAL_PASS || "Limerick2019*" }),
+    body: JSON.stringify({ username: process.env.VAL_USER || "admin-mari", password: VAL_PASS }),
   })).json()).token;
   if (!token) { console.log("login failed"); process.exit(2); }
 
@@ -60,7 +70,7 @@ const PAGES = [
   // React app then renders a login view of its own. Skipped silently when a
   // session already exists, so this still works against a live install.
   const user = process.env.VAL_USER || "admin-mari";
-  const pass = process.env.VAL_PASS || "Limerick2019*";
+  const pass = VAL_PASS;
 
   // Idempotent, and called AGAIN after the reload below: the reload can land
   // back on a login screen, and a walk that then reports sixteen missing nav

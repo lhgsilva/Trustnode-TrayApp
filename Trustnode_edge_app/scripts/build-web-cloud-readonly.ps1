@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$CloudApiUrl,
     [string]$BasePath,
     [switch]$ReadOnly
@@ -147,3 +147,27 @@ Deploy this folder content under your web server subfolder.
 Set-Content -Path (Join-Path $outputRoot "README.txt") -Value $readme -Encoding UTF8
 
 Write-Host "Cloud web bundle created at: $outputRoot"
+
+# 2026-10-20: this build writes the whole of web_cloud_readonly, which WIPES
+# web_cloud_readonly/lite. That has now broken CI three times - the repo ends
+# up with the Lite bundle deleted, and a commit straight after a build ships
+# a portal with no Lite. Rebuilding it here means the two can never drift:
+# whoever builds the portal gets Lite back in the same step.
+$liteBuilder = Join-Path $PSScriptRoot "build_lite_cloud_bundle.py"
+if (Test-Path $liteBuilder) {
+    Write-Host "Rebuilding the cloud Lite bundle (the portal build just wiped it)..."
+    $py = Get-Command python -ErrorAction SilentlyContinue
+    if ($py) {
+        & $py.Source $liteBuilder
+        if ($LASTEXITCODE -ne 0) {
+            throw "Lite bundle rebuild failed (exit $LASTEXITCODE). The portal bundle is built but web_cloud_readonly/lite is missing - do not commit this tree."
+        }
+    } else {
+        throw "python not found: cannot rebuild web_cloud_readonly/lite, which this build just deleted."
+    }
+    $liteSw = Join-Path $outputRoot "lite\sw.js"
+    if (-not (Test-Path $liteSw)) {
+        throw "Lite bundle rebuild reported success but $liteSw is absent."
+    }
+    Write-Host "Cloud Lite bundle restored."
+}

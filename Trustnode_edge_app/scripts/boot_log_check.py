@@ -125,12 +125,47 @@ def analyze_last_boot(log_path: str = DEFAULT_LOG, tail_bytes: int = 4_000_000) 
     return out
 
 
+#: How old the last boot block may be and still describe the build under test.
+#: Beyond this it is somebody else's boot and must not be reported as a result.
+STALE_BOOT_AFTER_S = 20 * 60
+
+
+def _boot_age_s(m: dict) -> float | None:
+    """Seconds since the boot block was written, or None if unknown."""
+    raw = str(m.get("boot_started_utc") or "").rstrip("Z")
+    if not raw:
+        return None
+    try:
+        when = datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - when).total_seconds())
+
+
 def verdict(m: dict, max_health_ms: int = DEFAULT_MAX_HEALTH_MS) -> tuple[bool, list[str]]:
     """(ok, lines) - every line reads 'name : PASS/FAIL (detail)'."""
     L: list[str] = []
     ok = True
     if not m.get("found"):
         return False, [f"  boot block present          : FAIL ({m.get('error', 'missing')})"]
+
+    # 2026-10-20: this reads the DESKTOP app's backend.log, which is only
+    # written when the Electron shell launches. On a machine where the shell
+    # is not started, the newest block can be hours old - and the gate was
+    # reporting "boot health <= 15s : FAIL (26.2s)" about a boot from that
+    # morning, on a database since compacted from 13.5 GB to 2.9 GB. A stale
+    # number presented as a result is worse than no number: it reads exactly
+    # like a regression in the code under test.
+    #
+    # It still FAILS, because boot genuinely has not been verified - but it
+    # says which of the two it is.
+    age = _boot_age_s(m)
+    if age is not None and age > STALE_BOOT_AFTER_S:
+        L.append("  boot block is from THIS run  : FAIL (last boot %s, %.1fh ago - "
+                 "this is not a measurement of the current build. Launch the "
+                 "app so a fresh boot is recorded, then re-run.)"
+                 % (m.get("boot_started_utc"), age / 3600.0))
+        ok = False
     ms = m.get("health_since_spawn_ms")
     if ms is None:
         ms = m.get("health_ok_ms")

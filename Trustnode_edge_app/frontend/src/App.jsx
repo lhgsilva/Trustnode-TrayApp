@@ -20409,6 +20409,28 @@ const getGatewayHealth = (gateway) => {
       setCpModalError("Contact email format looks invalid.");
       return;
     }
+    // 2026-10-20: required on CREATE only. This address is where a recovery
+    // code goes for any user in this company who has none of their own, so a
+    // customer created without one has no way back in. Existing customers
+    // still save without it - several on the live portal have none, and
+    // blocking their edits would be worse than the gap.
+    // The backend enforces the same rule; this is here so the operator sees
+    // WHY instead of a bare 400.
+    const isNewCustomer = !String(cpCustomerForm.customer_id || "").trim();
+    if (isNewCustomer && !email) {
+      setCpModalError(
+        "A company email is required - it is where account recovery goes " +
+        "for users who have none of their own."
+      );
+      return;
+    }
+    if (isNewCustomer && /@trustnode\.local$/i.test(email)) {
+      setCpModalError(
+        "That is a placeholder address nobody receives mail at. Use a real " +
+        "company inbox, or recovery codes will go nowhere."
+      );
+      return;
+    }
     setCpModalError("");
     setCpBusy(true);
     try {
@@ -32534,8 +32556,9 @@ const getGatewayHealth = (gateway) => {
                 <input value={cpCustomerForm.company_name} onChange={(e) => setCpCustomerForm((p) => ({ ...p, company_name: e.target.value }))} />
               </label>
               <label>
-                Contact Email
-                <input value={cpCustomerForm.contact_email} onChange={(e) => setCpCustomerForm((p) => ({ ...p, contact_email: e.target.value }))} />
+                {String(cpCustomerForm.customer_id || "").trim() ? "Contact Email" : "Contact Email *"}
+                <input value={cpCustomerForm.contact_email} onChange={(e) => setCpCustomerForm((p) => ({ ...p, contact_email: e.target.value }))} placeholder="ops@company.com" />
+                <span className="hint" style={{ display: "block", fontSize: "0.8em" }}>Where account recovery codes go for users who have no address of their own.</span>
               </label>
               <label>
                 Customer Domain

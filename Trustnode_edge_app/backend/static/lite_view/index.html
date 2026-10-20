@@ -2596,7 +2596,7 @@ function StatusPill({ liveRows, transport, gatewayLastSeen }) {
   let newest = 0;
   for (const r of liveRows) {
     if (pickedTenantId && r.tenant_id !== pickedTenantId) continue;
-    const t = Date.parse(r.ts_utc || 0);
+    const t = Date.parse(r.ts_utc || r.ts || "");  // `|| 0` parsed as the STRING "0" = year 2000, so one row with no timestamp reported the edge as 26.8 years offline (845835661.7 s on screen). NaN is ignored by the Number.isFinite guard below, which is what we want.
     if (Number.isFinite(t) && t > newest) newest = t;
   }
   // Count how many gateways have ever reported. If zero, this tenant has
@@ -5474,7 +5474,7 @@ function App({ viewLink = null }) {
   const gatewayLastSeen = useMemo(() => {
     const m = {};
     for (const r of (liveRows || [])) {
-      const t = Date.parse(r.ts_utc || 0);
+      const t = Date.parse(r.ts_utc || r.ts || "");  // `|| 0` parsed as the STRING "0" = year 2000, so one row with no timestamp reported the edge as 26.8 years offline (845835661.7 s on screen). NaN is ignored by the Number.isFinite guard below, which is what we want.
       if (Number.isFinite(t)) {
         const gid = r.gateway_id || "";
         if (gid && (!m[gid] || m[gid] < t)) m[gid] = t;

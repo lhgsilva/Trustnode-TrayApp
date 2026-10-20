@@ -49,6 +49,9 @@ OTP_MAGIC_LINK = "magiclink"
 #: they have no real address of their own (see _verify_against_supabase_auth).
 _SYNTHETIC_DOMAIN = "@trustnode.local"
 
+#: One warning per process when the anon key is missing, not one per request.
+_WARNED_UNCONFIGURED = False
+
 
 def supabase_config() -> Tuple[str, str]:
     """(url, anon_key) for the Auth API, or ("", "") when not configured.
@@ -89,6 +92,21 @@ def send_code(email: str, *, otp_type: str = OTP_RECOVERY,
     """
     url, anon = supabase_config()
     if not url:
+        # 2026-10-20: say it ONCE, loudly. Without the anon key this returns
+        # quietly, the caller still answers "a code has been sent", and the
+        # operator waits for an email that was never requested. Measured on
+        # the build machine: .env carried TRUSTNODE_SUPABASE_URL and
+        # TRUSTNODE_SUPABASE_SERVICE_KEY but no ANON key - and the anon key
+        # is the right one here, because service_role bypasses Auth instead
+        # of using it.
+        global _WARNED_UNCONFIGURED
+        if not _WARNED_UNCONFIGURED:
+            _WARNED_UNCONFIGURED = True
+            import logging
+            logging.getLogger("trustnode.auth").warning(
+                "recovery codes are unavailable: set TRUSTNODE_SUPABASE_URL "
+                "and TRUSTNODE_SUPABASE_ANON_KEY. Password recovery falls "
+                "back to the emailed link; sign-in by code cannot work.")
         return False, "supabase_not_configured"
     if not is_deliverable(email):
         return False, "no_deliverable_email"

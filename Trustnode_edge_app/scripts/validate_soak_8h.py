@@ -38,7 +38,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 API = os.environ.get("VAL_API", "http://127.0.0.1:8000")
 SOAK_SECONDS = int(os.environ.get("VAL_SOAK_SECONDS", str(8 * 3600)))
 LOGIN = {"username": os.environ.get("VAL_USER", "admin-mari"),
-         "password": os.environ.get("VAL_PASS", "Limerick2019*")}
+         "password": os.environ.get("VAL_PASS", "")}
+if not LOGIN["password"]:
+    raise SystemExit("Set VAL_PASS before running this - the password is not stored in this file.")
 GROWTH_WINDOW_S = int(os.environ.get("VAL_GROWTH_WINDOW_S", "45"))
 
 try:

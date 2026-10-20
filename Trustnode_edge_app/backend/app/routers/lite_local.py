@@ -561,11 +561,37 @@ def get_live(
             except Exception as exc:
                 logger.warning("lite-local live from customer DB failed: %s", exc)
     # Fallback to local SQLite.
+    #
+    # 2026-10-20: these two branches returned DIFFERENT ROW SHAPES from the
+    # same endpoint. The customer_sql SELECT above emits `ts_utc` / `tag_name`
+    # (the historian's own column names); app_store.get_live_rows() emits
+    # `ts` / `tag`. The Lite UI reads ts_utc/tag_name, so a site WITH a
+    # customer database saw live data and a site on local SQLite saw "no
+    # samples" with "Gateways 0/3" - which is exactly how it was reported.
+    #
+    # get_live_rows() is not the place to fix it: eight other callers (the
+    # full app, cloud_live, power, plc, the report scheduler) read ts/tag and
+    # work. So normalise HERE, and emit BOTH spellings so nothing that reads
+    # either one can break.
     try:
         rows = app_store.get_live_rows(limit=int(limit))
     except Exception:
         rows = []
-    return {"ok": True, "source": "local_sqlite", "rows": rows}
+    normalised = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        row = dict(r)
+        ts = row.get("ts_utc") or row.get("ts")
+        tag = row.get("tag_name") or row.get("tag")
+        if ts is not None:
+            row["ts_utc"] = ts
+            row["ts"] = ts
+        if tag is not None:
+            row["tag_name"] = tag
+            row["tag"] = tag
+        normalised.append(row)
+    return {"ok": True, "source": "local_sqlite", "rows": normalised}
 
 
 @router.get("/historian")

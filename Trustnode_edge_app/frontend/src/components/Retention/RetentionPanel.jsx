@@ -16,10 +16,40 @@ import {
   deleteRetentionPolicy, estimateRetentionPolicy, runRetentionV2, getRetentionRunsV2,
   compactDatabase, cancelDatabaseCompaction,
   listBackupsV2, createBackupV2, restoreBackupV2, cancelBackupRestore,
+  getPurgeTargets, purgeData,
   deleteBackupV2, backupDownloadUrl, getStorageStatus,
 } from "../../api";
 
 /* ------------------------------------------------------------------ utils */
+//: The things an operator may delete. Keys must match _PURGE_TARGETS in
+//  routers/retention.py - the server rejects anything it does not know, so a
+//  drift here shows up as a 400 rather than as a silent no-op.
+const PURGE_TARGETS = [
+  { key: "historian_raw", label: "Full-detail history" },
+  { key: "historian_rollups", label: "Summarised history" },
+  { key: "app_logs", label: "Application logs" },
+  { key: "reports_metadata", label: "Report records" },
+  { key: "telemetry_cycles", label: "Collection cycles" },
+  { key: "telemetry_audit", label: "Collection audit" },
+];
+
+function describePurgeCloud(v) {
+  if (v === undefined || v === null) return "—";
+  if (typeof v === "number") return fmtCount(v);
+  if (v.skipped) return v.skipped;
+  if (v.error) return `error: ${String(v.error).slice(0, 60)}`;
+  return fmtCount(v.rows);
+}
+
+function purgeRowCount(preview) {
+  let n = 0;
+  Object.values((preview || {}).results || {}).forEach((v) => {
+    if (typeof v.local === "number") n += v.local;
+    if (v.cloud && typeof v.cloud.rows === "number") n += v.cloud.rows;
+  });
+  return n;
+}
+
 function fmtBytes(n) {
   const v = Number(n || 0);
   if (!v) return "0 B";
@@ -185,6 +215,11 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
   const [storage, setStorage] = useState(null);
   const [storageBusy, setStorageBusy] = useState(false);
   const [confirm, setConfirm] = useState(null);     // {title, message, onConfirm}
+  const [purgeTargets, setPurgeTargets] = useState([]);
+  const [purgeBefore, setPurgeBefore] = useState("");
+  const [purgeScope, setPurgeScope] = useState("local");
+  const [purgePreview, setPurgePreview] = useState(null);
+  const [purgeError, setPurgeError] = useState("");
   const estimateTimer = useRef(null);
   const mounted = useRef(true);
 
@@ -350,6 +385,29 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
   const collection = status?.collection || {};
 
   /* ------------------------------------------------------------ render */
+  /* 2026-10-20: preview first, delete only on an explicit confirm. The
+     server defaults to a dry run as well, so a mistake on this screen
+     cannot turn a preview into a deletion. */
+  const runPurge = useCallback(async (reallyDelete) => {
+    setBusy("purge");
+    setPurgeError("");
+    try {
+      const res = await purgeData({
+        targets: purgeTargets,
+        beforeUtc: `${purgeBefore} 00:00:00`,
+        scope: purgeScope,
+        dryRun: !reallyDelete,
+        confirm: !!reallyDelete,
+      });
+      setPurgePreview(res);
+      if (reallyDelete) await refresh();
+    } catch (e) {
+      setPurgeError(String(e?.message || e));
+    } finally {
+      setBusy("");
+    }
+  }, [purgeTargets, purgeBefore, purgeScope, refresh]);
+
   return (
     <>
       {/* The sizes, above the settings that control them: "your database is
@@ -685,6 +743,125 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
                 <span className="db-cell">{describeSummary(r.details)}</span>
               </div>
             ))}
+          </div>
+        </section>
+      ) : null}
+
+
+      {/* ------------------------------------------------ DELETE DATA */}
+      {/* 2026-10-20, requested: the customer should be able to really delete
+          their own data, local and cloud, to get space back. Retention is a
+          policy that decides by age on a schedule; this is the other thing an
+          operator needs - "remove this, now". Admin only, and the server
+          enforces that again rather than trusting this screen. */}
+      {isAdmin ? (
+        <section className="card">
+          <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+            <h3 style={{ margin: 0 }}>Delete data</h3>
+            <span className="hint" style={{ fontSize: "0.8em" }}>
+              Permanent. Always shows you the row count first.
+            </span>
+          </div>
+
+          <div className="row" style={{ gap: 16, flexWrap: "wrap", marginTop: 12 }}>
+            <label style={{ minWidth: 190 }}>
+              Delete data older than
+              <input
+                type="date"
+                value={purgeBefore}
+                onChange={(e) => { setPurgeBefore(e.target.value); setPurgePreview(null); }}
+              />
+            </label>
+            <label style={{ minWidth: 190 }}>
+              Where
+              <select
+                value={purgeScope}
+                onChange={(e) => { setPurgeScope(e.target.value); setPurgePreview(null); }}
+              >
+                <option value="local">This computer</option>
+                <option value="cloud">Cloud database</option>
+                <option value="both">Both</option>
+              </select>
+            </label>
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <div className="hint" style={{ fontSize: "0.8em", marginBottom: 6 }}>
+              What to delete
+            </div>
+            <div className="row" style={{ gap: 14, flexWrap: "wrap" }}>
+              {PURGE_TARGETS.map((t) => (
+                <label key={t.key} className="row" style={{ gap: 6, alignItems: "center" }}>
+                  <input
+                    type="checkbox"
+                    checked={purgeTargets.includes(t.key)}
+                    onChange={(e) => {
+                      setPurgePreview(null);
+                      setPurgeTargets((prev) => (e.target.checked
+                        ? [...prev, t.key]
+                        : prev.filter((x) => x !== t.key)));
+                    }}
+                  />
+                  <span>{t.label}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {purgeError ? (
+            <div className="hint" style={{ color: "var(--danger, #ff6b6b)", marginTop: 10 }}>
+              {purgeError}
+            </div>
+          ) : null}
+
+          {purgePreview ? (
+            <div style={{ marginTop: 12, overflowX: "auto" }}>
+              <table className="data-table">
+                <thead>
+                  <tr><th>Data</th><th>This computer</th><th>Cloud</th></tr>
+                </thead>
+                <tbody>
+                  {Object.entries(purgePreview.results || {}).map(([k, v]) => (
+                    <tr key={k}>
+                      <td>{(PURGE_TARGETS.find((t) => t.key === k) || {}).label || k}</td>
+                      <td>{v.local === undefined ? "—" : fmtCount(v.local)}</td>
+                      <td>{describePurgeCloud(v.cloud)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="hint" style={{ fontSize: "0.8em", marginTop: 6 }}>
+                {purgePreview.dry_run
+                  ? `Nothing has been deleted yet. Scope: ${purgePreview.tenant_id}.`
+                  : "Deleted."}
+              </div>
+            </div>
+          ) : null}
+
+          <div className="row" style={{ gap: 8, marginTop: 14 }}>
+            <button
+              className="btn btn-secondary"
+              disabled={busy === "purge" || !purgeBefore || !purgeTargets.length}
+              onClick={() => runPurge(false)}
+            >
+              {busy === "purge" ? "Counting…" : "Preview"}
+            </button>
+            <button
+              className="btn btn-danger"
+              disabled={busy === "purge" || !purgePreview || !purgePreview.dry_run
+                        || !purgeRowCount(purgePreview)}
+              onClick={() => setConfirm({
+                title: "Delete data permanently",
+                message: `This removes ${fmtCount(purgeRowCount(purgePreview))} row(s) `
+                  + `older than ${purgeBefore} from `
+                  + `${purgeScope === "both" ? "this computer and the cloud"
+                      : purgeScope === "cloud" ? "the cloud database" : "this computer"}.`
+                  + "\n\nIt cannot be undone. Only this site's data is affected.",
+                onConfirm: () => runPurge(true),
+              })}
+            >
+              Delete permanently
+            </button>
           </div>
         </section>
       ) : null}

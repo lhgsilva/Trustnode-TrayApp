@@ -1613,8 +1613,24 @@ class RetentionEngine:
                             "%.0f%% / %.0f GB threshold"
                             % (waste.get("free_pct", 0.0), waste.get("free_gb", 0.0),
                                need_pct, need_gb)}
+                    # 2026-10-20: the telemetry store is a SECOND file and
+                    # compact() only ever knew about the app store. After
+                    # wiring telemetry_cycles_keep it had 1,244,877 free
+                    # pages - 5.10 GB of a 6.08 GB file - that nothing would
+                    # ever hand back. Deleting rows is not reclaiming space.
+                    # Evaluated on its own waste, not the app store's.
+                    summary["compact_sidecars"] = self._compact_sidecars(
+                        need_pct, need_gb)
                 except Exception as exc:  # noqa: BLE001
                     summary["notes"].append("auto-compact check failed: %s" % exc)
+
+            # 2026-10-20: the policy's `cloud` block was normalised and read
+            # by nothing, so the cloud grew without bound - 116 GB across two
+            # tables holding the same readings twice.
+            try:
+                summary["cloud"] = self._prune_cloud(policy, dry_run)
+            except Exception as exc:  # noqa: BLE001
+                summary["cloud"] = {"error": "%s: %s" % (type(exc).__name__, exc)}
 
             summary["took_s"] = round(time.time() - started, 2)
             summary["finished_utc"] = _utc_now_text()
@@ -2004,6 +2020,198 @@ class RetentionEngine:
                 time.sleep(pace)
         return total
 
+    def _delete_in(self, db_path: str, sql: str, params: Sequence[Any],
+                   deadline: float, pace: float) -> int:
+        """_delete_simple against a DIFFERENT file.
+
+        2026-10-20: telemetry lives in trustnode_telemetry.db, not the app
+        store, which is why `telemetry_cycles_keep` sat in the policy doing
+        nothing - the engine only ever addressed its own database. Measured
+        that day: 6.08 GB, 1,082,929 cycle rows spanning three months with
+        ZERO free pages, i.e. not one row had ever been deleted, while the
+        policy said to keep 7 days.
+        """
+        if not db_path or not os.path.exists(db_path):
+            return 0
+        total = 0
+        while not self._stop.is_set() and time.time() <= deadline:
+            try:
+                conn = sqlite3.connect(db_path, timeout=10.0)
+            except Exception:
+                return total
+            try:
+                cur = conn.execute(sql, tuple(params) + (self._batch_size,))
+                n = max(0, int(cur.rowcount or 0))
+                conn.commit()
+            except Exception:
+                return total
+            finally:
+                conn.close()
+            if n == 0:
+                break
+            total += n
+            if pace:
+                time.sleep(pace)
+        return total
+
+    def _telemetry_db_path(self) -> str:
+        """The telemetry store sits beside the app store, same data dir."""
+        try:
+            return os.path.join(os.path.dirname(self.store.db_path),
+                                "trustnode_telemetry.db")
+        except Exception:
+            return ""
+
+    # -- cloud retention ---------------------------------------------------
+    #: Tables cloud retention manages. historian_readings is the mirror every
+    #: surface reads; the second is the operator-configurable SINK table, whose
+    #: name comes from the database configuration (default "plc_readings").
+    #:
+    #: 2026-10-20, measured: the cloud held 116 GB across these two - 57 GB /
+    #: 92.9M rows of historian_readings and 51 GB / 151.8M rows of
+    #: plc_readings - because the `cloud` block below was normalised by
+    #: _normalise_policy and then read by NOTHING. Both carry the same
+    #: readings, so the cloud stored every sample twice and bounded neither.
+    #:
+    #: Both have (tenant_id, ts_utc DESC), so the delete below is an index
+    #: scan on each. Without the tenant filter it is a sequential scan over
+    #: 150M rows - which is why MIN(ts_utc) alone timed out.
+    #: The cloud target dict carries no `table`, so the sink table is named
+    #: here. Each is verified to exist before it is touched.
+    CLOUD_PRUNE_TABLES = ("historian_readings", "plc_readings")
+
+    def _cloud_prune_targets(self, cx=None, schema: str = "public") -> List[str]:
+        """The managed tables that actually exist in this cloud schema.
+
+        Verified rather than assumed: a customer database that has never had
+        a sink configured has no plc_readings, and DELETE against a missing
+        table would abort the whole pass.
+        """
+        tables = list(self.CLOUD_PRUNE_TABLES)
+        if cx is None:
+            return tables
+        try:
+            from sqlalchemy import text as _sql
+            present = set(cx.execute(_sql(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = :s"), {"s": schema}).scalars().all())
+            return [t for t in tables if t in present]
+        except Exception:
+            return tables
+
+    def _prune_cloud(self, policy: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
+        """Apply the policy's cloud window to the customer's cloud database.
+
+        Deliberately conservative:
+          * OFF unless the policy says otherwise - this deletes from a
+            database the operator pays for and cannot undo.
+          * TENANT SCOPED. The cloud database is shared between customers and
+            the edge connects with a role that bypasses RLS, so the WHERE
+            clause is the only thing protecting the others (CLAUDE.md 1b).
+          * BATCHED and CAPPED per run. A single DELETE over tens of millions
+            of rows holds locks and bloats WAL; `batch_rows` x
+            `max_batches_per_run` bounds each pass and the next run continues.
+          * Reports rows deleted, never bytes reclaimed: Postgres returns
+            deleted space to the TABLE, not to the disk. Shrinking the file
+            needs VACUUM FULL (exclusive lock) and is an operator decision.
+        """
+        cfg = (policy or {}).get("cloud") or {}
+        out: Dict[str, Any] = {"enabled": bool(cfg.get("enabled"))}
+        if not cfg.get("enabled"):
+            out["skipped"] = "cloud retention is off in the active policy"
+            return out
+        keep_s = int(cfg.get("keep_s") or 0)
+        if keep_s <= 0:
+            out["skipped"] = "no cloud keep window set"
+            return out
+
+        try:
+            from app.state import app_store as _store
+            target = _store._get_cloud_database_target()        # noqa: SLF001
+        except Exception as exc:  # noqa: BLE001
+            out["error"] = "cloud target unavailable: %s" % exc
+            return out
+        if not target:
+            out["skipped"] = "no cloud database configured"
+            return out
+
+        cutoff = _ms_to_sql(_now_ms() - keep_s * 1000)
+        out["cutoff_utc"] = cutoff
+        out["keep"] = cfg.get("keep")
+        batch = int(cfg.get("batch_rows") or 20000)
+        max_batches = int(cfg.get("max_batches_per_run") or 50)
+        tenants = self.store.tenants() or []
+        if not tenants:
+            out["skipped"] = "no tenants to scope the delete to"
+            return out
+
+        try:
+            from sqlalchemy import text as _sql
+            schema = str(target.get("schema") or "public")
+            engine, _ = _store._get_or_create_cloud_engine(target, schema)  # noqa: SLF001
+        except Exception as exc:  # noqa: BLE001
+            out["error"] = "cloud engine: %s" % exc
+            return out
+
+        results: Dict[str, Any] = {}
+        budget = max_batches
+        deadline = time.time() + 300
+        try:
+            with engine.connect() as _probe:
+                targets = self._cloud_prune_targets(_probe, schema)
+        except Exception:
+            targets = list(self.CLOUD_PRUNE_TABLES)
+        out["managed_tables"] = targets
+        for table in targets:
+            per_table = {"rows": 0, "batches": 0}
+            for tenant in tenants:
+                if budget <= 0 or time.time() > deadline or self._stop.is_set():
+                    break
+                try:
+                    with engine.connect() as cx:
+                        cx.execute(_sql("SET statement_timeout = '120s'"))
+                        if dry_run:
+                            # A plain COUNT(*) over tens of millions of rows
+                            # hits the statement timeout and comes back as
+                            # ZERO - a dry run that reports "nothing to do"
+                            # about 60 million rows. Count a bounded sample
+                            # instead and say when it was capped.
+                            cap = 2_000_000
+                            n = cx.execute(_sql(
+                                f'SELECT COUNT(*) FROM (SELECT 1 FROM '
+                                f'"{schema}"."{table}" WHERE tenant_id = :t '
+                                f'AND ts_utc < :c LIMIT :cap) s'),
+                                {"t": tenant, "c": cutoff, "cap": cap}).scalar() or 0
+                            per_table["rows"] += int(n)
+                            if int(n) >= cap:
+                                per_table["capped"] = True
+                            continue
+                        while budget > 0 and time.time() <= deadline:
+                            res = cx.execute(_sql(
+                                f'DELETE FROM "{schema}"."{table}" WHERE id IN ('
+                                f'  SELECT id FROM "{schema}"."{table}" '
+                                f'  WHERE tenant_id = :t AND ts_utc < :c '
+                                f'  ORDER BY id LIMIT :n)'),
+                                {"t": tenant, "c": cutoff, "n": batch})
+                            cx.commit()
+                            got = int(res.rowcount or 0)
+                            budget -= 1
+                            per_table["batches"] += 1
+                            per_table["rows"] += got
+                            if got <= 0:
+                                break
+                except Exception as exc:  # noqa: BLE001
+                    per_table.setdefault("errors", []).append(
+                        "%s: %s" % (tenant, str(exc)[:120]))
+            results[table] = per_table
+        out["dry_run"] = bool(dry_run)
+        out["tables"] = results
+        out["batches_left"] = budget
+        out["note"] = ("Rows are removed; Postgres returns the space to the "
+                       "table for reuse, not to the disk. The file shrinks "
+                       "only on VACUUM FULL, which takes an exclusive lock.")
+        return out
+
     # -- other data classes -----------------------------------------------
     def _prune_other_data(self, policy: Dict[str, Any]) -> Dict[str, int]:
         other = policy.get("other_data") or {}
@@ -2041,6 +2249,51 @@ class RetentionEngine:
                 (c,), deadline, 0.005)
             if n:
                 out["retention_runs"] = n
+
+        # 2026-10-20: the three keys below were in DEFAULT_POLICY, shown in
+        # the Retention page, and read by NOTHING. A dial an operator can set
+        # that changes no behaviour is worse than no dial - they believe the
+        # data is bounded when it is not.
+        c = cutoff_text("outbox_sent_keep")
+        if c:
+            # Only rows the outbox has already delivered. A pending row is
+            # work not yet done and must survive any cleanup.
+            n = self._delete_simple(
+                "DELETE FROM sync_outbox WHERE id IN (SELECT id FROM sync_outbox "
+                "WHERE status='sent' AND created_utc<? LIMIT ?)",
+                (c,), deadline, 0.005)
+            if n:
+                out["sync_outbox"] = n
+
+        c = cutoff_text("reports_metadata_keep")
+        if c:
+            n = self._delete_simple(
+                "DELETE FROM generated_reports WHERE rowid IN (SELECT rowid FROM "
+                "generated_reports WHERE created_utc<? LIMIT ?)",
+                (c,), deadline, 0.005)
+            if n:
+                out["generated_reports"] = n
+
+        c = cutoff_text("telemetry_cycles_keep")
+        if c:
+            tdb = self._telemetry_db_path()
+            n = self._delete_in(
+                tdb,
+                "DELETE FROM telemetry_samples_raw WHERE edge_record_id IN "
+                "(SELECT edge_record_id FROM telemetry_samples_raw "
+                " WHERE sample_ts_utc<? LIMIT ?)",
+                (c,), deadline, 0.005)
+            if n:
+                out["telemetry_samples_raw"] = n
+            # One audit row per sample, so it doubles the cost of keeping
+            # them. Same cutoff, same reason.
+            n = self._delete_in(
+                tdb,
+                "DELETE FROM ingest_audit_log_local WHERE id IN "
+                "(SELECT id FROM ingest_audit_log_local WHERE ts_utc<? LIMIT ?)",
+                (c,), deadline, 0.005)
+            if n:
+                out["ingest_audit_log_local"] = n
         return out
 
     # -- hygiene ----------------------------------------------------------
@@ -2132,6 +2385,63 @@ class RetentionEngine:
         return status
 
     # -- compaction -------------------------------------------------------
+    def _sidecar_paths(self) -> List[str]:
+        """Databases the engine prunes that are not the app store."""
+        return [p for p in (self._telemetry_db_path(),) if p and os.path.exists(p)]
+
+    @staticmethod
+    def _file_waste(db_path: str) -> Dict[str, float]:
+        try:
+            conn = sqlite3.connect("file:%s?mode=ro" % db_path.replace("\\", "/"),
+                                   uri=True, timeout=5.0)
+            try:
+                page = int(conn.execute("PRAGMA page_size").fetchone()[0])
+                count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+                free = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+            finally:
+                conn.close()
+        except Exception:
+            return {"free_pct": 0.0, "free_gb": 0.0}
+        if count <= 0:
+            return {"free_pct": 0.0, "free_gb": 0.0}
+        return {"free_pct": (free / float(count)) * 100.0,
+                "free_gb": (free * page) / 1e9}
+
+    def _compact_sidecars(self, need_pct: float, need_gb: float) -> List[Dict[str, Any]]:
+        """VACUUM the non-app-store databases when they are mostly holes.
+
+        A plain VACUUM, not the staged VACUUM INTO the app store uses: these
+        files are small, nothing restores from them, and an in-place rebuild
+        needs no swap-on-next-start dance. It takes a write lock, so a busy
+        writer simply means we skip and try on the next pass - never a
+        failure worth stopping maintenance for.
+        """
+        out: List[Dict[str, Any]] = []
+        for path in self._sidecar_paths():
+            waste = self._file_waste(path)
+            name = os.path.basename(path)
+            if waste["free_pct"] < need_pct or waste["free_gb"] < need_gb:
+                out.append({"file": name, "skipped": "%.0f%% (%.2f GB) free"
+                            % (waste["free_pct"], waste["free_gb"])})
+                continue
+            before = os.path.getsize(path)
+            try:
+                conn = sqlite3.connect(path, timeout=30.0)
+                conn.isolation_level = None
+                try:
+                    conn.execute("PRAGMA busy_timeout=30000")
+                    conn.execute("VACUUM")
+                finally:
+                    conn.close()
+            except Exception as exc:  # noqa: BLE001
+                out.append({"file": name, "ok": False,
+                            "error": "%s: %s" % (type(exc).__name__, exc)})
+                continue
+            after = os.path.getsize(path)
+            out.append({"file": name, "ok": True, "before_bytes": before,
+                        "after_bytes": after, "reclaimed_bytes": before - after})
+        return out
+
     def _compact_waste(self) -> Dict[str, float]:
         """How much of the SQLite file is free pages, as a percentage and in GB.
 

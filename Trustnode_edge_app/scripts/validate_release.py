@@ -39,7 +39,37 @@ env = dict(os.environ)
 env.setdefault("VAL_DURATION_S", "600")
 env.setdefault("PYTHONIOENCODING", "utf-8")
 
+# 2026-10-20: the login this gate uses to drive the running app used to be
+# a literal default inside validate_full_12h.py, so the gate "just worked"
+# by carrying a real operator password in the repo. The password now comes
+# from the environment or from .env, which is gitignored.
+#
+# Checked HERE, before anything runs: the credential is not needed until
+# the 10-minute full-system stage, and discovering it is missing after ten
+# minutes of source checks is its own small cruelty.
+if not env.get("VAL_PASS"):
+    _dotenv = os.path.join(os.path.dirname(HERE), ".env")
+    try:
+        with open(_dotenv, encoding="utf-8") as _fh:
+            for _line in _fh:
+                _line = _line.strip()
+                if _line.startswith("VAL_PASS=") and not _line.startswith("#"):
+                    env["VAL_PASS"] = _line.split("=", 1)[1].strip().strip("'\"")
+                    break
+    except OSError:
+        pass
+if not env.get("VAL_PASS"):
+    print("RELEASE GATE: cannot run - no VAL_PASS.", flush=True)
+    print("  The full-system stage signs in to the running app. Put the", flush=True)
+    print("  password in .env (gitignored) as  VAL_PASS=...  or set it in", flush=True)
+    print("  the environment. VAL_USER defaults to admin-mari.", flush=True)
+    sys.exit(2)
+
 SOURCE_CHECKS = [
+    # 2026-10-20: a lazy import naming something that does not exist runs
+    # only when its line runs, and an except around it hides the whole
+    # feature. That is how the report-template mirror was dead for months.
+    ("lazy imports resolve", "test_lazy_imports_resolve.py"),
     ("hook order / TDZ", "test_hook_deps_tdz.py"),
     ("historian commit path", "test_historian_commit_path.py"),
     ("ifm channel typing", "test_ifm_channels_unit.py"),
@@ -167,6 +197,30 @@ SOURCE_CHECKS = [
     # 2026-10-14: the onboarding chain - customer, licence, edge, activation
     # code, login. Every link has failed in production at least once.
     ("onboarding: licence, activation, login", "test_onboarding_activation_login.py"),
+    # 2026-10-20: the line above drives the STORE. This one drives the
+    # HTTP endpoint, and while it was in neither the gate nor CI,
+    # local-finalize returned 400 on every activation and nobody saw it.
+    ("activation leaves a usable admin", "test_activation_creates_admin.py"),
+    # 2026-10-20: the whole journey in one run - customer+email, licence,
+    # edge, code, activation, login, recovery. The per-link tests each
+    # build their own starting state, so none of them saw that activation
+    # blanked the company contact_email it had just been given.
+    ("onboarding flow, end to end", "validate_onboarding_flow.py"),
+    # 2026-10-20 storage work: the archive that let 7.8 GB of legacy files
+    # go without losing the 10.6M readings only they still held; the four
+    # retention dials that were declared and read by nothing; and the
+    # admin purge, whose tenant scoping is all that protects one customer
+    # from deleting another on the shared cloud database.
+    ("legacy stores fold, nothing lost", "test_legacy_archive.py"),
+    ("every retention dial prunes", "test_retention_prunes_everything.py"),
+    ("admin purge is scoped and gated", "test_admin_purge.py"),
+    # 2026-10-20: LAN Lite showed "no samples" while the full app on the
+    # same machine charted live data - /api/lite-local/live returned two
+    # different row shapes depending on which source answered.
+    ("Lite live rows carry the right names", "test_lite_live_contract.py"),
+    # and the cloud grew to 116 GB because the policy cloud block was
+    # normalised and read by nothing.
+    ("cloud retention is gated and scoped", "test_cloud_retention_gate.py"),
     # 2026-10-14: a NEW customer's machine has no portal address, nothing in
     # localStorage and an empty local store. The shipped bundle is the only
     # thing that knows where to send the code.

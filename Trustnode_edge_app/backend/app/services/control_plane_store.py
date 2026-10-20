@@ -1172,6 +1172,24 @@ class ControlPlaneStore:
         # 2026-10-13: the Lite/mobile surface is migratable too, so where it
         # lives is a portal setting rather than a file pushed over SSH.
         "lite_url",            # Lite / mobile web view base
+        # 2026-10-20, requested: "when I am setting up a new customer, I would
+        # like to create a new project in the supabase, and link the database
+        # in the portal ... this way I would know how big would be the
+        # customer database to cherge them."
+        #
+        # Today every customer shares ONE Supabase project, one database, one
+        # `public` schema and one superuser credential - measured on
+        # 2026-10-20, two live customers resolving to the identical host, role
+        # and password. Isolation is a tenant_id column, and the edge connects
+        # with a role that BYPASSES RLS, so the column is the only thing
+        # separating them.
+        #
+        # These keys are the seam for fixing that one customer at a time:
+        # resolution is already per-tenant over global, so a customer with
+        # their own project gets it and everyone else keeps the shared one.
+        # Nothing breaks on the day they are left blank.
+        "customer_db_url",     # per-customer Postgres/Supabase DSN (blank = shared)
+        "customer_db_schema",  # schema inside it (blank = "public")
     )
 
     def get_infrastructure_config(self, *, tenant_id: str | None = None) -> dict[str, Any]:

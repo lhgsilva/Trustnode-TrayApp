@@ -406,3 +406,320 @@ def download_backup(filename: str, request: Request):
     if not clean or not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="Backup not found.")
     return FileResponse(path, media_type="application/octet-stream", filename=clean)
+
+
+# ------------------------------------------------- operator-driven deletion
+# 2026-10-20, requested: "we also should have options to delete (real delete)
+# data from local databases and cloud (supabase) to save space so the customer
+# can control of their data when is logged with admin privilegy".
+#
+# Retention is a POLICY - it decides by age, on a schedule. This is the other
+# thing an operator needs: "remove this, now, because I say so". Keeping the
+# two apart matters: a manual purge that edited the policy would quietly
+# change what happens every night afterwards.
+#
+# Three rules this endpoint does not bend:
+#   * ADMIN only, enforced HERE, on the server. The legacy cleanup routes were
+#     gated in the browser alone, so any authenticated viewer could wipe the
+#     historian.
+#   * TENANT SCOPED, always. The cloud database is shared between customers
+#     and the edge connects with a role that bypasses RLS, so an unscoped
+#     DELETE there would take another company's history with it. That is a
+#     data-protection failure, not a bug (CLAUDE.md 1b).
+#   * COUNT BEFORE DELETE. dry_run is the default, and a cutoff is required:
+#     a purge with no cutoff is a wipe wearing a different name.
+
+#: What an operator may purge, and where each thing actually lives.
+_PURGE_TARGETS: Dict[str, Dict[str, str]] = {
+    "historian_raw": {"db": "store", "table": "historian_readings", "ts": "ts_utc"},
+    "historian_rollups": {"db": "store", "table": "historian_rollup", "ts": "bucket_ms"},
+    "app_logs": {"db": "store", "table": "app_logs", "ts": "ts_utc"},
+    "reports_metadata": {"db": "store", "table": "generated_reports", "ts": "created_utc"},
+    "telemetry_cycles": {"db": "telemetry", "table": "telemetry_samples_raw",
+                         "ts": "sample_ts_utc"},
+    "telemetry_audit": {"db": "telemetry", "table": "ingest_audit_log_local",
+                        "ts": "ts_utc"},
+}
+
+
+class PurgeIn(BaseModel):
+    targets: List[str] = Field(default_factory=list)
+    before_utc: str = ""
+    scope: str = "local"          # local | cloud | both
+    dry_run: bool = True
+    confirm: bool = False
+
+
+def _purge_tenant(request: Request) -> str:
+    """This edge's tenant. Never a value the caller supplied."""
+    from app.state import app_store as _store
+    try:
+        parts = str(_store.site_scope_key() or "").split("|")
+        if parts and parts[0].strip():
+            return parts[0].strip()
+    except Exception:
+        pass
+    try:
+        from app.tenant import get_current_tenant
+        return str(get_current_tenant() or "default")
+    except Exception:
+        return "default"
+
+
+def _purge_local(spec: Dict[str, str], tenant: str, before: str,
+                 dry_run: bool) -> int:
+    """Count, or delete, one table's rows older than `before` for one tenant."""
+    import sqlite3
+    from app.state import app_store as _store
+    store_path = _store._db_path                                  # noqa: SLF001
+    base = os.path.dirname(store_path)
+    path = (store_path if spec["db"] == "store"
+            else os.path.join(base, "trustnode_telemetry.db"))
+    if not os.path.exists(path):
+        return 0
+    table, tscol = spec["table"], spec["ts"]
+    conn = sqlite3.connect(path, timeout=60.0)
+    conn.isolation_level = None
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info([%s])" % table)}
+        if tscol not in cols:
+            return 0
+        # bucket_ms is epoch milliseconds; every other cutoff is an ISO string.
+        if tscol == "bucket_ms":
+            import datetime as _dt
+            try:
+                cut = int(_dt.datetime.fromisoformat(before).timestamp() * 1000)
+            except Exception:
+                return 0
+            where, args = "bucket_ms < ?", [cut]
+        else:
+            where, args = "%s < ?" % tscol, [before]
+        if "tenant_id" in cols:
+            where += " AND tenant_id = ?"
+            args.append(tenant)
+        n = int(conn.execute("SELECT COUNT(*) FROM [%s] WHERE %s" % (table, where),
+                             args).fetchone()[0] or 0)
+        if dry_run or not n:
+            return n
+        # Paced: a large purge must not hold a write lock for minutes with
+        # collection queued behind it.
+        removed = 0
+        while True:
+            cur = conn.execute(
+                "DELETE FROM [%s] WHERE rowid IN (SELECT rowid FROM [%s] "
+                "WHERE %s LIMIT 5000)" % (table, table, where), args)
+            got = max(0, int(cur.rowcount or 0))
+            if not got:
+                break
+            removed += got
+        return removed
+    finally:
+        conn.close()
+
+
+def _purge_cloud(spec: Dict[str, str], tenant: str, before: str,
+                 dry_run: bool) -> Dict[str, Any]:
+    """The same, in the cloud database. Tenant-scoped without exception."""
+    if spec["db"] != "store":
+        return {"skipped": "not mirrored to the cloud"}
+    from app.state import app_store as _store
+    cloud = _store._get_cloud_database_target()                   # noqa: SLF001
+    if not cloud:
+        return {"skipped": "no cloud database configured"}
+    try:
+        from sqlalchemy import text
+        schema = str(cloud.get("schema") or "public")
+        engine, _ = _store._get_or_create_cloud_engine(cloud, schema)   # noqa: SLF001
+        table = '"%s"."%s"' % (schema, spec["table"])
+        tscol = spec["ts"]
+        with engine.begin() as cx:
+            cnt = cx.execute(
+                text("SELECT COUNT(*) FROM %s WHERE %s < :b AND tenant_id = :t"
+                     % (table, tscol)), {"b": before, "t": tenant}).scalar() or 0
+            if dry_run or not cnt:
+                return {"rows": int(cnt), "deleted": 0}
+            cx.execute(
+                text("DELETE FROM %s WHERE %s < :b AND tenant_id = :t"
+                     % (table, tscol)), {"b": before, "t": tenant})
+        return {"rows": int(cnt), "deleted": int(cnt)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": "%s: %s" % (type(exc).__name__, exc)}
+
+
+@router.get("/data/purge/targets")
+def purge_targets(request: Request) -> Dict[str, Any]:
+    """What can be purged, so the UI never has to invent a name."""
+    _require_admin(request)
+    return {"ok": True, "targets": sorted(_PURGE_TARGETS.keys()),
+            "scopes": ["local", "cloud", "both"]}
+
+
+@router.post("/data/purge")
+def purge_data(payload: PurgeIn, request: Request) -> Dict[str, Any]:
+    actor = _require_admin(request)
+    targets = [t for t in (payload.targets or []) if t in _PURGE_TARGETS]
+    if not targets:
+        raise HTTPException(status_code=400,
+                            detail="name at least one known target")
+    before = str(payload.before_utc or "").strip()
+    if not before:
+        raise HTTPException(
+            status_code=400,
+            detail="before_utc is required - a purge with no cutoff is a wipe")
+    dry = bool(payload.dry_run) or not bool(payload.confirm)
+    scope = str(payload.scope or "local").strip().lower()
+    if scope not in ("local", "cloud", "both"):
+        raise HTTPException(status_code=400,
+                            detail="scope must be local, cloud or both")
+    tenant = _purge_tenant(request)
+
+    out: Dict[str, Any] = {"ok": True, "dry_run": dry, "tenant_id": tenant,
+                           "before_utc": before, "scope": scope, "results": {}}
+    for name in targets:
+        spec = _PURGE_TARGETS[name]
+        entry: Dict[str, Any] = {}
+        if scope in ("local", "both"):
+            entry["local"] = _purge_local(spec, tenant, before, dry)
+        if scope in ("cloud", "both"):
+            entry["cloud"] = _purge_cloud(spec, tenant, before, dry)
+        out["results"][name] = entry
+
+    if not dry:
+        try:
+            from app.state import app_store as _store
+            import datetime as _dt
+            _now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            _store.append_log_rows([{
+                "ts_utc": _now, "created_utc": _now, "level": "WARN",
+                "category": "retention", "tenant_id": tenant,
+                "message": ("admin purge by %s: %s before %s (scope=%s)"
+                            % (actor, ",".join(targets), before, scope)),
+            }])
+        except Exception:
+            pass
+    return out
+
+
+# ------------------------------------------------------------ usage metering
+# 2026-10-20, asked: "this way I would know how big would be the customer
+# database to cherge them." Nothing counted bytes per customer, so there was
+# no number to bill against.
+#
+# Bytes are ESTIMATED, deliberately and visibly. SQLite can only report the
+# size of a whole file, and one file holds several tenants; dbstat is not
+# compiled into the shipped interpreter. So we take the real average cost of
+# a row in each table - measured from the file itself, indexes included - and
+# multiply by that tenant's row count. On 2026-10-20 that average was 646 B
+# for a historian reading: 165 B of payload and the rest four indexes.
+#
+# An estimate labelled as one beats an exact number for the wrong thing (the
+# file size), which is what a naive implementation would report.
+
+_USAGE_TABLES = (
+    ("historian_readings", "store", "full-detail history"),
+    ("historian_rollup", "store", "summarised history"),
+    ("app_logs", "store", "application logs"),
+    ("generated_reports", "store", "report records"),
+    ("telemetry_samples_raw", "telemetry", "collection cycles"),
+    ("ingest_audit_log_local", "telemetry", "collection audit"),
+)
+
+
+def _usage_db_paths() -> Dict[str, str]:
+    from app.state import app_store as _store
+    store_path = _store._db_path                                  # noqa: SLF001
+    return {"store": store_path,
+            "telemetry": os.path.join(os.path.dirname(store_path),
+                                      "trustnode_telemetry.db")}
+
+
+def _avg_row_bytes(conn, table: str) -> float:
+    """Real cost of one row in this table, indexes included.
+
+    file_pages / total_rows across the whole file would be wrong when a file
+    holds several tables, so scale the file by this table's share of the rows.
+    Crude, but honest and stable - and it is the number an operator is
+    actually billed on.
+    """
+    try:
+        page = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        free = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        used = max(0, count - free) * page
+        rows_here = int(conn.execute("SELECT COUNT(*) FROM [%s]" % table).fetchone()[0] or 0)
+        if rows_here <= 0:
+            return 0.0
+        total = 0
+        for (t,) in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%'"):
+            try:
+                total += int(conn.execute("SELECT COUNT(*) FROM [%s]" % t).fetchone()[0] or 0)
+            except Exception:
+                pass
+        if total <= 0:
+            return 0.0
+        return (used / float(total))
+    except Exception:
+        return 0.0
+
+
+@router.get("/data/usage")
+def data_usage(request: Request) -> Dict[str, Any]:
+    """Rows and estimated bytes per tenant, per table."""
+    _require_admin(request)
+    import sqlite3
+    paths = _usage_db_paths()
+    per_tenant: Dict[str, Dict[str, Any]] = {}
+    tables: List[Dict[str, Any]] = []
+
+    for table, which, label in _USAGE_TABLES:
+        path = paths.get(which) or ""
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            conn = sqlite3.connect("file:%s?mode=ro" % path.replace("\\", "/"),
+                                   uri=True, timeout=30)
+        except Exception:
+            continue
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info([%s])" % table)}
+            if not cols:
+                continue
+            per_row = _avg_row_bytes(conn, table)
+            if "tenant_id" in cols:
+                rows = conn.execute(
+                    "SELECT tenant_id, COUNT(*) FROM [%s] GROUP BY tenant_id" % table
+                ).fetchall()
+            else:
+                rows = [("(untenanted)",
+                         conn.execute("SELECT COUNT(*) FROM [%s]" % table).fetchone()[0])]
+            total = 0
+            for tenant, n in rows:
+                tid = str(tenant or "(none)")
+                n = int(n or 0)
+                total += n
+                slot = per_tenant.setdefault(tid, {"rows": 0, "est_bytes": 0.0,
+                                                   "tables": {}})
+                slot["rows"] += n
+                slot["est_bytes"] += n * per_row
+                slot["tables"][table] = {"rows": n,
+                                         "est_bytes": int(n * per_row)}
+            tables.append({"table": table, "label": label, "database": which,
+                           "rows": total, "avg_row_bytes": round(per_row, 1)})
+        finally:
+            conn.close()
+
+    out_tenants = []
+    for tid, v in sorted(per_tenant.items(), key=lambda kv: -kv[1]["rows"]):
+        out_tenants.append({"tenant_id": tid, "rows": v["rows"],
+                            "est_bytes": int(v["est_bytes"]),
+                            "tables": v["tables"]})
+    files = {}
+    for which, path in paths.items():
+        files[which] = {"path": path,
+                        "bytes": os.path.getsize(path) if os.path.exists(path) else 0}
+    return {"ok": True, "estimated": True, "tenants": out_tenants,
+            "tables": tables, "files": files,
+            "note": ("Bytes are estimated: a SQLite file reports its own size "
+                     "only, and one file holds several tenants. Rows are exact.")}

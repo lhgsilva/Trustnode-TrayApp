@@ -36,7 +36,9 @@ import urllib.error
 import urllib.request
 
 API = os.environ.get("VAL_API", "http://127.0.0.1:8000")
-LOGIN = {"username": os.environ.get("VAL_USER", "admin-mari"), "password": os.environ.get("VAL_PASS", "Limerick2019*")}
+LOGIN = {"username": os.environ.get("VAL_USER", "admin-mari"), "password": os.environ.get("VAL_PASS", "")}
+if not LOGIN["password"]:
+    raise SystemExit("Set VAL_PASS before running this - the password is not stored in this file.")
 VIEWER = ("val-surface-viewer", "viewer-pass-2026")
 
 

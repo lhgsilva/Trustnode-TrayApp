@@ -33,6 +33,14 @@ SECRETS_PATH = "/etc/systemd/system/trustnode-backend.service.d/10-secrets.conf"
 REQUIRED = (
     "TRUSTNODE_SUPABASE_URL",
     "TRUSTNODE_SUPABASE_SERVICE_KEY",
+    # 2026-10-20: the ANON key, and it is required, not optional. /auth/v1
+    # wants anon; service_role BYPASSES Auth rather than using it. Without
+    # this the emailed sign-in and recovery codes cannot be sent, and
+    # _verify_against_supabase_auth - which is how a portal-created user logs
+    # into an edge - silently returns False for everyone. It is public by
+    # design (it ships to every browser in /lite/config.json), unlike the
+    # service key beside it.
+    "TRUSTNODE_SUPABASE_ANON_KEY",
     "TRUSTNODE_CLOUD_DB_HOST",
     "TRUSTNODE_CLOUD_DB_USER",
     "TRUSTNODE_CLOUD_DB_PASSWORD",

@@ -49,8 +49,21 @@ from datetime import datetime, timezone
 DURATION_S = int(os.environ.get("VAL_DURATION_S", "43200"))
 INTERVAL_S = float(os.environ.get("VAL_INTERVAL_S", "1.0"))
 API = "http://127.0.0.1:8000"
+# 2026-10-20: the password used to sit here as a literal default. A real
+# operator credential in a committed script is a credential in every clone,
+# every fork and the whole git history - and CLAUDE.md 6 already says to ask
+# for key NAMES, not values. There is no default now: the run says what to
+# set and stops, which is noisier than a silent wrong-password 401 anyway.
 LOGIN = {"username": os.environ.get("VAL_USER", "admin-mari"),
-         "password": os.environ.get("VAL_PASS", "Limerick2019*")}
+         "password": os.environ.get("VAL_PASS", "")}
+if not LOGIN["password"]:
+    raise SystemExit(
+        "Set VAL_PASS (and VAL_USER if not admin-mari) before running "
+        "this. PowerShell:  $env:VAL_PASS = '...'   bash:  export "
+        "VAL_PASS='...'  -  the password is deliberately not stored "
+        "in this file.")
+
+
 DB = os.path.expanduser("~/.trustnode_edge/data/trustnode_app_store.db")
 
 

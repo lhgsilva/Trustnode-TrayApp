@@ -37,18 +37,64 @@ _PUBLIC_RESET_WINDOW_S = 300.0
 _PUBLIC_RESET_MAX = 5
 
 
-def _registered_email(tenant_id: str, username: str) -> str:
-    """The address this user registered, within their OWN tenant.
+def _existing_customer(tenant_id: str | None, customer_id: str) -> bool:
+    """Does this customer already exist? Create and edit are one endpoint."""
+    cid = str(customer_id or "").strip()
+    if not cid:
+        return False
+    try:
+        for row in control_plane_store.list_customers(tenant_id=tenant_id) or []:
+            if str(row.get("customer_id") or "") == cid:
+                return True
+    except Exception:
+        return True      # cannot tell -> treat as an edit, never block a save
+    return False
 
-    Scoped on purpose: looking a username up across tenants would let a
-    recovery request in one customer resolve another customer's address.
+
+def _registered_email(tenant_id: str, username: str) -> str:
+    """Where a recovery code for this user should go.
+
+    The user's own address first; failing that, the COMPANY address on their
+    customer record.
+
+    2026-10-20, decided: "every user locally or in the cloud ... need a email
+    for future recovery. The company when created in the portal need a email;
+    when users doesn't have email registered the recovery should go to the
+    company email registered."
+
+    That fallback is what makes the feature usable at all here. Measured the
+    same day, not one portal account could receive a code: three had no
+    address, and the other two were <user>@trustnode.local placeholders that
+    nobody reads. An administrator with a real company address can now
+    recover a colleague who never had one.
+
+    Scoped on purpose: resolving a username across tenants would let a
+    recovery request in one customer reach another customer's address.
     """
     uname = str(username or "").strip().lower()
     if not uname:
         return ""
+    customer_id = ""
     for row in control_plane_store.list_users(tenant_id=tenant_id) or []:
-        if str(row.get("username") or "").strip().lower() == uname:
-            return str(row.get("email") or "")
+        if str(row.get("username") or "").strip().lower() != uname:
+            continue
+        own = str(row.get("email") or "").strip()
+        if recovery_codes.is_deliverable(own):
+            return own
+        customer_id = str(row.get("customer_id") or "").strip()
+        break
+    else:
+        return ""           # no such user in this tenant
+    # The user has no usable address: fall back to their company's.
+    try:
+        for cust in control_plane_store.list_customers(tenant_id=tenant_id) or []:
+            if customer_id and str(cust.get("customer_id") or "") != customer_id:
+                continue
+            company = str(cust.get("contact_email") or "").strip()
+            if recovery_codes.is_deliverable(company):
+                return company
+    except Exception:
+        pass
     return ""
 
 
@@ -496,6 +542,24 @@ class EdgeRegisterRequest(BaseModel):
 class EdgeLocalFinalizeRequest(BaseModel):
     tenant_id: str
     edge_id: str
+    # 2026-10-20: these two were MISSING while edge_link_local_finalize read
+    # them on its first statement, so every call died with
+    #   400 "init: 'EdgeLocalFinalizeRequest' object has no attribute
+    #        'admin_username'"
+    # - the AttributeError caught by the step-tracking try. Activation could
+    # not complete and the administrator the portal promised was never
+    # created, which is the 2026-08-25 report ("activation reported success,
+    # the admin did not exist, no way back in") returning.
+    #
+    # It stayed invisible because the onboarding test in the gate exercises
+    # the STORE, not this endpoint, and test_activation_creates_admin.py -
+    # which does drive it - was in neither the gate nor CI. It is in the gate
+    # now.
+    #
+    # Defaults match the sibling activation models and what the endpoint
+    # already falls back to, so an older caller that omits them is unchanged.
+    admin_username: str = "admin"
+    admin_password: str = ""
     edge_name: str = ""
     customer_id: str = ""
     license_id: str = ""
@@ -991,6 +1055,21 @@ def upsert_customer(payload: CustomerUpsertRequest, request: Request, tenant_id:
     # tenant. Each customer gets their own tenant — that's what makes the
     # existing Lite RLS isolate them from each other.
     _scoped_tenant(request, tenant_id, require_admin_write=True)
+    # 2026-10-20, decided: "the company when created in the portal need a
+    # email ... when users doesn't have email registered the recovery should
+    # go to the company email registered."
+    #
+    # So this address is not decoration - it is the last way back into an
+    # account whose owner never registered one. Required on CREATE only: an
+    # existing customer is not blocked from being edited for an address it
+    # never had, which would make the field impossible to fill in.
+    _email = str(payload.contact_email or "").strip()
+    _is_new = not _existing_customer(tenant_id, str(payload.customer_id or ""))
+    if _is_new and not recovery_codes.is_deliverable(_email):
+        raise HTTPException(
+            status_code=400,
+            detail="A company email is required - it is where account "
+                   "recovery goes for users who have none of their own.")
     # Auto-generate a customer_id when the portal sends an empty one.
     # control_plane_store.upsert_customer falls back to 'cust-<8hex>' if
     # we don't supply one, but _customer_tenant_id below needs the id
@@ -2784,11 +2863,35 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
         # Materialize local control-plane scope so license-check can validate immediately.
         step = "upsert_customer"
         if customer_id:
+            # 2026-10-20: this passed company_name=customer_id and
+            # contact_email="" unconditionally, and upsert_customer REPLACES
+            # the row. So re-activating an edge overwrote the company's name
+            # with its raw id and BLANKED its contact address.
+            #
+            # That address is where a recovery code goes for every user in
+            # the company who has none of their own, so activation was
+            # quietly destroying the only way back in for those users. Same
+            # shape as the four earlier blank-writes: a writer that was not
+            # given a value wrote an empty one over a good one.
+            #
+            # Finalize does not carry these fields, so it must not claim to
+            # know them: keep what is already there, and only fall back to
+            # the id when the row is new.
+            _existing = {}
+            try:
+                for _row in (control_plane_store.list_customers(
+                        tenant_id=tenant_id) or []):
+                    if str(_row.get("customer_id") or "") == customer_id:
+                        _existing = _row
+                        break
+            except Exception:
+                _existing = {}
             control_plane_store.upsert_customer(
                 tenant_id=tenant_id,
                 customer_id=customer_id,
-                company_name=customer_id,
-                contact_email="",
+                company_name=(str(_existing.get("company_name") or "").strip()
+                              or customer_id),
+                contact_email=str(_existing.get("contact_email") or "").strip(),
                 status="active",
                 metadata={"source": "edge_local_finalize"},
             )

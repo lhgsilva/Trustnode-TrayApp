@@ -234,7 +234,13 @@ class ReportsStore:
         Runs in a background thread so the local save doesn't block on a
         cloud round-trip (same pattern as `_mirror_config_doc_to_cloud`).
         """
-        from .app_store import app_store  # local import to avoid a cycle
+        # 2026-10-20: this said `from .app_store import app_store` and that
+        # name does not exist - the module defines the CLASS AppStore and
+        # the singleton lives in app.state. So both mirror paths raised
+        # ImportError on their first line and every template push was
+        # swallowed by the caller's except. Supabase held 1 template while
+        # two edges held 15 and 269, and Lite's Templates tab was empty.
+        from app.state import app_store  # late import to avoid a cycle
         try:
             cloud = app_store._get_cloud_database_target()  # noqa: SLF001
         except Exception:
@@ -294,7 +300,7 @@ class ReportsStore:
 
         Returns the count of templates attempted.
         """
-        from .app_store import app_store  # local import to avoid cycle
+        from app.state import app_store  # late import to avoid a cycle
         try:
             cloud = app_store._get_cloud_database_target()  # noqa: SLF001
         except Exception:

@@ -256,10 +256,24 @@ check("  and neither reaches outside the window it was asked for",
 check("  the endpoint answered at all", all(
           isinstance(results[k][0].get("rows"), list) for k in results),
       "a 200 with a rows array, whatever the fixture could serve")
+# 2026-10-20: this asked for span(60min) > span(2min) * 10, i.e. more than
+# 1200 s, from a fixture that holds 244 s in total. The endpoint was right -
+# it returned 240 of the 244 seconds that exist - and the gate failed anyway,
+# blocking every commit. A fixed multiple cannot be asserted against a slice
+# whose length nobody controls.
+#
+# The point of the check is unchanged: the old row-budget path returned ~90 s
+# whatever you asked for, because 99 tags per sample ate the budget. So
+# measure against what the copy HOLDS, like every neighbouring check does.
+# Under the old bug span(60min) would still be ~90 s against 244 s present,
+# which fails this just as hard.
 check("  the wide window really is wider",
-      span_seconds(sixty) > span_seconds(two) * 10 or not two,
-      "%.0f s vs %.0f s - the old row-budget path returned ~90 s for both"
-      % (span_seconds(sixty), span_seconds(two)))
+      not two
+      or (span_seconds(sixty) > span_seconds(two)
+          and span_seconds(sixty) >= have60 * 0.9),
+      "%.0f s returned for %d s present, vs %.0f s in the 2-min window - "
+      "the old row-budget path returned ~90 s for both"
+      % (span_seconds(sixty), have60, span_seconds(two)))
 
 print()
 print("[resolution is chosen for the window, not fixed]")

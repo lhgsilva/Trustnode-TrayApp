@@ -1938,6 +1938,29 @@ export async function runRetentionV2(dryRun = true, force = false, background = 
     timeoutMs: 60000,
   });
 }
+// 2026-10-20: operator-driven deletion, separate from the retention policy.
+// Retention decides by age on a schedule; this is "remove this, now". The
+// server is admin-only and always tenant-scoped - the cloud database is
+// shared between customers, so an unscoped delete there would take another
+// company's history with it.
+export async function getPurgeTargets() {
+  return _retentionCall("/data/purge/targets");
+}
+export async function purgeData({ targets, beforeUtc, scope = "local",
+                                  dryRun = true, confirm = false }) {
+  return _retentionCall("/data/purge", {
+    method: "POST",
+    body: {
+      targets: Array.isArray(targets) ? targets : [],
+      before_utc: String(beforeUtc || ""),
+      scope,
+      dry_run: !!dryRun,
+      confirm: !!confirm,
+    },
+    timeoutMs: 300000,
+  });
+}
+
 export async function getRetentionRunsV2(limit = 25) {
   return _retentionCall(`/retention/v2/runs?limit=${encodeURIComponent(String(limit))}`);
 }
