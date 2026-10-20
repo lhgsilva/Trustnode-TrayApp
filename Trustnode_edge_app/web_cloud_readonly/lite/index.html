@@ -228,9 +228,34 @@ function jwtTenantId(session) {
 // ============================================================
 // Utilities
 // ============================================================
+// 2026-10-20: THE historian timestamp parser. Everything that turns a stored
+// timestamp into milliseconds must come through here.
+//
+// The backend stores UTC in a column called ts_utc and serialises it as
+// "2026-10-20 20:21:28.491" - a SPACE, and no zone marker. Date.parse() reads
+// that shape as LOCAL time, so on a UTC+1 machine every sample looked exactly
+// one hour old: the header read "OFFLINE - 3608.5 s" while collection was
+// writing 1,870 rows every 15 seconds, the chart window excluded every
+// sample ("no samples"), and gatewayLastSeen aged out to "Gateways: 0/3".
+//
+// The value was right and the name was right; the READER was wrong - the
+// same trap as the Data Export window (CLAUDE.md 8).
+const tsMs = (v) => {
+  if (v === null || v === undefined || v === "") return NaN;
+  if (typeof v === "number") return v;
+  let str = String(v).trim();
+  if (!str) return NaN;
+  // Already zoned (…Z or ±HH:MM) or a bare date: let the engine decide.
+  const zoned = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(str);
+  if (!zoned) {
+    if (str.includes(" ") && !str.includes("T")) str = str.replace(" ", "T");
+    if (/\d{2}:\d{2}/.test(str)) str += "Z";   // a time with no zone IS UTC here
+  }
+  return Date.parse(str);
+};
 const fmtAge = (iso) => {
   if (!iso) return "never";
-  const t = Date.parse(iso);
+  const t = tsMs(iso);
   if (!Number.isFinite(t)) return "never";
   const dt = Math.max(0, Date.now() - t);
   if (dt < 1500) return "now";
@@ -252,7 +277,7 @@ const fmtTs = (iso) => {
   try { return new Date(iso).toLocaleString(); } catch { return String(iso); }
 };
 const freshnessClass = (ts) => {
-  const t = ts ? Date.parse(ts) : 0;
+  const t = ts ? tsMs(ts) : 0;
   if (!t) return "bad";
   const age = Date.now() - t;
   if (age < 10_000) return "fresh";
@@ -772,7 +797,7 @@ const chartTooltipProps = {
 function formatLiteTickTime(ts, formatKey) {
   if (!ts) return "";
   try {
-    const d = new Date(ts);
+    const d = new Date(tsMs(ts));
     if (!Number.isFinite(d.getTime())) return "";
     const opts = (() => {
       switch (String(formatKey || "hh_mm_ss").toLowerCase()) {
@@ -1242,10 +1267,13 @@ function useMultiSeries(widget, sampleCount) {
       const buf = buffersRef.current.get(def.id);
       if (!buf) continue;
       for (const [ts, value] of buf.entries()) {
-        const tsMs = Date.parse(ts);
-        if (!Number.isFinite(tsMs)) continue;
-        let row = byTs.get(tsMs);
-        if (!row) { row = { ts, perSeries: {} }; byTs.set(tsMs, row); }
+        // Named tMs, not tsMs: a local called tsMs would SHADOW the parser
+        // above, and every chart x-value would go back to being read as
+        // local time - the bug this whole helper exists to stop.
+        const tMs = tsMs(ts);
+        if (!Number.isFinite(tMs)) continue;
+        let row = byTs.get(tMs);
+        if (!row) { row = { ts, perSeries: {} }; byTs.set(tMs, row); }
         row.perSeries[def.id] = value;
       }
     }
@@ -1313,7 +1341,7 @@ function bucketMergedRows(merged, seriesDefs, groupKey, aggKey) {
   const reducer = String(aggKey || "last").toLowerCase();
   const buckets = new Map(); // bucketStartMs -> { ts, lastTs, valuesById: { id -> [..] }, lastById }
   for (const row of merged) {
-    const tsMs = Date.parse(row.ts || "");
+    const tsMs = tsMs(row.ts);
     if (!Number.isFinite(tsMs)) continue;
     const key = Math.floor(tsMs / bucketMs) * bucketMs;
     let b = buckets.get(key);
@@ -2595,7 +2623,7 @@ function StatusPill({ liveRows, transport, gatewayLastSeen }) {
   let newest = 0;
   for (const r of liveRows) {
     if (pickedTenantId && r.tenant_id !== pickedTenantId) continue;
-    const t = Date.parse(r.ts_utc || r.ts || "");  // `|| 0` parsed as the STRING "0" = year 2000, so one row with no timestamp reported the edge as 26.8 years offline (845835661.7 s on screen). NaN is ignored by the Number.isFinite guard below, which is what we want.
+    const t = tsMs(r.ts_utc || r.ts);  // `|| 0` parsed as the STRING "0" = year 2000, so one row with no timestamp reported the edge as 26.8 years offline (845835661.7 s on screen). NaN is ignored by the Number.isFinite guard below, which is what we want.
     if (Number.isFinite(t) && t > newest) newest = t;
   }
   // Count how many gateways have ever reported. If zero, this tenant has
@@ -3779,7 +3807,7 @@ function HistorianView() {
       }
       if (rangeMs > 0) {
         const fromMs = Date.now() - rangeMs;
-        const tsMs = Date.parse(String(r.ts_utc || ""));
+        const tsMs = tsMs(String(r.ts_utc || ""));
         if (Number.isFinite(tsMs) && tsMs < fromMs) return;
       }
       setRows((prev) => {
@@ -4121,11 +4149,11 @@ function useActiveAlarmCount() {
     for (const a of events) {
       if (!a || typeof a !== "object") continue;
       if (a.event_type !== "active" || a.acknowledged) continue;
-      const tsMs = Date.parse(String(a.ts || ""));
+      const tsMs = tsMs(String(a.ts || ""));
       if (!Number.isFinite(tsMs) || tsMs < cutoff) continue;
       const key = String(a.alert_key || a.id || `${a.gateway_id || ""}|${a.tag || ""}`);
       const prev = byKey.get(key);
-      if (!prev || tsMs > Date.parse(String(prev.ts || ""))) byKey.set(key, a);
+      if (!prev || tsMs > tsMs(String(prev.ts || ""))) byKey.set(key, a);
     }
     return byKey.size;
   }, [events]);
@@ -4174,11 +4202,11 @@ function ActiveAlarmsList() {
     for (const a of events) {
       if (!a || typeof a !== "object") continue;
       if (a.event_type !== "active" || a.acknowledged) continue;
-      const tsMs = Date.parse(String(a.ts || ""));
+      const tsMs = tsMs(String(a.ts || ""));
       if (!Number.isFinite(tsMs) || tsMs < cutoff) continue;
       const key = String(a.alert_key || a.id || `${a.gateway_id || ""}|${a.tag || ""}`);
       const prev = byKey.get(key);
-      if (!prev || tsMs > Date.parse(String(prev.ts || ""))) {
+      if (!prev || tsMs > tsMs(String(prev.ts || ""))) {
         byKey.set(key, a);
       }
     }
@@ -5473,7 +5501,7 @@ function App({ viewLink = null }) {
   const gatewayLastSeen = useMemo(() => {
     const m = {};
     for (const r of (liveRows || [])) {
-      const t = Date.parse(r.ts_utc || r.ts || "");  // `|| 0` parsed as the STRING "0" = year 2000, so one row with no timestamp reported the edge as 26.8 years offline (845835661.7 s on screen). NaN is ignored by the Number.isFinite guard below, which is what we want.
+      const t = tsMs(r.ts_utc || r.ts);  // `|| 0` parsed as the STRING "0" = year 2000, so one row with no timestamp reported the edge as 26.8 years offline (845835661.7 s on screen). NaN is ignored by the Number.isFinite guard below, which is what we want.
       if (Number.isFinite(t)) {
         const gid = r.gateway_id || "";
         if (gid && (!m[gid] || m[gid] < t)) m[gid] = t;

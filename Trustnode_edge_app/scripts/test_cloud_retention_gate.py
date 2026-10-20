@@ -111,6 +111,58 @@ check("the count is bounded by a cap",
       "million rows, which is exactly what the first version did")
 
 print()
+print("[4b. cleaning the cloud must not cost us the data going into it]")
+# 2026-10-20, reported: a backlog warning every cycle. The forwarder was
+# pushing ZERO rows while collection produced 110/s, and data_sync_state
+# held the reason:
+#   Data sync failed: (psycopg.errors.DeadlockDetected) deadlock detected
+#   LINE 2: INSERT INTO "public"."plc_readings"...
+# The prune's DELETE deadlocked against the edge's own INSERT on the same
+# table, and the deadlock aborted the WHOLE data-sync transaction - so every
+# batch was lost and the backlog grew without bound.
+check("the delete yields rather than fights",
+      "FOR UPDATE SKIP LOCKED" in seg,
+      "a row the forwarder is touching must be left for the next pass, not "
+      "waited on")
+check("  a deadlock is caught, not propagated",
+      'if "deadlock" in str(exc).lower():' in seg,
+      "it aborted the run and took the forwarder's transaction with it")
+check("  and it backs off rather than spinning",
+      "deadlocks >= 3" in seg and "time.sleep(1.0)" in seg,
+      "retrying a deadlock immediately just deadlocks again")
+check("  the rollback happens before the retry",
+      "cx.rollback()" in seg,
+      "a failed transaction must be closed or the connection is unusable")
+
+print()
+print("[4c. the cloud schema bootstrap must not fight the forwarder]")
+# 2026-10-20: the forwarder pushed ZERO rows while collection produced 110/s.
+# Postgres named the culprit:
+#   deadlock detected
+#   Process A waits for RowExclusiveLock    ... INSERT INTO plc_readings
+#   Process B waits for AccessExclusiveLock ... blocked by A
+# ALTER TABLE ... ADD COLUMN IF NOT EXISTS takes an AccessExclusiveLock EVEN
+# WHEN THE COLUMN ALREADY EXISTS, and the ready-set is per PROCESS, so every
+# restart re-ran the whole DDL pass against a 51 GB table. After the fix the
+# forwarder went from 0 to 1,633 rows/s and the backlog drained.
+APP = io.open(os.path.join(ROOT, "backend", "app", "services", "app_store.py"),
+              encoding="utf-8").read()
+# Bound on the NEXT def, not on the first .add - the early return added by
+# the fix also calls .add, which would truncate the slice before the rest.
+seg2 = APP[APP.index("def _ensure_cloud_schema_once"):]
+seg2 = seg2[:seg2.index(chr(10) + "    def ", 10)]
+check("it reads the catalogue before issuing DDL",
+      "information_schema.columns" in seg2,
+      "a catalogue SELECT takes no lock; ALTER TABLE takes an "
+      "AccessExclusiveLock even when it changes nothing")
+check("  and returns early when the schema is current",
+      "required.issubset(have_cols)" in seg2,
+      "the common case must cost one cheap SELECT and block nothing")
+check("  it still falls through to DDL when it cannot tell",
+      "cannot tell -> fall through" in seg2,
+      "a probe failure must not skip a bootstrap that is genuinely needed")
+
+print()
 print("[5. it is honest about what deleting does NOT do]")
 check("it says rows are freed, not disk",
       "VACUUM FULL" in seg,

@@ -2186,14 +2186,50 @@ class RetentionEngine:
                             if int(n) >= cap:
                                 per_table["capped"] = True
                             continue
+                        # 2026-10-20: FOR UPDATE SKIP LOCKED is not optional.
+                        # Without it this DELETE deadlocked against the edge's
+                        # own forwarder inserting into the same table:
+                        #
+                        #   Data sync failed: (psycopg.errors.DeadlockDetected)
+                        #   deadlock detected
+                        #   LINE 2: INSERT INTO "public"."plc_readings"...
+                        #
+                        # The deadlock aborts the WHOLE data-sync transaction,
+                        # so the forwarder lost every batch and pushed 0 rows
+                        # while collection kept producing 110/s - the backlog
+                        # grew without bound and the operator got a backlog
+                        # warning every cycle. Cleaning the cloud must never
+                        # cost us the data we are still trying to put in it.
+                        #
+                        # SKIP LOCKED makes the prune yield: any row the
+                        # forwarder is touching is simply left for the next
+                        # pass. A deadlock is still possible on index pages,
+                        # so it is also caught and backed off rather than
+                        # bubbling out and killing the run.
+                        deadlocks = 0
                         while budget > 0 and time.time() <= deadline:
-                            res = cx.execute(_sql(
-                                f'DELETE FROM "{schema}"."{table}" WHERE id IN ('
-                                f'  SELECT id FROM "{schema}"."{table}" '
-                                f'  WHERE tenant_id = :t AND ts_utc < :c '
-                                f'  ORDER BY id LIMIT :n)'),
-                                {"t": tenant, "c": cutoff, "n": batch})
-                            cx.commit()
+                            try:
+                                res = cx.execute(_sql(
+                                    f'DELETE FROM "{schema}"."{table}" WHERE id IN ('
+                                    f'  SELECT id FROM "{schema}"."{table}" '
+                                    f'  WHERE tenant_id = :t AND ts_utc < :c '
+                                    f'  ORDER BY id LIMIT :n '
+                                    f'  FOR UPDATE SKIP LOCKED)'),
+                                    {"t": tenant, "c": cutoff, "n": batch})
+                                cx.commit()
+                            except Exception as exc:  # noqa: BLE001
+                                try:
+                                    cx.rollback()
+                                except Exception:
+                                    pass
+                                if "deadlock" in str(exc).lower():
+                                    deadlocks += 1
+                                    per_table["deadlocks"] = deadlocks
+                                    if deadlocks >= 3:
+                                        break        # leave the table alone
+                                    time.sleep(1.0)
+                                    continue
+                                raise
                             got = int(res.rowcount or 0)
                             budget -= 1
                             per_table["batches"] += 1

@@ -595,11 +595,28 @@ class AppStore:
             # (when running in cloud-canonical mode) + the Lite mirror
             # all share this engine. Bumped from 4+4 to 8+12 (max 20)
             # to ride out portal-page-load bursts that fire ~10 cp_*
-            # endpoints in parallel without exhausting the pool. The
-            # Supabase Pooler can comfortably hold ~30 concurrent
-            # connections per project; we're well under that.
-            pool_size = int(os.environ.get("TRUSTNODE_CLOUD_DB_POOL_SIZE", "8") or "8")
-            max_overflow = int(os.environ.get("TRUSTNODE_CLOUD_DB_MAX_OVERFLOW", "12") or "12")
+            # endpoints in parallel without exhausting the pool.
+            #
+            # 2026-10-20: the previous comment here said "the Supabase Pooler
+            # can comfortably hold ~30 concurrent connections per project;
+            # we're well under that" at 8 + 12 = 20. The pooler disagreed:
+            #
+            #   FATAL: (EMAXCONNSESSION) max clients reached in session mode
+            #          max clients are limited to pool_size: 15
+            #
+            # So the edge alone could ask for more than the project allows,
+            # and once it did the forwarder could not get a connection at
+            # all: it pushed ZERO rows while collection produced 110/s, the
+            # failures surfaced as deadlocks, and the operator got a backlog
+            # warning every cycle on a growing queue.
+            #
+            # 4 + 4 leaves most of the 15 for everything else that shares the
+            # project - Lite, the portal, the report mirror, an operator with
+            # psql. A forwarder doing batched inserts is sequential; it has
+            # never needed eight connections, and running out of them costs
+            # far more than queueing for one.
+            pool_size = int(os.environ.get("TRUSTNODE_CLOUD_DB_POOL_SIZE", "4") or "4")
+            max_overflow = int(os.environ.get("TRUSTNODE_CLOUD_DB_MAX_OVERFLOW", "4") or "4")
             engine = create_engine(
                 url,
                 pool_pre_ping=True,
@@ -884,6 +901,42 @@ class AppStore:
             if target_key in self._cloud_schema_ready_keys:
                 return
             from sqlalchemy import text  # type: ignore
+
+            # 2026-10-20: skip the whole DDL pass when the schema is already
+            # current. This set is per PROCESS, so every restart re-ran the
+            # bootstrap - and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes
+            # an AccessExclusiveLock EVEN WHEN THE COLUMN EXISTS. Against a
+            # 51 GB plc_readings that collided with our own forwarder:
+            #
+            #   deadlock detected
+            #   Process A waits for RowExclusiveLock   ... INSERT plc_readings
+            #   Process B waits for AccessExclusiveLock ... blocked by A
+            #
+            # The deadlock aborts the whole data-sync transaction, so the
+            # forwarder pushed ZERO rows while collection produced 110/s and
+            # the backlog grew without bound.
+            #
+            # Reading the catalogue takes no lock at all, so the common case
+            # (schema already correct) now costs one cheap SELECT and cannot
+            # block anything.
+            try:
+                with engine.connect() as probe:
+                    have_cols = set(probe.execute(text(
+                        "SELECT table_name || '.' || column_name "
+                        "FROM information_schema.columns WHERE table_schema = :s"),
+                        {"s": schema}).scalars().all())
+                required = {
+                    "historian_readings.local_id", "historian_readings.tenant_id",
+                    "historian_readings.tag_name", "historian_readings.ts_utc",
+                    "plc_readings.local_id", "plc_readings.tenant_id",
+                    "plc_readings.tag_name", "plc_readings.ts_utc",
+                    "live_latest.tenant_id", "live_latest.tag_name",
+                }
+                if required.issubset(have_cols):
+                    self._cloud_schema_ready_keys.add(target_key)
+                    return
+            except Exception:
+                pass            # cannot tell -> fall through and do the DDL
 
             with engine.begin() as conn:
                 if schema != "public":

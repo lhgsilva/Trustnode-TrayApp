@@ -177,9 +177,39 @@ check("no Date.parse(... || 0) remains",
       "Date.parse(r.ts_utc || 0)" not in LITE,
       "the number 0 coerces to the string \"0\", which parses as "
       "2000-01-01 and reported 845835661.7 s offline")
-check("  it falls back to ts and then to an unparseable value",
-      'Date.parse(r.ts_utc || r.ts || "")' in LITE,
-      "NaN is ignored by the Number.isFinite guard, which is correct")
+check("  it falls back to ts, then to NaN",
+      "tsMs(r.ts_utc || r.ts)" in LITE,
+      "NaN is ignored by the Number.isFinite guards, which is correct")
+
+print()
+print("[4b. a stored UTC timestamp is not read as local time]")
+# 2026-10-20, second report: "lite lan app still not working". The rows were
+# arriving correctly by then - collection was writing 1,870 every 15 s - but
+# the header read "OFFLINE - 3608.5 s" and the chart said "no samples".
+# 3608.5 s is one hour: this machine is UTC+1, and the backend serialises
+# ts_utc as "2026-10-20 20:21:28.491" - a SPACE and no zone. Date.parse()
+# reads that shape as LOCAL, so every sample looked exactly one timezone
+# offset old and fell outside the chart window.
+check("there is ONE timestamp parser",
+      "const tsMs = (v) =>" in LITE,
+      "eleven call sites each doing their own Date.parse is how half of "
+      "them end up wrong")
+check("  it appends Z to a zone-less time",
+      'str += "Z"' in LITE,
+      "the column is named ts_utc and the value IS utc; only the reader "
+      "was wrong")
+check("  it leaves an already-zoned value alone",
+      "const zoned =" in LITE,
+      "appending Z to '...+00:00' would produce an unparseable string")
+_code = chr(10).join(
+    ln for ln in LITE.splitlines() if not ln.strip().startswith("//"))
+check("  no raw Date.parse survives outside it",
+      _code.count("Date.parse(") == 1,
+      "found %d in CODE (the helper itself is the one) - every stored "
+      "timestamp must go through tsMs()" % _code.count("Date.parse("))
+check("  and no local variable shadows it",
+      "const tsMs = Date.parse" not in LITE,
+      "a local called tsMs would silently restore the bug inside that scope")
 
 print()
 print("[5. the endpoint says why, for whoever edits it next]")
