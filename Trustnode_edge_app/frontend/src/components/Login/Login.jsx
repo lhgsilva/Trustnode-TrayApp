@@ -146,16 +146,20 @@ export const Login = ({
     setForgotBusy(true);
     setForgotResult("");
     try {
+      // 2026-10-20 (SECURITY): this used to read res.row.reset_token and
+      // PUT THE CODE ON SCREEN. That was the client half of an account
+      // takeover - the endpoint handed the token to any unauthenticated
+      // caller, so anyone at a login screen could reset anyone's password.
+      //
+      // The code now goes to the account's registered email and never comes
+      // back in the response. The operator types what they received.
       const res = await issuePublicPasswordReset({
         username,
         tenant_id: String(forgotForm.tenant_id || "").trim(),
         ttl_minutes: 15,
       });
-      const token = String(res?.row?.reset_token || "");
-      setForgotForm((prev) => ({ ...prev, reset_token: token || prev.reset_token }));
-      setForgotResult(token
-        ? "Verification code generated. Use this code to set a new password."
-        : "Verification code issued. Check portal/admin support channel.");
+      setForgotResult(String(res?.message || "")
+        || "If that account exists and has a registered email, a code has been sent to it.");
     } catch (err) {
       setForgotResult(`Code request failed: ${String(err?.message || err)}`);
     } finally {

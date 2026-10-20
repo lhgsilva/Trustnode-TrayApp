@@ -1369,6 +1369,13 @@ PUBLIC_PATHS = {
     "/api/auth/refresh",
     "/api/auth/me",
     "/api/auth/forgot-password",
+    # 2026-10-20: the code flows. Every one of these is for somebody who
+    # CANNOT sign in - behind the auth gate they would be unreachable by the
+    # only people who need them. Each is rate limited, audited, and answers
+    # identically whether or not the account exists.
+    "/api/auth/login-code/request",
+    "/api/auth/login-code/verify",
+    "/api/auth/reset-password/code",
     "/api/auth/reset-password",
     # 2026-08-25: a locked-out edge must be recoverable BY SOMEONE AT THE
     # MACHINE. These are unauthenticated by necessity - the operator has no

@@ -1,7 +1,7 @@
 import logging
 import time
 from collections import defaultdict
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Request, Response
 from app.services import access_policy as _access
@@ -574,6 +574,26 @@ def change_password(payload: ChangePasswordRequest, request: Request) -> Dict[st
 
 class _ForgotPasswordPayload(BaseModel):
     identifier: str = ""
+    #: "code" asks for a 6-digit code by email (the default from 2026-10-20);
+    #: "link" keeps the original SMTP reset link for an edge with no
+    #: internet, which Supabase cannot reach.
+    delivery: str = "code"
+
+
+class _CodeRequestPayload(BaseModel):
+    """Ask for a sign-in code. No password involved."""
+    identifier: str = ""
+
+
+class _CodeVerifyPayload(BaseModel):
+    identifier: str = ""
+    code: str = ""
+
+
+class _CodeResetPayload(BaseModel):
+    identifier: str = ""
+    code: str = ""
+    new_password: str = ""
 
 
 class _ResetPasswordPayload(BaseModel):
@@ -664,6 +684,24 @@ def forgot_password(payload: _ForgotPasswordPayload, request: Request) -> Dict[s
         return {"ok": True, "message": "If a matching account exists, a reset email has been sent."}
     username = str(u.get("username") or "")
     email = str(u.get("email") or "")
+    # 2026-10-20: a code by default, the link only when asked for. The link
+    # still exists because an edge with no internet cannot be reached by
+    # Supabase, and that is exactly the machine whose operator is locked out.
+    if str(payload.delivery or "code").strip().lower() == "code":
+        from app.services import recovery_codes
+        if recovery_codes.is_deliverable(email):
+            sent, reason = recovery_codes.send_code(
+                email, otp_type=recovery_codes.OTP_RECOVERY)
+            try:
+                auth_store.record_login(
+                    username, ok=bool(sent), remote_ip=client_host,
+                    detail=f"forgot_password_code:{reason}")
+            except Exception:
+                pass
+            if sent:
+                return {"ok": True, "message": "If a matching account exists, a reset email has been sent."}
+        # Supabase unreachable or no usable address: fall through to the link,
+        # rather than leaving the operator with nothing.
     token = None
     try:
         token = auth_store.issue_reset_token(username, ttl_seconds=1800)
@@ -684,6 +722,154 @@ def forgot_password(payload: _ForgotPasswordPayload, request: Request) -> Dict[s
     except Exception:
         pass
     return {"ok": True, "message": "If a matching account exists, a reset email has been sent."}
+
+
+# ---------------------------------------------------------------- codes
+#
+# 2026-10-20, requested: "instead of forget password, the users can request a
+# code ... I want to use supabase features for that", and sign-in by code
+# alone ("email should be enough").
+#
+# Supabase owns generation, expiry and delivery for all three endpoints
+# below, so there is no second code store here to keep, expire or leak. The
+# edge's existing SMTP link flow and its offline file-based recovery are left
+# exactly as they are: a machine on a factory LAN with no internet cannot be
+# rescued by an email service, and removing that path would lock people out.
+#
+# Every one of these answers the SAME way whether or not the account exists.
+
+
+_GENERIC_CODE_REPLY = (
+    "If that account exists and has a registered email, a code has been sent to it."
+)
+
+
+def _lookup_user_email(identifier: str) -> tuple[Optional[Dict[str, Any]], str]:
+    """(user_row, email) for a username or email, or (None, "")."""
+    try:
+        u = auth_store.find_user_by_email_or_username(identifier)
+    except Exception:
+        u = None
+    if not u:
+        return None, ""
+    return u, str(u.get("email") or "")
+
+
+@router.post("/login-code/request")
+def login_code_request(payload: _CodeRequestPayload, request: Request) -> Dict[str, Any]:
+    """Email a sign-in code. Nobody types a password in this flow."""
+    client_host = str(getattr(request.client, "host", "") or "unknown")
+    _check_rate_limit(client_host)
+    identifier = str(payload.identifier or "").strip()
+    if not identifier:
+        return {"ok": True, "message": _GENERIC_CODE_REPLY}
+    from app.services import recovery_codes
+    user, email = _lookup_user_email(identifier)
+    sent, reason = (False, "unknown_user")
+    if user and recovery_codes.is_deliverable(email):
+        sent, reason = recovery_codes.send_code(
+            email, otp_type=recovery_codes.OTP_MAGIC_LINK)
+    try:
+        auth_store.record_login(
+            str((user or {}).get("username") or identifier), ok=bool(sent),
+            remote_ip=client_host, detail=f"login_code_request:{reason}")
+    except Exception:
+        pass
+    return {"ok": True, "message": _GENERIC_CODE_REPLY}
+
+
+@router.post("/login-code/verify")
+def login_code_verify(payload: _CodeVerifyPayload, request: Request,
+                      response: Response) -> Dict[str, Any]:
+    """Verify an emailed code and sign the user in.
+
+    The code IS the credential here - that is the operator's decision
+    ("email should be enough"), and it is what Slack, Notion and Linear do.
+    It also means an attacker with mailbox access is an attacker with account
+    access, so this is deliberately rate limited and fully audited.
+    """
+    client_host = str(getattr(request.client, "host", "") or "unknown")
+    _check_rate_limit(client_host)
+    identifier = str(payload.identifier or "").strip()
+    code = str(payload.code or "").strip()
+    if not identifier or not code:
+        raise HTTPException(status_code=400, detail="Identifier and code are required")
+    from app.services import recovery_codes
+    user, email = _lookup_user_email(identifier)
+    ok = False
+    if user and recovery_codes.is_deliverable(email):
+        ok, _tok, _why = recovery_codes.verify_code(
+            email, code, otp_type=recovery_codes.OTP_MAGIC_LINK)
+    if not ok or not user:
+        try:
+            auth_store.record_login(identifier, ok=False, remote_ip=client_host,
+                                    detail="login_code_verify_failed")
+        except Exception:
+            pass
+        # Same answer as a wrong password, for the same reason.
+        raise HTTPException(status_code=401, detail="That code is not valid")
+    user_public = _public_user(user)
+    _ttl = 4 * 3600
+    token = create_access_token(user_public, expires_seconds=_ttl)
+    try:
+        auth_store.clear_failed_attempts(user_public["username"])
+        auth_store.record_login(user_public["username"], ok=True,
+                                remote_ip=client_host, detail="login_code")
+    except Exception:
+        pass
+    return {"ok": True, "token": token, "user": user_public,
+            "expires_in": _ttl}
+
+
+@router.post("/reset-password/code")
+def reset_password_with_code(payload: _CodeResetPayload,
+                             request: Request) -> Dict[str, Any]:
+    """Set a new password using the emailed recovery code."""
+    client_host = str(getattr(request.client, "host", "") or "unknown")
+    _check_rate_limit(client_host)
+    identifier = str(payload.identifier or "").strip()
+    code = str(payload.code or "").strip()
+    new_password = str(payload.new_password or "")
+    if not identifier or not code:
+        raise HTTPException(status_code=400, detail="Identifier and code are required")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    from app.services import recovery_codes
+    user, email = _lookup_user_email(identifier)
+    ok = False
+    if user and recovery_codes.is_deliverable(email):
+        ok, _tok, _why = recovery_codes.verify_code(
+            email, code, otp_type=recovery_codes.OTP_RECOVERY)
+    if not ok or not user:
+        try:
+            auth_store.record_login(identifier, ok=False, remote_ip=client_host,
+                                    detail="reset_code_failed")
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail="That code is not valid")
+    username = str(user.get("username") or "")
+    # Same policy and the same hashing scheme as /reset-password - a second
+    # way in must not be a weaker way in.
+    try:
+        _role = str((auth_store.get_user(username) or {}).get("role") or "")
+    except Exception:
+        _role = ""
+    _policy_err = _password_policy_error(new_password, _role)
+    if _policy_err:
+        raise HTTPException(status_code=400, detail=_policy_err)
+    try:
+        new_hash = app_store._hash_password_if_needed(new_password)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Password hashing failed: {exc}") from exc
+    if not auth_store.set_user_password(username, new_hash):
+        raise HTTPException(status_code=400, detail="Could not set the password")
+    try:
+        auth_store.clear_failed_attempts(username)
+        auth_store.record_login(username, ok=True, remote_ip=client_host,
+                                detail="reset_password_code")
+    except Exception:
+        pass
+    return {"ok": True, "message": "Password updated. You can sign in now."}
 
 
 @router.post("/reset-password")

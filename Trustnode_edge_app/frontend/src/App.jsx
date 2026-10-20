@@ -178,6 +178,7 @@ import {
   setControlPlaneUserPassword,
   generateControlPlaneUserTempPassword,
   changeOwnPassword,
+  setAuthToken,
   issueControlPlaneActivationCode,
   applyControlPlaneActivationCode,
   getControlPlaneActivationCodes,
@@ -22504,6 +22505,24 @@ const getGatewayHealth = (gateway) => {
                     <SwitchUserIcon />
                     <span>Switch User</span>
                   </button>
+                  {/* 2026-10-20, requested: "we should have a way to change
+                      the password when logged using the user logged in
+                      button, together with logout option". The modal that
+                      already exists for a temporary password does exactly
+                      this job, so it is reused rather than rebuilt. */}
+                  <button
+                    className="user-menu-item"
+                    onClick={() => {
+                      setShowUserMenu(false);
+                      setForceChangePassword({
+                        current: "", next: "", confirm: "",
+                        error: "", busy: false, voluntary: true,
+                      });
+                    }}
+                  >
+                    <span style={{ width: 16, textAlign: "center" }}>•</span>
+                    <span>Change password</span>
+                  </button>
                   <button className="user-menu-item" onClick={logout}>
                     <LogoutIcon />
                     <span>Logout</span>
@@ -34209,14 +34228,15 @@ const getGatewayHealth = (gateway) => {
       {forceChangePassword ? (
         <div className="modal-backdrop">
           <div className="modal-card" style={{ minWidth: 420 }}>
-            <h3>Set your password</h3>
+            <h3>{forceChangePassword.voluntary ? "Change your password" : "Set your password"}</h3>
             <p style={{ fontSize: 13, lineHeight: 1.4, opacity: 0.85 }}>
-              An administrator issued you a temporary password. Choose
-              your own password now before continuing.
+              {forceChangePassword.voluntary
+                ? "Enter your current password, then choose a new one."
+                : "An administrator issued you a temporary password. Choose your own password now before continuing."}
             </p>
             <div className="form-grid" style={{ marginTop: 8 }}>
               <label>
-                Current (temporary) password
+                {forceChangePassword.voluntary ? "Current password" : "Current (temporary) password"}
                 <input
                   type="password"
                   value={forceChangePassword.current || ""}
@@ -34265,15 +34285,29 @@ const getGatewayHealth = (gateway) => {
                   setForceChangePassword((p) => ({ ...p, busy: true, error: "" }));
                   try {
                     const res = await changeOwnPassword(String(forceChangePassword.current || ""), next);
-                    if (res?.token) {
-                      try { localStorage.setItem("auth_token", String(res.token)); } catch (_) {}
-                    }
+                    // 2026-10-20: this wrote the fresh token to "auth_token"
+                    // while every reader uses "trustnode_auth_token"
+                    // (AUTH_TOKEN_KEY in api.js). So changing your password
+                    // left the app holding the OLD token - which the change
+                    // had just invalidated - and the next call failed with
+                    // "session expired". setAuthToken owns that key.
+                    if (res?.token) setAuthToken(String(res.token));
                     setForceChangePassword(null);
                   } catch (err) {
                     setForceChangePassword((p) => ({ ...p, busy: false, error: String(err?.message || err) }));
                   }
                 }}
               >Save</button>
+              {/* A FORCED change has no way out on purpose - that is the
+                  point of it. One the user opened themselves must be
+                  escapable, or the menu item is a trap. */}
+              {forceChangePassword.voluntary ? (
+                <button
+                  className="btn btn-secondary"
+                  disabled={!!forceChangePassword.busy}
+                  onClick={() => setForceChangePassword(null)}
+                >Cancel</button>
+              ) : null}
             </div>
           </div>
         </div>

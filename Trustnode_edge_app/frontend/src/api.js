@@ -3582,6 +3582,50 @@ export async function applyControlPlanePasswordReset(payload, tenantId = "") {
   return res.json();
 }
 
+// --- sign-in and recovery by emailed code (2026-10-20) -------------------
+//
+// Requested: "instead of forget password, the users can request a code", and
+// sign-in by code alone ("email should be enough"). Supabase generates,
+// expires and delivers; the edge only verifies. None of these ever return
+// the code - it goes to the account's registered email and nowhere else.
+
+export async function requestLoginCode(identifier) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/auth/login-code/request`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ identifier: String(identifier || "") })
+  });
+  await ensureOk(res, "Could not request a sign-in code");
+  return res.json();
+}
+
+export async function verifyLoginCode(identifier, code) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/auth/login-code/verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ identifier: String(identifier || ""), code: String(code || "") })
+  });
+  await ensureOk(res, "That code is not valid");
+  const body = await res.json();
+  // The code IS the credential, so a success here is a signed-in session.
+  if (body?.token) setAuthToken(String(body.token));
+  return body;
+}
+
+export async function resetPasswordWithCode(identifier, code, newPassword) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/auth/reset-password/code`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      identifier: String(identifier || ""),
+      code: String(code || ""),
+      new_password: String(newPassword || ""),
+    })
+  });
+  await ensureOk(res, "Could not set the password");
+  return res.json();
+}
+
 export async function issuePublicPasswordReset(payload) {
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/password-reset/public/issue`, {
     method: "POST",

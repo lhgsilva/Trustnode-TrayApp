@@ -190,6 +190,11 @@ SOURCE_CHECKS = [
     # and returned the reset token in its own response body - account
     # takeover in two requests, on a route reachable from the internet.
     ("public reset leaks no token", "test_public_reset_no_token_leak.py"),
+    # 2026-10-20: sign in and recover with an emailed code, and change a
+    # password from the user menu. The code endpoints must stay PUBLIC -
+    # behind the auth gate they are unreachable by the only people who need
+    # them, which is how the first version shipped.
+    ("sign-in and recovery by code", "test_login_codes.py"),
     # 2026-10-17: "Clear All Alarms" only emptied React state. alarms_setup is
     # a protected collection, so the save was refused server-side (12 times
     # since 2026-08-26) and the catch block said nothing - the 300 stored
