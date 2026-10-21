@@ -175,6 +175,11 @@ LOG = os.path.expanduser(r"~\AppData\Roaming\trustnode-edge-desktop\backend.log"
 # boot regression that hit users on every launch can never ship again.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import boot_log_check as _boot  # noqa: E402
+
+#: When this run began - the boot block is judged against this,
+#: not against the wall clock, so a long soak does not fail
+#: simply because its own duration aged the boot out.
+RUN_STARTED_AT = time.time()
 import validate_surfaces as _surf  # noqa: E402  (2026-08-21: LAN surfaces + access policy)
 import validate_licence_and_views as _lic  # noqa: E402  (2026-08-29: licensing, customers, Lite/web views)
 BOOT_MAX_HEALTH_MS = int(os.environ.get("VAL_BOOT_MAX_HEALTH_MS", "15000"))
@@ -832,7 +837,7 @@ def build_summary(t0: float, final: bool) -> str:
     # verdict
     A("\n[VERDICT vs SLOs]")
     ok = True
-    b_ok, b_lines = _boot.verdict(boot_metrics, BOOT_MAX_HEALTH_MS)
+    b_ok, b_lines = _boot.verdict(boot_metrics, BOOT_MAX_HEALTH_MS, run_started_at=RUN_STARTED_AT)
     for ln in b_lines:
         A(ln)
     ok &= b_ok
@@ -917,7 +922,7 @@ async def main() -> int:
     emit({"t": "start", "duration": DURATION_S, "gw": GW})
     boot_metrics.update(_boot.analyze_last_boot(LOG))
     emit({"t": "boot", **{k: v for k, v in boot_metrics.items() if k != "integrity"}})
-    _b_ok, _b_lines = _boot.verdict(boot_metrics, BOOT_MAX_HEALTH_MS)
+    _b_ok, _b_lines = _boot.verdict(boot_metrics, BOOT_MAX_HEALTH_MS, run_started_at=RUN_STARTED_AT)
     print("[BOOT HEALTH] " + ("PASS" if _b_ok else "FAIL") + "\n" + "\n".join(_b_lines), flush=True)
     print(f"validation started {datetime.now(timezone.utc).isoformat()[:19]}Z "
           f"for {DURATION_S/3600:.1f}h — gateway {GW}", flush=True)

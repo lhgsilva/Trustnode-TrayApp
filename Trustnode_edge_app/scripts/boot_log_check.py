@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 
 DEFAULT_LOG = os.path.expanduser(r"~\AppData\Roaming\trustnode-edge-desktop\backend.log")
@@ -142,7 +143,8 @@ def _boot_age_s(m: dict) -> float | None:
     return max(0.0, (datetime.now(timezone.utc) - when).total_seconds())
 
 
-def verdict(m: dict, max_health_ms: int = DEFAULT_MAX_HEALTH_MS) -> tuple[bool, list[str]]:
+def verdict(m: dict, max_health_ms: int = DEFAULT_MAX_HEALTH_MS,
+            run_started_at: float | None = None) -> tuple[bool, list[str]]:
     """(ok, lines) - every line reads 'name : PASS/FAIL (detail)'."""
     L: list[str] = []
     ok = True
@@ -159,11 +161,21 @@ def verdict(m: dict, max_health_ms: int = DEFAULT_MAX_HEALTH_MS) -> tuple[bool, 
     #
     # It still FAILS, because boot genuinely has not been verified - but it
     # says which of the two it is.
+    # 2026-10-21: judge the boot against WHEN THE RUN STARTED, not against
+    # now. The first version compared to wall-clock, so an 8-hour soak failed
+    # this by construction: the app booted before the run, and by the time the
+    # report printed that boot was 8.1 hours old. The question is not "was
+    # this boot recent" but "was it the boot of the build under test".
     age = _boot_age_s(m)
-    if age is not None and age > STALE_BOOT_AFTER_S:
-        L.append("  boot block is from THIS run  : FAIL (last boot %s, %.1fh ago - "
-                 "this is not a measurement of the current build. Launch the "
-                 "app so a fresh boot is recorded, then re-run.)"
+    if run_started_at is not None:
+        allowance = max(STALE_BOOT_AFTER_S,
+                        (time.time() - float(run_started_at)) + STALE_BOOT_AFTER_S)
+    else:
+        allowance = STALE_BOOT_AFTER_S
+    if age is not None and age > allowance:
+        L.append("  boot block is from THIS run  : FAIL (last boot %s, %.1fh ago, "
+                 "older than this run - it is not a measurement of the build "
+                 "under test. Launch the app, then re-run.)"
                  % (m.get("boot_started_utc"), age / 3600.0))
         ok = False
     ms = m.get("health_since_spawn_ms")
