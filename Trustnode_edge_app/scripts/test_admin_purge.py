@@ -287,5 +287,27 @@ check("  and it is paced, not one giant DELETE",
       "a multi-minute write lock stalls collection behind it")
 
 print()
+print("[7. the cloud preview answers fast enough for a browser]")
+# 2026-10-21: the Delete data card showed "Failed to fetch" with Where=Both.
+# That is a NETWORK error - the browser got no response. _purge_cloud ran a
+# plain COUNT(*) per target against a 57 GB historian, so the request never
+# returned. Bounded now: a Preview needs an order of magnitude, fast.
+RSRC = io.open(os.path.join(ROOT, "backend", "app", "routers", "retention.py"),
+               encoding="utf-8").read()
+pc = RSRC[RSRC.index("def _purge_cloud"):RSRC.index("@router.get(\"/data/purge/targets\")")]
+check("the cloud count is capped", "LIMIT :cap" in pc,
+      "an unbounded COUNT over 92M rows outlives the browser")
+check("  and it says when it capped", '"capped"' in pc,
+      "a capped number presented as exact would mislead the decision")
+check("  a statement timeout bounds it too", "SET statement_timeout" in pc)
+check("  a missing table is named, not called a timeout",
+      "not in the cloud database" in pc,
+      "historian_rollup is local-only; reporting that as a timeout sent "
+      "someone hunting a performance problem that did not exist")
+check("  and the delete is batched, not one statement",
+      "LIMIT 20000" in pc,
+      "one DELETE over millions of rows holds locks against the forwarder")
+
+print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))
 finish(0 if not FAILS else 2)

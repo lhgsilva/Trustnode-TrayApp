@@ -212,11 +212,36 @@ check("  and no local variable shadows it",
       "a local called tsMs would silently restore the bug inside that scope")
 
 print()
+print("[4c. the CHART SEED endpoint carries the same names]")
+# 2026-10-21, reported: "lan lite is not working ... charts start the new
+# reading when we move from the page to other page". /live was fixed; the
+# chart seeds from /historian, which still returned ts/tag. Measured on the
+# shipped build: 0 of 200 seed rows usable, so every page change re-seeded
+# with rows the UI could not read and the series restarted from empty.
+st, r = call("GET", "/api/lite-local/historian?limit=50", None, TOKEN)
+hrows = (r or {}).get("rows") if isinstance(r, dict) else None
+check("the historian seed returns rows", st == 200 and bool(hrows),
+      "HTTP %s rows=%s" % (st, len(hrows or [])))
+if hrows:
+    ok = [x for x in hrows if x.get("ts_utc") and x.get("tag_name")]
+    check("  every seed row is usable by the chart",
+          len(ok) == len(hrows), "%d of %d" % (len(ok), len(hrows)))
+    check("  and the old spellings still travel",
+          all(x.get("ts") and x.get("tag") for x in hrows))
+
+LL = io.open(os.path.join(ROOT, "backend", "app", "routers", "lite_local.py"),
+             encoding="utf-8").read()
+check("there is ONE normaliser, not one per endpoint",
+      LL.count("def _canonical_rows") == 1 and LL.count("_canonical_rows(") >= 3,
+      "two endpoints drifted apart twice; a third would have done it again")
+
+print()
 print("[5. the endpoint says why, for whoever edits it next]")
 SRC = io.open(os.path.join(ROOT, "backend", "app", "routers", "lite_local.py"),
               encoding="utf-8").read()
 check("the normalisation is in the endpoint, not get_live_rows",
-      "normalised" in SRC and "get_live_rows" in SRC)
+      "_canonical_rows" in SRC and "get_live_rows" in SRC,
+      "get_live_rows has eight other callers that read ts/tag")
 check("  and the reason is recorded",
       "DIFFERENT ROW SHAPES" in SRC or "ts_utc` / `tag_name`" in SRC)
 

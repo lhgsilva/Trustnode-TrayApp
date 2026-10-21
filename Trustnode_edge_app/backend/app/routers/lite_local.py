@@ -531,6 +531,41 @@ def get_bootstrap(request: Request, token: str = "") -> dict:
             "capabilities": _lite_capabilities(session)}
 
 
+def _canonical_rows(rows):
+    """Give every row BOTH spellings of the timestamp and the tag.
+
+    2026-10-20/21: three endpoints here answer from one of two sources, and
+    the two disagreed. The customer_sql branches SELECT the historian's own
+    column names (ts_utc, tag_name); the local-SQLite fallbacks come from
+    app_store, which returns ts/tag. The Lite UI reads ts_utc/tag_name.
+
+    So a site WITH a customer database worked and a site on local SQLite did
+    not - twice. /live showed "no samples" and "Gateways: 0/3"; once that was
+    fixed, /historian still fed the CHART rows it could not read, so the live
+    header updated while the chart stayed empty and every page change started
+    the series from nothing.
+
+    Normalising in ONE place, and emitting both spellings, is what stops the
+    next endpoint repeating it. app_store.get_*_rows() is deliberately not
+    changed: eight other callers read ts/tag and work.
+    """
+    out = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        row = dict(r)
+        ts = row.get("ts_utc") or row.get("ts")
+        tag = row.get("tag_name") or row.get("tag")
+        if ts is not None:
+            row["ts_utc"] = ts
+            row["ts"] = ts
+        if tag is not None:
+            row["tag_name"] = tag
+            row["tag"] = tag
+        out.append(row)
+    return out
+
+
 @router.get("/live")
 def get_live(
     request: Request,
@@ -577,21 +612,8 @@ def get_live(
         rows = app_store.get_live_rows(limit=int(limit))
     except Exception:
         rows = []
-    normalised = []
-    for r in rows or []:
-        if not isinstance(r, dict):
-            continue
-        row = dict(r)
-        ts = row.get("ts_utc") or row.get("ts")
-        tag = row.get("tag_name") or row.get("tag")
-        if ts is not None:
-            row["ts_utc"] = ts
-            row["ts"] = ts
-        if tag is not None:
-            row["tag_name"] = tag
-            row["tag"] = tag
-        normalised.append(row)
-    return {"ok": True, "source": "local_sqlite", "rows": normalised}
+    return {"ok": True, "source": "local_sqlite",
+            "rows": _canonical_rows(rows)}
 
 
 @router.get("/historian")
@@ -654,7 +676,8 @@ def get_historian(
         )
     except Exception:
         rows = []
-    return {"ok": True, "source": "local_sqlite", "rows": rows}
+    return {"ok": True, "source": "local_sqlite",
+            "rows": _canonical_rows(rows)}
 
 
 # ---------------------------------------------------------------------------

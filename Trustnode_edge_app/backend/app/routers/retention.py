@@ -10,6 +10,7 @@ Design: docs/historian-retention-and-forwarding-architecture-2026-08-21.md
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -532,16 +533,68 @@ def _purge_cloud(spec: Dict[str, str], tenant: str, before: str,
         engine, _ = _store._get_or_create_cloud_engine(cloud, schema)   # noqa: SLF001
         table = '"%s"."%s"' % (schema, spec["table"])
         tscol = spec["ts"]
+        # 2026-10-21: this was a plain COUNT(*). On a 57 GB historian it runs
+        # for minutes, and the Preview button asks for one PER TARGET - so the
+        # browser gave up before the server answered and the card showed
+        # "Failed to fetch", which reads like a broken endpoint rather than a
+        # slow query.
+        #
+        # Count a bounded sample and SAY when it was capped. An operator
+        # deciding whether to delete needs an order of magnitude and a fast
+        # answer, not an exact number they never see.
+        # A small cap on purpose. The Preview button needs an order of
+        # magnitude fast, not an exact number: "50,000+" tells the operator
+        # everything they need to decide, and a 1,000,000 cap still took
+        # longer than the statement timeout on a 92M-row table.
+        cap = 50_000
+        capped = False
         with engine.begin() as cx:
-            cnt = cx.execute(
-                text("SELECT COUNT(*) FROM %s WHERE %s < :b AND tenant_id = :t"
-                     % (table, tscol)), {"b": before, "t": tenant}).scalar() or 0
+            cx.execute(text("SET statement_timeout = '8s'"))
+            # Not every managed table exists in every cloud schema -
+            # historian_rollup is local-only. Say "not in the cloud" rather
+            # than letting the failed query be reported as a timeout, which
+            # sent an operator looking for a performance problem that was
+            # really a missing table.
+            present = cx.execute(text(
+                "SELECT 1 FROM information_schema.tables WHERE table_schema = :s "
+                "AND table_name = :t"), {"s": schema, "t": spec["table"]}).first()
+            if not present:
+                return {"skipped": "not in the cloud database"}
+            try:
+                cnt = cx.execute(text(
+                    "SELECT COUNT(*) FROM (SELECT 1 FROM %s WHERE %s < :b "
+                    "AND tenant_id = :t LIMIT :cap) s" % (table, tscol)),
+                    {"b": before, "t": tenant, "cap": cap}).scalar() or 0
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                if "statement timeout" in msg or "QueryCanceled" in msg:
+                    return {"error": "count timed out (table too large to "
+                                     "count quickly)"}
+                return {"error": "%s: %s" % (type(exc).__name__, msg[:70])}
+            capped = int(cnt) >= cap
             if dry_run or not cnt:
-                return {"rows": int(cnt), "deleted": 0}
-            cx.execute(
-                text("DELETE FROM %s WHERE %s < :b AND tenant_id = :t"
-                     % (table, tscol)), {"b": before, "t": tenant})
-        return {"rows": int(cnt), "deleted": int(cnt)}
+                out = {"rows": int(cnt), "deleted": 0}
+                if capped:
+                    out["capped"] = True
+                return out
+
+        # Delete in bounded batches so one statement cannot hold locks for
+        # minutes against the forwarder writing into the same table.
+        removed = 0
+        deadline = time.time() + 240
+        while time.time() < deadline:
+            with engine.begin() as cx:
+                cx.execute(text("SET statement_timeout = '120s'"))
+                res = cx.execute(text(
+                    "DELETE FROM %s WHERE ctid IN (SELECT ctid FROM %s "
+                    "WHERE %s < :b AND tenant_id = :t LIMIT 20000)"
+                    % (table, table, tscol)), {"b": before, "t": tenant})
+            got = int(res.rowcount or 0)
+            removed += got
+            if got <= 0:
+                break
+        return {"rows": int(cnt), "deleted": removed,
+                "capped": capped, "more": removed >= cap}
     except Exception as exc:  # noqa: BLE001
         return {"error": "%s: %s" % (type(exc).__name__, exc)}
 
