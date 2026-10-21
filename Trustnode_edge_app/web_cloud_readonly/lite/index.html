@@ -470,7 +470,7 @@ function useLiveLatest(enabled = true) {
     const startFallbackPolls = () => {
       // Active poll while we're disconnected from realtime.
       if (!pollTimer) {
-        pollTimer = setInterval(fetchAll, Math.max(1000, Number(cfg?.live_poll_ms || 2000)));
+        pollTimer = setInterval(fetchAll, Math.max(250, Number(cfg?.live_poll_ms || 2000)));  // floor 250 ms, not 1000: the old floor silently overrode any LAN setting below a second, so configuring 500 did nothing
       }
       // Safety-net poll fires regardless so the StatusPill always sees a
       // fresh state every ~5 s even if the active poll above was killed.

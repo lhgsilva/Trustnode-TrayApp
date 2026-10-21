@@ -51,7 +51,12 @@ LAN_LOAD_CONFIG = """async function loadConfig() {
     show_dashboard_tab: true,
     show_alarms_tab: true,
     show_power_tab: true,
-    live_poll_ms: 2000,
+    // 2026-10-21: 500 ms on the LAN, not 2000. Measured on this machine the
+    // request itself costs 22 ms, so on the same network the poll interval
+    // WAS the latency: a "DELAYED 2.2s" badge sat on top of a 1 s collection
+    // cadence and a 22 ms round trip. The cloud keeps 2000 through its own
+    // config.json, where the round trip is real and metered.
+    live_poll_ms: 500,
     history_default_limit: 300,
     default_chart_range_minutes: 60,
   };

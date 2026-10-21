@@ -236,6 +236,24 @@ check("there is ONE normaliser, not one per endpoint",
       "two endpoints drifted apart twice; a third would have done it again")
 
 print()
+print("[4d. on a LAN the poll interval IS the latency]")
+# 2026-10-21, asked: "the local lite ideally should not have any latency once
+# we are in the same network right?" Measured: /lite-local/live costs 22 ms
+# on this machine, so a "DELAYED 2.2s" badge was the 2000 ms poll plus a 1 s
+# collection cadence - the network was ~1% of it.
+check("the LAN default is 500 ms", "live_poll_ms: 500," in LITE,
+      "2000 ms on a link with a 22 ms round trip is all overhead")
+check("  and the floor does not override it",
+      "Math.max(250, Number(cfg?.live_poll_ms" in LITE,
+      "the old Math.max(1000, ...) silently clamped any LAN setting below a "
+      "second, so configuring 500 would have done nothing at all")
+check("  the cloud is NOT dragged down with it",
+      '"live_poll_ms": 2000' in io.open(
+          os.path.join(ROOT, "web_cloud_readonly", "lite", "config.json"),
+          encoding="utf-8").read(),
+      "across the internet the round trip is real and metered")
+
+print()
 print("[5. the endpoint says why, for whoever edits it next]")
 SRC = io.open(os.path.join(ROOT, "backend", "app", "routers", "lite_local.py"),
               encoding="utf-8").read()
