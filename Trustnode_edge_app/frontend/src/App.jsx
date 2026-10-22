@@ -187,6 +187,7 @@ import {
   registerControlPlaneEdgeLink,
   unlinkControlPlaneEdgeLink,
   checkControlPlaneEdgeLicense,
+  cacheLicenceSnapshot,
   startControlPlaneEdgeTrial,
   listControlPlaneEdgeTrialHistory,
   issueControlPlanePasswordReset,
@@ -2408,10 +2409,16 @@ const MODULE_KEY_BY_PAGE = {
   // both are the same licensed module.
   oee_machine_detail: "oee",
   oee_planning: "oee",
-  connections_overview: "lan_access",
-  lan_sharing: "lan_access",
-  opc_ua: "opcua",
-  mqtt: "mqtt",
+  // 2026-10-22: the catalogue sells the Connections PAGE as its own module
+  // ("connections" - LAN + OPC + MQTT) as well as the three individual
+  // ones. Requiring only `lan_access` meant an admin could tick
+  // "Connections page" on the licence and the menu stayed hidden - the
+  // feature was bought and never appeared. A list means ANY of these
+  // unlocks the page, so whichever box the portal ticks, it works.
+  connections_overview: ["connections", "lan_access"],
+  lan_sharing: ["connections", "lan_access"],
+  opc_ua: ["connections", "opcua"],
+  mqtt: ["connections", "mqtt"],
   // 2026-10-22: these three had NO entry, and isPageLicensed() returns true
   // for any page it cannot map ("if (!required) return true"), so they were
   // visible on every edge no matter what the licence said. Reported from a
@@ -2422,6 +2429,26 @@ const MODULE_KEY_BY_PAGE = {
   power_configuration: "power_management",
   email_and_notifications: "email_notifications",
   scheduled_reports: "scheduled_reports",
+  // 2026-10-22, second pass: canOpenPage now gates EVERY page named here,
+  // so this map is the single place that decides what a licence governs.
+  //
+  // Only modules a licence actually carries are listed. The catalogue's
+  // `default_enabled: False` entries - tags, gateway_configuration,
+  // plc_drivers/meter_drivers, database, users_and_access_control - are
+  // deliberately NOT mapped: a licence created with defaults does not
+  // include them, so gating those pages would hide Gateway Configuration,
+  // Tags, Devices, Database and user management from customers who are
+  // entitled to them, and lock an admin out of their own edge.
+  data_export: "historian_export",
+  triggers_and_limits: "triggers_limits",
+  // Batch was already gated by its own hasLicenseModule() call, which is
+  // why it was the one module that hid correctly. Naming it here too keeps
+  // one rule rather than two that can drift apart.
+  batch_overview: "batch_management",
+  batch_definitions: "batch_management",
+  batch_analysis: "batch_management",
+  // Cloud sync is an add-on; hiding it leaves the local database intact.
+  customer_database: "cloud_database",
 };
 
 function deriveModuleKeysFromPermissions(perms = {}) {
@@ -2438,6 +2465,8 @@ function deriveModuleKeysFromPermissions(perms = {}) {
 function userHasModuleForPage(user, page) {
   const required = MODULE_KEY_BY_PAGE[page];
   if (!required) return true;
+  const requiredKeys = (Array.isArray(required) ? required : [required])
+    .map((k) => String(k || "").trim().toLowerCase()).filter(Boolean);
   // Admins implicitly have every module (otherwise a fresh admin would
   // get locked out of pages until a second admin grants them modules).
   const role = String(user?.role || "").toLowerCase();
@@ -2447,7 +2476,11 @@ function userHasModuleForPage(user, page) {
   // The old fallback granted everything when modules=[], which silently
   // bypassed every module gate for users created before the modules UI
   // existed.
-  return modules.includes(required);
+  // Any one of the page's modules is enough - the same rule the licence
+  // gate uses, or a user granted "connections" would still be refused a
+  // page that happens to name lan_access.
+  const held = modules.map((m) => String(m || "").trim().toLowerCase());
+  return requiredKeys.some((k) => held.includes(k));
 }
 
 function normalizeLicenseModuleKeys(modules) {
@@ -12208,10 +12241,12 @@ function AppShell() {
       // override here on purpose — the whole point of the signature is
       // to defeat the "edit the SQLite to flip flags" attack.
       if (licenseTampered) return false;
-      const key = String(required || "").toLowerCase();
-      if (grandfatheredModules.has(key)) return true;
+      const keys = (Array.isArray(required) ? required : [required])
+        .map((k) => String(k || "").trim().toLowerCase())
+        .filter(Boolean);
+      if (keys.some((k) => grandfatheredModules.has(k))) return true;
       if (!licensedModuleKeys.length) return false;
-      return licensedModuleKeys.includes(key);
+      return keys.some((k) => licensedModuleKeys.includes(k));
     },
     [isClientView, edgeLicenseSnapshot?.ok, licensedModuleKeys, grandfatheredModules, licenseTampered]
   );
@@ -12362,7 +12397,21 @@ function AppShell() {
     // from admins because of it.
     const role = String(currentUser?.role || "").toLowerCase();
     const isAdmin = role === "admin" || role === "super";
-    if (!isAdmin && !isPageLicensed(page) && ["dashboard", "power_overview", "historian", "alarms", "reporting", "generated_reports", "interface"].includes(page)) {
+    // 2026-10-22: this consulted the licence for SEVEN pages listed by
+    // hand, so a page WITH a licence module but no entry in that list was
+    // never gated here at all. Power Configuration, all four OEE pages,
+    // Email and Notifications and Scheduled Reports were therefore visible
+    // on every edge whatever the licence said - reported twice, because
+    // adding them to MODULE_KEY_BY_PAGE fixed the map and not this list.
+    //
+    // MODULE_KEY_BY_PAGE already knows which pages a licence governs, so
+    // ask it. A newly licensed page now needs one entry there and nothing
+    // here. The admin exemption survives only while the licence is
+    // UNKNOWN - a transient snapshot miss must not hide the navigation -
+    // which is exactly what hasClientModuleAccess does.
+    const licenceKnown = Boolean(edgeLicenseSnapshot?.ok) && !licenseTampered;
+    if (MODULE_KEY_BY_PAGE[page] && !isPageLicensed(page)
+        && (licenceKnown || !isAdmin)) {
       return false;
     }
     // Operator 2026-06-18: new license-gated pages.
@@ -12483,7 +12532,7 @@ function AppShell() {
       return Boolean(currentUser?.permissions?.trustnode_intelligence);
     }
     return canEditPage(page);
-  }, [currentUser, isPortalOnly, isClientView, isPageLicensed, canEditPage, hasLicenseModule, licensedModuleKeys]);
+  }, [currentUser, isPortalOnly, isClientView, isPageLicensed, canEditPage, hasLicenseModule, licensedModuleKeys, edgeLicenseSnapshot?.ok, licenseTampered]);
 
   const visibleClientModuleLabels = useCallback(
     (user) => {
@@ -21566,6 +21615,9 @@ const getGatewayHealth = (gateway) => {
       }
 
       setEdgeLicenseSnapshot(out || null);
+      // Persist what we just fetched, or the next launch
+      // short-circuits on the PREVIOUS licence's modules.
+      cacheLicenceSnapshot(out || null);
       if (out?.ok) {
         setLicenseGuardBlocked(false);
         setLicenseGuardMessage("License active");
@@ -21687,6 +21739,9 @@ const getGatewayHealth = (gateway) => {
       }
       const licenseOut = await checkControlPlaneEdgeLicense(resolvedEdgeId, resolvedTenantId);
       setEdgeLicenseSnapshot(licenseOut || null);
+      // Persist what we just fetched, or the next launch
+      // short-circuits on the PREVIOUS licence's modules.
+      cacheLicenceSnapshot(licenseOut || null);
       setLicenseGuardLastCheckedUtc(tsNow());
       if (licenseOut?.ok) {
         setLicenseGuardBlocked(false);
@@ -22617,7 +22672,13 @@ const getGatewayHealth = (gateway) => {
           {/* Intelligence menu: self-hides when /api/intelligence/status
               returns 404 (module not loaded or license missing). Sits
               above the user/login footer. Independent of other menus. */}
-          {(currentUser?.role === "admin" || currentUser?.role === "super"
+          {/* 2026-10-22: this was role + permission ONLY, so an admin saw the
+              AI menu on an edge whose licence does not include
+              trustnode_intelligence - an add-on menu showing for a module
+              nobody bought. The self-hide in the comment above depends on
+              the backend answering 404, which is not a licence check. */}
+          {hasLicenseModule("trustnode_intelligence")
+            && (currentUser?.role === "admin" || currentUser?.role === "super"
             || Boolean(currentUser?.permissions?.trustnode_intelligence)) ? (
             <IntelligenceMenu activePage={activePage} onNavigate={setActivePage} sidebarCollapsed={sidebarCollapsed} />
           ) : null}

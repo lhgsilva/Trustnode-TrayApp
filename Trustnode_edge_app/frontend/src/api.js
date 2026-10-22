@@ -3680,6 +3680,33 @@ export async function getCodeReadiness() {
   return res.json();
 }
 
+// 2026-10-22: activation installs a NEW licence, but the edge keeps a
+// 30-day localStorage snapshot of the previous one and short-circuits on
+// it before any cloud round-trip. After re-activating a machine the menu
+// therefore kept showing the OLD module set until something forced a
+// re-check - reported as "I had to refresh on the edge menu for the
+// license to be loaded". Activation clears it so the next read is fresh.
+// The counterpart: a licence we have just fetched becomes the cached one.
+// The manual "Re-check now" and the activation refresh both updated React
+// state only, so the menu was right until the next launch - when the 30-day
+// cached snapshot short-circuited and the OLD module set came back. A
+// snapshot that is NOT ok clears the cache instead of being stored, so a
+// revoked or expired licence cannot leave a stale positive behind.
+export function cacheLicenceSnapshot(snapshot) {
+  try {
+    if (snapshot && snapshot.ok) {
+      localStorage.setItem("trustnode_edge_license_snapshot_v1",
+        JSON.stringify({ snapshot, cached_at_ms: Date.now() }));
+    } else {
+      localStorage.removeItem("trustnode_edge_license_snapshot_v1");
+    }
+  } catch (_) {}
+}
+
+export function clearCachedLicenceSnapshot() {
+  try { localStorage.removeItem("trustnode_edge_license_snapshot_v1"); } catch (_) {}
+}
+
 export async function requestLoginCode(identifier) {
   const res = await fetchWithTimeout(`${getApiBase()}/api/auth/login-code/request`, {
     method: "POST",

@@ -4,6 +4,7 @@ import {
   requestLoginCode,
   verifyLoginCode,
   getCodeReadiness,
+  clearCachedLicenceSnapshot,
   applyEmailPasswordReset,
   registerControlPlaneEdgeLink,
   registerControlPlaneEdgeLinkLogin,
@@ -303,6 +304,10 @@ export const Login = ({
       };
       const result = await registerControlPlaneEdgeLinkLogin(payload);
       if (result?.ok) {
+        // The licence that just arrived is the one that must gate the
+        // menu. Drop the cached snapshot from any previous activation
+        // before the app reads it, or the old module set wins.
+        clearCachedLicenceSnapshot();
         setEdgeRegisterResult("Edge activated successfully. Admin user created for customer scope.");
         setEdgeRegisterForm((p) => ({
           // keep the portal that just worked - dropping it made a second
