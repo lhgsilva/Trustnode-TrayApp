@@ -12,6 +12,34 @@
 ; (fires at start of uninstall). Both have admin privileges because
 ; we set `requestExecutionLevel admin` in package.json.
 
+!macro customInit
+  ; --- Operator 2026-10-22: UPGRADE WHERE THE PREVIOUS VERSION ALREADY LIVES.
+  ;
+  ; Until today `menuCategory` was set, and electron-builder installs to
+  ;   %PROGRAMFILES%\<menuCategory>\<productName>
+  ; so every existing machine has C:\Program Files\TrustNode\TrustNode.
+  ; Removing menuCategory gives new installs the clean
+  ;   C:\Program Files\TrustNode
+  ; but it also CHANGES THE DEFAULT for an upgrade.
+  ;
+  ; electron-builder finds a previous install by reading InstallLocation from
+  ; the uninstall registry key - and on this machine that value is ABSENT
+  ; (only UninstallString is written). With it missing the installer falls
+  ; back to the default directory, which would have put the new version in a
+  ; SECOND folder and left the old one behind: two installs, stale shortcuts,
+  ; and a customer running whichever one they happened to click.
+  ;
+  ; So: if the old nested layout is physically there, install into it. No
+  ; registry parsing, no guessing - the file either exists or it does not.
+  ; A machine with no previous install is untouched and gets the clean path.
+  IfFileExists "$PROGRAMFILES64\TrustNode\TrustNode\TrustNode.exe" 0 +3
+    StrCpy $INSTDIR "$PROGRAMFILES64\TrustNode\TrustNode"
+    Goto tn_initdone
+  IfFileExists "$PROGRAMFILES32\TrustNode\TrustNode\TrustNode.exe" 0 +2
+    StrCpy $INSTDIR "$PROGRAMFILES32\TrustNode\TrustNode"
+  tn_initdone:
+!macroend
+
 !macro customInstall
   ; Operator 2026-06-18: prior version used backslash line continuations
   ; inside nsExec::Exec single-quoted strings. NSIS passed those literally

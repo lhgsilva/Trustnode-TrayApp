@@ -54,7 +54,7 @@ class CpUsersPuller:
 
     def __init__(self, *, control_plane_store, tenant_id: str,
                  cloud_url: str, login_user: str, login_password: str,
-                 poll_seconds: float = 30.0) -> None:
+                 poll_seconds: float = 30.0, sync_token: str = "") -> None:
         self._store = control_plane_store
         self._tenant_id = str(tenant_id or "").strip()
         self._cloud_url = str(cloud_url or "").rstrip("/")
@@ -63,6 +63,9 @@ class CpUsersPuller:
         self._poll_seconds = max(5.0, float(poll_seconds))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # A credential the activation delivered, scoped to this edge's tenant.
+        # When present it replaces the username/password login entirely.
+        self._sync_token = str(sync_token or "").strip()
         self._token = ""
         self._token_exp = 0.0
         self._last_synced_utc = ""
@@ -110,9 +113,16 @@ class CpUsersPuller:
             self._stop.wait(self._poll_seconds)
 
     def _ensure_token(self) -> str:
+        # The activation-delivered token needs no login round trip. It is the
+        # normal path on a customer edge; the username/password below only
+        # runs where an operator configured one deliberately.
+        if self._sync_token:
+            return self._sync_token
         now = time.time()
         if self._token and self._token_exp > now + 60:
             return self._token
+        if not (self._user and self._password):
+            raise RuntimeError("cloud_login_no_credential")
         try:
             r = requests.post(
                 f"{self._cloud_url}/api/auth/login",
@@ -292,8 +302,26 @@ def build_from_env(control_plane_store, app_settings: dict[str, Any] | None = No
         or _env("TRUSTNODE_TENANT_ID")
         or "default"
     )
-    user = _env("TRUSTNODE_CLOUD_BOOTSTRAP_USER", "admin")
-    pwd  = _env("TRUSTNODE_CLOUD_BOOTSTRAP_PASSWORD", "admin")
+    # 2026-10-22: these defaulted to "admin"/"admin" - the break-glass master
+    # with its DEFAULT password, which auth.py refuses from the network by
+    # design (the release gate asserts that refusal). So on every customer
+    # install this puller got 403 every poll, for ever, and users created in
+    # the portal never reached the edge. The operator saw accounts in the
+    # portal that simply could not log in on the machine.
+    #
+    # The activation hands the edge a tenant-scoped token for exactly this.
+    # Prefer it; fall back to the old username/password only when an operator
+    # has set them explicitly, so an existing deployment that configured them
+    # keeps working.
+    sync_token = str(settings.get("cloud_sync_token") or "").strip() or _env("TRUSTNODE_CLOUD_SYNC_TOKEN")
+    user = _env("TRUSTNODE_CLOUD_BOOTSTRAP_USER", "")
+    pwd  = _env("TRUSTNODE_CLOUD_BOOTSTRAP_PASSWORD", "")
+    if not sync_token and not (user and pwd):
+        # Nothing usable. Say so once rather than 403 in a loop.
+        log.info("cp_users_puller: no cloud credential (no activation sync "
+                 "token and no TRUSTNODE_CLOUD_BOOTSTRAP_USER/PASSWORD); "
+                 "portal users will not sync to this edge.")
+        return None
     poll_s = float(_env("TRUSTNODE_CP_USERS_POLL_SECONDS", "30") or 30)
     return CpUsersPuller(
         control_plane_store=control_plane_store,
@@ -301,5 +329,6 @@ def build_from_env(control_plane_store, app_settings: dict[str, Any] | None = No
         cloud_url=cloud_url,
         login_user=user,
         login_password=pwd,
+        sync_token=sync_token,
         poll_seconds=poll_s,
     )

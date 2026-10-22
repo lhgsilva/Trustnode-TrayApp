@@ -68,3 +68,27 @@ def get_pipeline() -> dict:
         "storage": snap.get("storage"),
         "pipeline": snap.get("pipeline"),
     }
+
+
+@router.get("/locations")
+def get_locations() -> dict:
+    """Every place TrustNode data has ever lived, and which one is live.
+
+    2026-10-22: answering "which database am I actually looking at" meant
+    opening SQLite files by hand. One machine had seven TrustNode folders
+    and three complete, abandoned app stores - the shape that makes a
+    confident wrong answer easy, and the reason the first rule of this
+    repository is "never point at old data". This turns that question into
+    a request. Read-only: it stats files and opens nothing.
+    """
+    from app.services import workspace_identity
+    try:
+        rows = workspace_identity.all_locations()
+    except Exception as exc:  # diagnostics must never be the thing that breaks
+        return {"ok": False, "error": str(exc)[:200], "locations": []}
+    return {
+        "ok": True,
+        "live": next((r["path"] for r in rows if r.get("is_live")), ""),
+        "stale_stores": [r["path"] for r in rows if r.get("stale_store")],
+        "locations": rows,
+    }

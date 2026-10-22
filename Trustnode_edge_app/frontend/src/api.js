@@ -3256,6 +3256,11 @@ export async function registerControlPlaneEdgeLink(payload) {
         primary_domain: String(dataLike?.primary_domain || row?.primary_domain || ""),
         admin_username: String(payload?.admin_username || "admin"),
         admin_password: String(payload?.admin_password || ""),
+        // 2026-10-22: the tenant-scoped credential the cloud minted when the
+        // activation code was applied. Without it cp_users_puller falls back
+        // to the break-glass admin/admin the cloud refuses from the network,
+        // and users created in the portal never reach this edge.
+        sync_token: String(dataLike?.sync_token || row?.sync_token || ""),
       }),
     }, 20000);
     await ensureOk(finalizeRes, "Control-plane edge-link local finalize failed");
@@ -3395,6 +3400,11 @@ export async function registerControlPlaneEdgeLinkLogin(payload) {
         primary_domain: String(dataLike?.primary_domain || row?.primary_domain || ""),
         admin_username: String(payload?.admin_username || "admin"),
         admin_password: String(payload?.admin_password || ""),
+        // 2026-10-22: the tenant-scoped credential the cloud minted when the
+        // activation code was applied. Without it cp_users_puller falls back
+        // to the break-glass admin/admin the cloud refuses from the network,
+        // and users created in the portal never reach this edge.
+        sync_token: String(dataLike?.sync_token || row?.sync_token || ""),
       }),
     }, 20000);
     await ensureOk(finalizeRes, "Control-plane edge-link local finalize failed");

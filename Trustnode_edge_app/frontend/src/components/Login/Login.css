@@ -144,6 +144,15 @@ html, body {
   box-shadow: var(--shadow-card);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
+  /* 2026-10-22: the ACTIVATE card has had this since it grew tall; the LOGIN
+     card never did. Opening "Recover local access" or "Forgot password" adds
+     a whole panel - tenant, username, code, new password and three buttons -
+     and the card simply ran off the bottom of the window with no scrollbar.
+     The operator could not reach the buttons they had just revealed, nor the
+     toggle that closes the panel again, so the screen looked like a dead end.
+     Reported from a customer machine. */
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
 }
 
 .theme-toggle-btn {
@@ -917,4 +926,16 @@ select {
   font-weight: 800 !important;
   letter-spacing: 0.03em;
   text-transform: none;
+}
+
+
+/* 2026-10-22: header row for the reset panel, so the way OUT is visible at
+   the top instead of below a panel the operator cannot scroll to. */
+.auth-forgot-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-weight: 600;
 }

@@ -2,7 +2,7 @@
   "name": "trustnode-desktop",
   "version": "0.1.0",
   "private": false,
-  "description": "TrustNode Edge — industrial data collection & dashboards",
+  "description": "TrustNode Edge \u2014 industrial data collection & dashboards",
   "author": {
     "name": "TrustNode",
     "email": "support@trustnode.io"
@@ -26,13 +26,14 @@
     "cross-env": "^7.0.3",
     "electron": "^31.7.7",
     "electron-builder": "^24.13.3",
-    "rcedit": "^5.0.2"
+    "rcedit": "^5.0.2",
+    "@sentry/electron": "^7.13.0"
   },
   "build": {
     "appId": "com.trustnode.edge",
     "afterPack": "./afterPack.js",
     "productName": "TrustNode",
-    "copyright": "Copyright © 2026 TrustNode",
+    "copyright": "Copyright \u00a9 2026 TrustNode",
     "directories": {
       "output": "dist"
     },
@@ -40,7 +41,26 @@
       "main.js",
       "preload.js",
       "workspace_detector.js",
-      "package.json"
+      "package.json",
+      "!**/*.map",
+      "!**/*.ts",
+      "!**/*.md",
+      "!**/*.markdown",
+      "!**/test/**",
+      "!**/tests/**",
+      "!**/__tests__/**",
+      "!**/*.test.js",
+      "!**/*.spec.js",
+      "!**/*.test-d.ts",
+      "!**/.github/**",
+      "!**/.vscode/**",
+      "!**/docs/**",
+      "!**/example/**",
+      "!**/examples/**",
+      "!**/benchmark/**",
+      "!**/.eslintrc*",
+      "!**/tsconfig*.json",
+      "!**/.editorconfig"
     ],
     "extraResources": [
       {
@@ -110,12 +130,9 @@
       "uninstallDisplayName": "TrustNode",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "menuCategory": "TrustNode",
       "artifactName": "TrustNode-Setup-${version}.exe",
       "include": "build/installer.nsh"
     }
   },
-  "dependencies": {
-    "@sentry/electron": "^7.13.0"
-  }
+  "dependencies": {}
 }

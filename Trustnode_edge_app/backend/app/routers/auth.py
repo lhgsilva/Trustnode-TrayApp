@@ -52,6 +52,20 @@ def _verify_against_supabase_auth(username: str, password: str) -> bool:
 
 
 def _check_rate_limit(ip: str):
+    """Throttle repeated auth attempts FROM THE NETWORK.
+
+    2026-10-22: this counted loopback too, so an operator at the machine who
+    mistyped a few times was told "Too many login attempts. Try again in 60
+    seconds." on their own edge. Together with the per-account lockout that
+    made commissioning a new install feel like being shut out of it, which is
+    what a customer reported.
+
+    Rate limiting exists to make guessing from the network expensive. Someone
+    sitting at the console already has the machine; throttling them protects
+    nothing and costs the one person who must always be able to get in.
+    """
+    if not _client_is_remote(ip):
+        return
     now = time.time()
     attempts = _login_attempts[ip]
     # Remove old entries
@@ -205,16 +219,30 @@ def login(payload: LoginRequest, request: Request, response: Response) -> Dict[s
     if not username:
         raise HTTPException(status_code=400, detail="Username required")
 
+    _remote = _client_is_remote(client_host)
+
     # Operator 2026-08-21 (Remote Access hardening): per-account lockout
     # (5 failures / 15 min -> 15 min lock) in addition to the per-IP limiter.
-    _locked_until = auth_store.locked_until(username)
-    if _locked_until:
-        try:
-            auth_store.record_login(username, ok=False, remote_ip=client_host, detail="locked_out")
-        except Exception:
-            pass
-        raise HTTPException(status_code=423, detail=f"Account temporarily locked after repeated failures. Try again after {_locked_until} UTC.")
-    _remote = _client_is_remote(client_host)
+    #
+    # 2026-10-22: REMOTE ONLY. The lockout exists to make guessing from the
+    # network expensive. Applied on loopback it did the opposite of its job:
+    # the operator standing at the machine, mistyping the password of an edge
+    # whose admin they had just created, locked themselves out of their own
+    # installation for fifteen minutes - with no second account to fall back
+    # on and the recovery screen one more thing to get wrong. Reported from a
+    # customer commissioning a new edge.
+    #
+    # The same reasoning is already written into _effective_for_role(): an
+    # admin on loopback is never hard-blocked, "so a misclassified path can
+    # never lock the operator out of their own machine".
+    if _remote:
+        _locked_until = auth_store.locked_until(username)
+        if _locked_until:
+            try:
+                auth_store.record_login(username, ok=False, remote_ip=client_host, detail="locked_out")
+            except Exception:
+                pass
+            raise HTTPException(status_code=423, detail=f"Account temporarily locked after repeated failures. Try again after {_locked_until} UTC.")
 
     # 1. Master-admin break-glass account. Works on every install, even
     #    a brand-new one where AuthStore is empty. ENV-overridable.
@@ -333,9 +361,14 @@ def login(payload: LoginRequest, request: Request, response: Response) -> Dict[s
             auth_store.record_login(username, ok=False, remote_ip=client_host, detail="invalid_credentials")
         except Exception:
             pass
-        _until = auth_store.record_failed_attempt(username)
-        if _until:
-            raise HTTPException(status_code=423, detail=f"Account temporarily locked after repeated failures. Try again after {_until} UTC.")
+        # Only a REMOTE failure counts towards the lock, and only a remote
+        # caller is refused by it. A local operator fumbling their own
+        # password must not lock the account for anyone - including the
+        # engineer who then tries to help from the LAN.
+        if _remote:
+            _until = auth_store.record_failed_attempt(username)
+            if _until:
+                raise HTTPException(status_code=423, detail=f"Account temporarily locked after repeated failures. Try again after {_until} UTC.")
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     user_public = _public_user(hit)

@@ -24,9 +24,10 @@ for writing.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 import sqlite3
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 
 def default_data_dir() -> str:
@@ -141,3 +142,74 @@ def describe() -> Dict[str, Any]:
             f"start it without {source or 'the data-dir override'} set."
         ) if hiding else "",
     }
+
+
+def all_locations() -> List[Dict[str, Any]]:
+    """Every place TrustNode data has ever lived, and which one is live.
+
+    2026-10-22. Diagnosing "where is my data" meant opening SQLite files by
+    hand and guessing which was current. On one machine there were SEVEN
+    TrustNode directories and THREE of them held a complete, abandoned
+    trustnode_app_store.db - the exact shape that makes a confident, wrong
+    answer easy. Reading the live store is rule one; this makes it a request.
+
+    Read-only: it stats files, opens nothing and changes nothing. The
+    candidate list deliberately includes the paths we no longer write, so a
+    store left behind by an older install still shows up instead of being
+    invisible.
+    """
+    live_dir = ""
+    try:
+        live_dir = str(summary().get("data_dir") or "")
+    except Exception:
+        pass
+
+    home = os.path.expanduser("~")
+    program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+    local_app = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+    roaming = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
+
+    candidates = [
+        ("data (ProgramData)", os.path.join(program_data, "TrustNode", "edge"), "store"),
+        ("data (legacy home)", os.path.join(home, ".trustnode_edge", "data"), "store"),
+        ("data (LocalAppData)", os.path.join(local_app, "TrustNode", "data"), "store"),
+        ("desktop profile", os.path.join(roaming, "trustnode-edge-desktop"), "desktop"),
+        ("desktop profile (previous)", os.path.join(roaming, "trustnode-desktop"), "desktop"),
+        ("early boot log + .env", os.path.join(local_app, "TrustNode"), "support"),
+    ]
+    if live_dir and _norm(live_dir) not in {_norm(p) for _, p, _ in candidates}:
+        candidates.insert(0, ("data (this process)", live_dir, "store"))
+
+    out: List[Dict[str, Any]] = []
+    for label, path, kind in candidates:
+        exists = os.path.isdir(path)
+        store = os.path.join(path, "trustnode_app_store.db")
+        has_store = os.path.isfile(store)
+        try:
+            store_bytes = os.path.getsize(store) if has_store else 0
+        except OSError:
+            store_bytes = 0
+        try:
+            newest = max(
+                (os.path.getmtime(os.path.join(path, n)) for n in os.listdir(path)),
+                default=0.0,
+            ) if exists else 0.0
+        except OSError:
+            newest = 0.0
+        out.append({
+            "label": label,
+            "path": path,
+            "kind": kind,
+            "exists": exists,
+            "is_live": bool(live_dir) and _norm(path) == _norm(live_dir),
+            "has_app_store": has_store,
+            "app_store_bytes": store_bytes,
+            "newest_mtime_utc": (
+                datetime.fromtimestamp(newest, tz=timezone.utc).isoformat()
+                if newest else ""
+            ),
+            # A store that is not the live one is the thing that makes an
+            # operator read the wrong database. Say so, do not just list it.
+            "stale_store": bool(has_store and live_dir and _norm(path) != _norm(live_dir)),
+        })
+    return out

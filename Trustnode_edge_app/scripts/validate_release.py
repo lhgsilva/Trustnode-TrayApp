@@ -229,6 +229,19 @@ SOURCE_CHECKS = [
     # the licence says - three were. And admins skipped the licence gate
     # outright, which is who actually uses a customer edge.
     ("the menu shows only licensed modules", "test_menu_licence_gating.py"),
+    # 2026-10-22, from a customer install: after activation the locally
+    # created users could not log in, and many sites have no internet at
+    # all. This drives an ACTIVATED edge with every cloud variable stripped
+    # and the cloud URL pointed at a black hole: activation, an admin
+    # creating a user, that user logging in, an admin resetting them, and
+    # the local recovery path - none of which may need the network.
+    ("local users + recovery, fully offline", "test_local_users_offline.py"),
+    # 2026-10-22: "Request Code" did nothing on a customer machine.
+    # send_code() needs a Supabase URL AND an anon key and read the
+    # ENVIRONMENT ONLY - a fresh install has no .env and the activation
+    # code never carried a key, so it returned supabase_not_configured
+    # while the screen still said a code had been sent.
+    ("the cloud can issue a recovery code", "test_recovery_code_config.py"),
     # 2026-10-20: the whole journey in one run - customer+email, licence,
     # edge, code, activation, login, recovery. The per-link tests each
     # build their own starting state, so none of them saw that activation

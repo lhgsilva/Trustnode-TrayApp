@@ -58,9 +58,36 @@ def supabase_config() -> Tuple[str, str]:
 
     The ANON key is correct here: /auth/v1 is the public auth surface, and
     service_role bypasses Auth rather than using it.
+
+    2026-10-22: this used to read the ENVIRONMENT ONLY, and a customer's edge
+    has neither variable - a fresh machine has no .env (that file is something
+    an operator installs by hand) and activation never carried an anon key.
+    So on every customer install send_code() returned "supabase_not_configured"
+    while the UI still answered "if the account exists, a code has been sent",
+    and the operator waited for an email nobody had requested. Reported from a
+    new customer trying to recover an edge login.
+    
+    The endpoints the activation code delivered are the right second source:
+    they are already stored for exactly this purpose, and the ANON key is
+    public by design - it ships inside every browser bundle and is protected
+    by row-level security, not by secrecy.
     """
     url = (os.environ.get("TRUSTNODE_SUPABASE_URL") or "").strip().rstrip("/")
     anon = (os.environ.get("TRUSTNODE_SUPABASE_ANON_KEY") or "").strip()
+    if url and anon:
+        return url, anon
+    try:
+        from app.state import app_store
+        # get_domain_scoped_fast reads THIS edge's scope and nothing else.
+        # get_config_domain would read `config_documents`, the legacy unscoped
+        # table that is shared across every scope in the file.
+        settings = app_store.get_domain_scoped_fast("app_settings") or {}
+        infra = settings.get("infrastructure_endpoints") if isinstance(settings, dict) else None
+        if isinstance(infra, dict):
+            url = url or str(infra.get("supabase_url") or "").strip().rstrip("/")
+            anon = anon or str(infra.get("supabase_anon_key") or "").strip()
+    except Exception:
+        pass
     return (url, anon) if url and anon else ("", "")
 
 

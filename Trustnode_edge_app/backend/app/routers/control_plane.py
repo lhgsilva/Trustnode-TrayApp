@@ -560,6 +560,11 @@ class EdgeLocalFinalizeRequest(BaseModel):
     # already falls back to, so an older caller that omits them is unchanged.
     admin_username: str = "admin"
     admin_password: str = ""
+    # 2026-10-22: tenant-scoped credential minted by the cloud when the
+    # activation code was applied. The edge stores it so cp_users_puller can
+    # authenticate without the break-glass admin/admin the cloud refuses from
+    # the network - the reason portal users never reached a customer edge.
+    sync_token: str = ""
     edge_name: str = ""
     customer_id: str = ""
     license_id: str = ""
@@ -1939,9 +1944,42 @@ def apply_activation_code(payload: ActivationCodeApplyRequest, request: Request)
                 )
         except Exception as exc:  # never fail an activation over the extras
             logger.warning("activation apply: could not attach the licence: %s", exc)
+        # 2026-10-22: hand the edge a credential it can actually use.
+        #
+        # cp_users_puller logged into the cloud as TRUSTNODE_CLOUD_BOOTSTRAP_USER
+        # / _PASSWORD, which default to "admin"/"admin" - the break-glass master
+        # with its default password, which auth.py BLOCKS from the network by
+        # design (the release gate asserts that block). So on every customer
+        # install the puller got 403 every 30 seconds for ever and portal users
+        # never reached the edge, while the activation's own cloud user upsert
+        # forwarded an Authorization header that is empty on a machine nobody
+        # has signed into yet. User sync was broken in BOTH directions.
+        #
+        # The activation code is the credential: it already proved which
+        # tenant, customer and edge this machine is. Mint a token scoped to
+        # that tenant and let the edge use it. It is NOT a global admin - the
+        # tenant claim is the customer's own, so it can only ever see and
+        # write that customer's users, exactly like their own administrator.
+        sync_token = ""
+        try:
+            from app.auth import create_access_token as _mint
+            sync_token = _mint(
+                {
+                    "username": "edge-sync:%s" % str(row.get("edge_id") or "").strip(),
+                    "role": "admin",
+                    "tenant_id": tid,
+                    "permissions": {},
+                    "modules": [],
+                },
+                expires_seconds=365 * 24 * 3600,
+            )
+        except Exception as exc:
+            logger.warning("activation apply: could not mint the sync token: %s", exc)
         out: dict[str, Any] = {"ok": True, "row": row}
         if license_payload:
             out["license"] = license_payload
+        if sync_token:
+            out["sync_token"] = sync_token
         return out
     except Exception as exc:
         control_plane_store.audit(
@@ -2464,6 +2502,12 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                             "primary_domain": str(data.get("primary_domain") or ""),
                             "cloud_api_url": str(data.get("cloud_api_url") or cloud_url or ""),
                             "license": upstream_license_obj,
+                            # 2026-10-22: carry the cloud's tenant-scoped sync
+                            # credential through to the client, which hands it
+                            # to local-finalize. Dropping it here would leave
+                            # cp_users_puller with no usable credential and
+                            # portal users would never reach this edge.
+                            "sync_token": str(data.get("sync_token") or ""),
                             "app_settings_patch": {},
                         }
                     else:
@@ -3180,6 +3224,13 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
         # keep the full set under one key too, for future endpoints without new fields
         if infra:
             app_settings["infrastructure_endpoints"] = infra
+        # 2026-10-22: the tenant-scoped credential the cloud minted for this
+        # edge when the activation code was applied. cp_users_puller uses it
+        # instead of the break-glass admin/admin that the cloud refuses from
+        # the network, which is why portal users never reached a customer edge.
+        _sync_token = str(getattr(payload, "sync_token", "") or "").strip()
+        if _sync_token:
+            app_settings["cloud_sync_token"] = _sync_token
         web_client = str(infra.get("web_client_url") or "").strip()
         if web_client:
             app_settings["tenant_web_client_url"] = web_client

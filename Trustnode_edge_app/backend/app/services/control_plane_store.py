@@ -1251,6 +1251,25 @@ class ControlPlaneStore:
             for k, v in over.items():
                 if str(v or "").strip():
                     merged[k] = v
+        # 2026-10-22: carry the Supabase URL and ANON key so a customer's edge
+        # can ask the cloud for a recovery code.
+        #
+        # recovery_codes.send_code() needs both. A customer machine had
+        # neither: a fresh install has no .env (an operator installs that by
+        # hand) and the activation payload carried the URL but never a key. So
+        # send_code returned "supabase_not_configured" on every customer
+        # install while the screen still said "a code has been sent", and the
+        # operator waited for an email nobody had requested.
+        #
+        # The ANON key is public by design - it ships inside every browser
+        # bundle and is protected by row-level security, not by secrecy. The
+        # SERVICE key is never put here: it bypasses Auth entirely.
+        for key, env_name in (("supabase_url", "TRUSTNODE_SUPABASE_URL"),
+                              ("supabase_anon_key", "TRUSTNODE_SUPABASE_ANON_KEY")):
+            if not str(merged.get(key) or "").strip():
+                value = str(os.environ.get(env_name, "") or "").strip()
+                if value:
+                    merged[key] = value
         return merged
 
     def revoke_edge_view_links(self, *, tenant_id: str, edge_id: str) -> int:

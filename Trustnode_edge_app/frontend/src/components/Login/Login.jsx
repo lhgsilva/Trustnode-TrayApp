@@ -716,6 +716,21 @@ export const Login = ({
 
             {forgotResult ? (
               <div className="auth-forgot-box">
+                {/* 2026-10-22, reported from a customer machine: this panel
+                    appears the moment "Forgot password?" is clicked and
+                    NOTHING ever cleared forgotResult again, so there was no
+                    way back to a plain sign-in form - the operator was stuck
+                    looking at a reset flow they had opened by accident. */}
+                <div className="auth-forgot-head">
+                  <span>Reset a password</span>
+                  <button
+                    type="button"
+                    className="forgot-link"
+                    onClick={() => { setForgotResult(""); setForgotBusy(false); }}
+                  >
+                    Back to sign in
+                  </button>
+                </div>
                 <label>
                   <span>Tenant (optional)</span>
                   <input
