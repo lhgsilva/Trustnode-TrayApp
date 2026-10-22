@@ -69,6 +69,60 @@ process.on("unhandledRejection", (reason) => {
 });
 bootLog(`boot start v${(() => { try { return app.getVersion(); } catch { return "?"; } })()} pid=${process.pid}`);
 
+// ── First-window safety (operator 2026-10-22) ─────────────────────────────
+// A machine whose graphics stack cannot create the FIRST BrowserWindow takes
+// the process down natively. There is no JS exception, so the handlers above
+// never fire and nothing is written. It then looks like "the backend never
+// started", because the backend is spawned AFTER the splash.
+//
+// A breadcrumb is written immediately before the first window is created and
+// removed once one exists. Finding it at startup therefore means the PREVIOUS
+// launch died in exactly that window, so this launch falls back to software
+// rendering and says so. The fallback is sticky: a machine known to fail this
+// way stays on software rendering instead of failing every other launch.
+//
+// It lives in BOOT_LOG_DIR because that path is computed WITHOUT Electron -
+// app.getPath() is not usable this early, and on a machine that has never run
+// the app it is the only location known to be writable.
+const FIRST_WINDOW_PENDING = path.join(BOOT_LOG_DIR, "first-window-pending");
+const GPU_UNSAFE_MARKER = path.join(BOOT_LOG_DIR, "gpu-unsafe");
+
+function markFirstWindowPending() {
+  try { fs.writeFileSync(FIRST_WINDOW_PENDING, new Date().toISOString()); } catch (_) {}
+}
+function clearFirstWindowPending() {
+  try { if (fs.existsSync(FIRST_WINDOW_PENDING)) fs.unlinkSync(FIRST_WINDOW_PENDING); } catch (_) {}
+}
+
+(() => {
+  let reason = "";
+  try {
+    const argv = process.argv.slice(1).map((a) => String(a).toLowerCase());
+    const envAsked = ["1", "true", "yes", "on"].includes(
+      String(process.env.TRUSTNODE_DISABLE_GPU || "").trim().toLowerCase(),
+    );
+    if (argv.includes("--disable-gpu") || argv.includes("--safe-mode") || envAsked) {
+      reason = "asked for explicitly (--disable-gpu / --safe-mode / TRUSTNODE_DISABLE_GPU)";
+    } else if (fs.existsSync(GPU_UNSAFE_MARKER)) {
+      reason = "this machine has failed to create a window with GPU rendering before";
+    } else if (fs.existsSync(FIRST_WINDOW_PENDING)) {
+      reason = "the previous launch died while creating its first window";
+      try { fs.writeFileSync(GPU_UNSAFE_MARKER, new Date().toISOString()); } catch (_) {}
+    }
+  } catch (err) {
+    // Never let the safety check itself stop the app starting.
+    try { bootLog(`first-window safety check failed (ignored): ${err && err.message || err}`); } catch (_) {}
+  }
+  if (reason) {
+    try {
+      app.disableHardwareAcceleration();
+      bootLog(`GPU rendering DISABLED for this launch: ${reason}`);
+    } catch (err) {
+      bootLog(`could not disable GPU rendering: ${err && err.message || err}`);
+    }
+  }
+})();
+
 let mainWindow = null;
 let splashWindow = null;
 let tray = null;
@@ -355,6 +409,51 @@ function resolveBackendDataDir() {
   return legacyDir;
 }
 
+// 2026-10-22: the installer creates %ProgramData%\TrustNode\edge with
+// "Authenticated Users:(OI)(CI)RX" ON PURPOSE - a customer's ordinary user
+// must not be able to open the SQLite and edit licence flags. But the app RUNS
+// as that user, and on a machine with NO previous install the workspace
+// detector picks exactly that directory and we hand it to the backend as
+// TRUSTNODE_DATA_DIR.
+//
+// app_store._resolve_db_path has a fallback for this, but it is gated on the
+// variable being UNSET, so it never fired here. The process then died at
+// IMPORT - TelemetryService writes collector_instance_id.txt in its
+// constructor - with PermissionError and exit code 1, before anything could
+// serve /api/health. That is "the backend did not start" on a new customer
+// PC, while the portable (which never creates that directory) worked fine.
+//
+// Checking here fixes every consumer at once - telemetry, app store, auth
+// store, reports - instead of each one discovering it separately.
+//
+// fs.accessSync reports the read-only ATTRIBUTE on Windows, not the ACL, and
+// answers "writable" for a directory that refuses every write. The only
+// honest test is to write a file.
+function dirIsWritable(dir) {
+  if (!dir) return false;
+  const probe = path.join(dir, `.tn-write-probe-${process.pid}`);
+  try {
+    fs.writeFileSync(probe, "probe");
+    fs.unlinkSync(probe);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function ensureWritableDataDir(dir) {
+  if (dirIsWritable(dir)) return dir;
+  const fallback = path.join(app.getPath("home"), ".trustnode_edge", "data");
+  try { fs.mkdirSync(fallback, { recursive: true }); } catch (_) {}
+  if (dirIsWritable(fallback)) {
+    logBackend(`data dir ${dir} is not writable by this user (installer ACL); using ${fallback} instead`);
+    chosenWorkspaceDataDir = fallback;
+    return fallback;
+  }
+  logBackend(`WARNING: neither ${dir} nor ${fallback} is writable - the backend cannot store anything`);
+  return dir;
+}
+
 function ensureBackendDataDir(dir) {
   try {
     fs.mkdirSync(dir, { recursive: true });
@@ -430,6 +529,15 @@ function _rotateBackendLog(logFile) {
 
 function logBackend(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
+  // 2026-10-22: until boot completes, mirror into boot-error.log as well.
+  // These two logs used to tell separate halves of the same story:
+  // boot-error.log stopped at the workspace detector and everything that
+  // explains a startup - splash, backend spawn, health - went only to
+  // backend.log under app.getPath("userData"). On a machine that fails
+  // early that directory may not exist yet, so the one file an operator is
+  // told to send contained nothing useful. Boot is short; the duplication
+  // is bounded and stops the moment the app is ready.
+  if (bootPhase !== "ready") { try { bootLog(msg); } catch (_) {} }
   backendLogs.push(line);
   if (backendLogs.length > 200) backendLogs.shift();
   try {
@@ -797,8 +905,10 @@ async function startBackend() {
   backendExited = false;
   backendExitCode = null;
 
-  const dataDir = resolveBackendDataDir();
+  let dataDir = resolveBackendDataDir();
   ensureBackendDataDir(dataDir);
+  // Never hand the backend a directory it cannot write; see ensureWritableDataDir.
+  dataDir = ensureWritableDataDir(dataDir);
   // Load .env so TRUSTNODE_SUPABASE_*, TRUSTNODE_CLOUD_DB_*, etc. land
   // in the spawned backend's environment. Without this the Lite user
   // mirror (and the historian cloud sync, in cloud-only installs)
@@ -1278,6 +1388,7 @@ function createSplashWindow() {
       }
     });
     logBackend("Splash window created");
+    clearFirstWindowPending();
   } catch (err) {
     logBackend(`Splash window failed to create: ${err}`);
     splashWindow = null;
@@ -2006,7 +2117,19 @@ async function bootSequence() {
   // the EXE is launched. startBackend() can take 5–20 s on a fresh
   // SmartScreen-scanning machine; without a splash the user sees a
   // blank desktop and reasonably assumes nothing is happening.
-  createSplashWindow();
+  // The breadcrumb is set immediately before the first window in the process
+  // is created and cleared once it exists; see FIRST_WINDOW_PENDING above.
+  markFirstWindowPending();
+  try {
+    createSplashWindow();
+  } catch (err) {
+    // The splash is feedback, not a dependency. createSplashWindow() was the
+    // only unguarded statement between the workspace detector and the backend
+    // spawn - the tray call right below it has always been wrapped - so a
+    // throw here used to skip startBackend() entirely and present as "the
+    // backend is not responding".
+    bootLog(`splash creation threw (continuing without it): ${err && err.stack || err}`);
+  }
   // Operator 2026-08-21 (NO-ORPHANS): tray icon EARLY so "Quit TrustNode" is
   // always one click away — even if the main window never appears — and the
   // headless watchdog from here on guarantees something is always visible.

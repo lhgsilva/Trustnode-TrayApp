@@ -2835,7 +2835,23 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
     try:
         tenant_id = normalize_tenant_id(str(payload.tenant_id or "default"))
         admin_username = str(payload.admin_username or "").strip() or "admin"
-        admin_password = str(payload.admin_password or "").strip() or "admin"
+        # 2026-10-22: this used to fall back to the literal "admin" when the
+        # field arrived blank. Activation then reported SUCCESS while creating
+        # an account whose password nobody had been told: the operator typed
+        # the password they meant, failed repeatedly, and the account locked
+        # itself (HTTP 423 "temporarily locked after repeated failures").
+        # Reported from a customer's new machine.
+        #
+        # It was also a quiet security hole - every edge activated with a blank
+        # field shipped with a publicly known admin/admin - and because
+        # upsert_user below OVERWRITES the password, re-activating an existing
+        # edge silently RESET its admin password to "admin".
+        #
+        # Refusing is the safe answer: a caller that does not set a password
+        # gets a named error instead of an account it cannot use.
+        admin_password = str(payload.admin_password or "").strip()
+        if not admin_password:
+            raise ValueError("admin_password_required")
         edge_id = str(payload.edge_id or "").strip()
         edge_name = str(payload.edge_name or payload.edge_id or "").strip() or edge_id
         customer_id = str(payload.customer_id or "").strip()

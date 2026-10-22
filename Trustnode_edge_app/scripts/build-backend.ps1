@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $backendRoot = Join-Path $projectRoot "backend"
@@ -201,6 +201,72 @@ print('compile-check OK')
         throw "Upgrade-shape boot self-test FAILED: the legacy store was COPIED into ProgramData despite being over the migration cap. That copy is what delayed startup past the launcher's budget."
     }
     Write-Host "[upgrade-probe] PASS: /api/health 200 after ${elapsed}s, legacy store adopted in place"
+
+    # Operator 2026-10-22 (READ-ONLY DATA DIR): the installer creates
+    # %ProgramData%\TrustNode\edge as "Authenticated Users:(OI)(CI)RX" on
+    # purpose, so a customer's ordinary user cannot open the SQLite and edit
+    # licence flags. The app RUNS as that user, and on a machine with no
+    # previous install the desktop shell's workspace detector picks exactly
+    # that directory and passes it as TRUSTNODE_DATA_DIR. Every service then
+    # tried to create its database there and the process died at IMPORT with
+    # exit code 1 - "the backend did not start" on a new customer PC, while
+    # the PORTABLE build (which never creates that directory) worked fine on
+    # the same machine.
+    #
+    # Neither probe above catches it: --boot-probe overrides the store path,
+    # and the upgrade probe seeds a WRITABLE legacy store. This one hands the
+    # EXE the shape that actually failed.
+    Write-Host "Running read-only data-dir boot self-test..."
+    $ro = Join-Path $env:TEMP ("tn-ro-probe-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
+    $roHome = Join-Path $ro "home"
+    $roData = Join-Path $ro "programdata\TrustNode\edge"
+    New-Item -ItemType Directory -Force $roHome | Out-Null
+    New-Item -ItemType Directory -Force $roData | Out-Null
+    # Exactly the ACL installer.nsh applies.
+    & icacls $roData /inheritance:r | Out-Null
+    & icacls $roData /grant:r "SYSTEM:(OI)(CI)F" | Out-Null
+    & icacls $roData /grant:r "Administrators:(OI)(CI)F" | Out-Null
+    & icacls $roData /grant:r "Authenticated Users:(OI)(CI)RX" | Out-Null
+    $roWritable = $true
+    try { [IO.File]::WriteAllText((Join-Path $roData "probe.txt"), "x") } catch { $roWritable = $false }
+    if ($roWritable) {
+        Write-Host "[ro-probe] SKIP: this account can write through the ACL (running elevated?) - the probe would prove nothing"
+    } else {
+        $roPort = 8794
+        $psi2 = New-Object System.Diagnostics.ProcessStartInfo
+        $psi2.FileName = $exePath
+        $psi2.UseShellExecute = $false
+        $psi2.RedirectStandardOutput = $true
+        $psi2.RedirectStandardError = $true
+        $psi2.EnvironmentVariables["TRUSTNODE_DATA_DIR"] = $roData
+        $psi2.EnvironmentVariables["USERPROFILE"] = $roHome
+        $psi2.EnvironmentVariables["HOME"] = $roHome
+        $psi2.EnvironmentVariables["TRUSTNODE_PORT"] = "$roPort"
+        $psi2.EnvironmentVariables["TRUSTNODE_SKIP_DOTENV"] = "1"
+        $psi2.EnvironmentVariables["TRUSTNODE_BOOT_INTEGRITY_CHECK"] = "never"
+        $psi2.EnvironmentVariables.Remove("TRUSTNODE_APP_STORE_PATH") | Out-Null
+        $roProc = [System.Diagnostics.Process]::Start($psi2)
+        $roBudget = 60
+        $sw2 = [Diagnostics.Stopwatch]::StartNew()
+        $roHealthy = $false
+        while ($sw2.Elapsed.TotalSeconds -lt $roBudget) {
+            Start-Sleep -Milliseconds 1000
+            if ($roProc.HasExited) { break }
+            try {
+                $r2 = Invoke-WebRequest "http://127.0.0.1:$roPort/api/health" -TimeoutSec 3 -UseBasicParsing
+                if ($r2.StatusCode -eq 200) { $roHealthy = $true; break }
+            } catch { }
+        }
+        $roElapsed = [int]$sw2.Elapsed.TotalSeconds
+        $roCode = if ($roProc.HasExited) { $roProc.ExitCode } else { "still running" }
+        if (-not $roProc.HasExited) { try { $roProc.Kill() } catch { } }
+        Start-Sleep -Milliseconds 500
+        Remove-Item -Recurse -Force $ro -ErrorAction SilentlyContinue
+        if (-not $roHealthy) {
+            throw "Read-only data-dir boot self-test FAILED (exit=$roCode after ${roElapsed}s): the backend could not start when TRUSTNODE_DATA_DIR points at a directory it may read but not write. That is the shape a FULL INSTALL takes on a customer's new machine - do not ship this build."
+        }
+        Write-Host "[ro-probe] PASS: /api/health 200 after ${roElapsed}s against a read-only data dir"
+    }
 
     Write-Host "Backend bundle created: $(Join-Path $backendRoot 'dist\trustnode-service')"
 }

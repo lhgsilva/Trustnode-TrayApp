@@ -1231,7 +1231,7 @@ class AppStore:
                 # read-only ATTRIBUTE, not the ACL, and it answered True for a
                 # directory that refused every write. The only honest test is
                 # to write a file.
-                if defaulted and not _store_is_writable(
+                if not _store_is_writable(
                         os.path.join(data_dir, "trustnode_app_store.db")):
                     fallback = os.path.join(os.path.expanduser("~"),
                                             ".trustnode_edge", "data")

@@ -2,6 +2,61 @@ import os
 import threading
 from typing import Any
 
+
+def _ensure_writable_data_dir() -> None:
+    """Point TRUSTNODE_DATA_DIR somewhere this process can actually write.
+
+    2026-10-22, from a customer's brand-new machine: the installer creates
+    %ProgramData%/TrustNode/edge read-only for ordinary users ON PURPOSE, so
+    nobody can open the SQLite and edit licence flags. The app RUNS as such a
+    user, and on a machine with no previous install the desktop shell's
+    workspace detector picks exactly that directory and passes it here as
+    TRUSTNODE_DATA_DIR. Every service then tried to create its database there
+    and the process died at IMPORT with exit code 1, before serving anything -
+    "the backend did not start". The portable build never creates that
+    directory, which is why it worked on the same PC.
+
+    app_store had a fallback for this but it only applied when the variable
+    was UNSET, and TelemetryService (constructed first, below) never had one.
+    Fixing it per-service is whack-a-mole: the value is corrected ONCE here,
+    before any service is constructed, so telemetry, the app store, the auth
+    store and reports all agree on one writable location.
+
+    os.access() is not usable for this on Windows - it reports the read-only
+    ATTRIBUTE, not the ACL, and answers True for a directory that refuses
+    every write. The only honest test is to write a file.
+    """
+    data_dir = str(os.environ.get("TRUSTNODE_DATA_DIR", "") or "").strip()
+    if not data_dir:
+        return  # nothing explicit: each service keeps its own default
+    probe = os.path.join(data_dir, ".tn-write-probe")
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("probe")
+        os.remove(probe)
+        return  # writable - leave it exactly as the caller asked
+    except OSError:
+        pass
+    fallback = os.path.join(os.path.expanduser("~"), ".trustnode_edge", "data")
+    try:
+        os.makedirs(fallback, exist_ok=True)
+        with open(os.path.join(fallback, ".tn-write-probe"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("probe")
+        os.remove(os.path.join(fallback, ".tn-write-probe"))
+    except OSError:
+        print("[trustnode][boot] WARN: data dir %s is not writable and neither "
+              "is %s - startup will almost certainly fail"
+              % (data_dir, fallback), flush=True)
+        return
+    print("[trustnode][boot] WARN: data dir %s is not writable by this user "
+          "(installer ACL); using %s instead" % (data_dir, fallback), flush=True)
+    os.environ["TRUSTNODE_DATA_DIR"] = fallback
+
+
+_ensure_writable_data_dir()
+
 from app.services.plc_manager import PLCManager
 from app.services.app_store import AppStore
 from app.services.auth_store import AuthStore

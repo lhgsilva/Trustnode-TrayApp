@@ -246,6 +246,21 @@ jobs:
               echo "ERROR: 10-secrets.conf missing on VPS. Run scripts/install_vps_secrets.py before deploying." >&2
               exit 78
             fi
+            # Same fail-fast for the control-plane pointer. Without
+            # TRUSTNODE_CONTROL_PLANE_BACKEND=cloud the portal does NOT fail
+            # loudly - it silently serves the VPS's local SQLite, which is a
+            # years-old snapshot. On 2026-10-21 a deploy rewrote override.conf
+            # without that key and the portal lost four customers, four
+            # licences and every working global admin. Nothing had been
+            # deleted; it was reading the wrong database, and only the stale
+            # contents gave it away. Refusing to restart is far better than
+            # serving the wrong control plane.
+            if ! grep -rqs "TRUSTNODE_CONTROL_PLANE_BACKEND=cloud" /etc/systemd/system/${{ env.BACKEND_SERVICE }}.service.d/; then
+              echo "ERROR: TRUSTNODE_CONTROL_PLANE_BACKEND=cloud is not set in any drop-in." >&2
+              echo "       The portal would fall back to the stale local SQLite store." >&2
+              echo "       Restore /etc/systemd/system/${{ env.BACKEND_SERVICE }}.service.d/30-control-plane.conf" >&2
+              exit 78
+            fi
             systemctl daemon-reload
             systemctl reset-failed ${{ env.BACKEND_SERVICE }} || true
             systemctl restart ${{ env.BACKEND_SERVICE }}
@@ -430,6 +445,21 @@ jobs:
             # from a developer workstation (see scripts/README.md).
             if [ ! -f /etc/systemd/system/${{ env.BACKEND_SERVICE }}.service.d/10-secrets.conf ]; then
               echo "ERROR: 10-secrets.conf missing on VPS. Run scripts/install_vps_secrets.py before deploying." >&2
+              exit 78
+            fi
+            # Same fail-fast for the control-plane pointer. Without
+            # TRUSTNODE_CONTROL_PLANE_BACKEND=cloud the portal does NOT fail
+            # loudly - it silently serves the VPS's local SQLite, which is a
+            # years-old snapshot. On 2026-10-21 a deploy rewrote override.conf
+            # without that key and the portal lost four customers, four
+            # licences and every working global admin. Nothing had been
+            # deleted; it was reading the wrong database, and only the stale
+            # contents gave it away. Refusing to restart is far better than
+            # serving the wrong control plane.
+            if ! grep -rqs "TRUSTNODE_CONTROL_PLANE_BACKEND=cloud" /etc/systemd/system/${{ env.BACKEND_SERVICE }}.service.d/; then
+              echo "ERROR: TRUSTNODE_CONTROL_PLANE_BACKEND=cloud is not set in any drop-in." >&2
+              echo "       The portal would fall back to the stale local SQLite store." >&2
+              echo "       Restore /etc/systemd/system/${{ env.BACKEND_SERVICE }}.service.d/30-control-plane.conf" >&2
               exit 78
             fi
             systemctl daemon-reload

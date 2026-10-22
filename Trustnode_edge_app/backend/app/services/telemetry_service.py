@@ -71,12 +71,30 @@ class TelemetryService:
             self._sync_thread.join(timeout=2)
 
     def _load_or_create_instance_id(self) -> str:
-        if self.instance_path.exists():
-            value = self.instance_path.read_text(encoding="utf-8").strip()
-            if value:
-                return value
+        """The collector's own id. Never fatal.
+
+        2026-10-22: this runs in __init__, which runs at IMPORT of app.state,
+        which is the first thing the backend does. On a new customer machine
+        the data dir is %ProgramData%/TrustNode/edge, created by the
+        installer as read-only for ordinary users, so write_text raised
+        PermissionError and the whole process exited with code 1 before
+        anything served /api/health. A telemetry identifier is not worth a
+        backend that will not start - fall back to a per-run id and carry on.
+        """
+        try:
+            if self.instance_path.exists():
+                value = self.instance_path.read_text(encoding="utf-8").strip()
+                if value:
+                    return value
+        except OSError:
+            pass
         value = str(uuid.uuid4())
-        self.instance_path.write_text(value, encoding="utf-8")
+        try:
+            self.instance_path.write_text(value, encoding="utf-8")
+        except OSError as exc:
+            print("[trustnode] WARN: cannot persist the collector id at %s "
+                  "(%s); using a per-run id instead"
+                  % (self.instance_path, exc), flush=True)
         return value
 
     @staticmethod

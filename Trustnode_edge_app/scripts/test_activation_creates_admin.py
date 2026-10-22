@@ -219,6 +219,30 @@ st, r = call("POST", "/api/auth/login",
                    "password": FINALIZE["admin_password"]})
 check("  the old one does not", st != 200, "status={0}".format(st))
 
+# 2026-10-22, reported from a customer's new machine: activation said it had
+# worked, the operator typed the password they meant, it failed, and after a
+# few tries the account locked itself (HTTP 423). The endpoint had been
+# substituting the literal "admin" whenever the password field arrived blank -
+# so the account existed, with a password nobody had been told, and every edge
+# activated that way shipped with a publicly known admin/admin. Because
+# upsert_user OVERWRITES the password, re-activating an edge also reset it.
+print()
+print("[a blank admin password is refused, not invented]")
+BLANK = dict(FINALIZE)
+BLANK["edge_id"] = "edge-blankpw-0001"
+BLANK["admin_username"] = "admin-blankpw"
+BLANK["admin_password"] = "   "
+st, r = call("POST", "/api/control-plane/edge-link/local-finalize", body=BLANK)
+check("local-finalize REFUSES a blank admin password", st == 400,
+      "status={0} {1}".format(st, str(r)[:120]))
+check("  and says which field is missing",
+      "admin_password_required" in str(r), str(r)[:120])
+st, r = call("POST", "/api/auth/login",
+             body={"username": BLANK["admin_username"], "password": "admin"})
+check("  no admin/admin account was left behind", st != 200,
+      "status={0} - a known default password is worse than a failed activation"
+      .format(st))
+
 print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))
 finish(0 if not FAILS else 2)

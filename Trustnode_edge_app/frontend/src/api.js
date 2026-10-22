@@ -182,7 +182,26 @@ export function setSessionRole(role) {
 // Safe to call at module level (does not read React state).
 export function isReadOnlySession() {
   const surface = getRuntimeSurface();
-  if (["lan_client", "lan_lite", "cloud"].includes(surface)) return true;
+  if (["lan_client", "lan_lite"].includes(surface)) return true;
+  // 2026-10-22: "cloud" used to be read-only unconditionally. But
+  // getRuntimeSurface() returns "cloud" for ANY page served over http(s)
+  // from a non-localhost host - which is every hosted surface, the
+  // DEVELOPER PORTAL included. The portal is the one cloud surface whose
+  // whole purpose is writing control-plane records, so a global admin on
+  // it saw "Read-only portal mode: this user cannot add, edit, or delete
+  // control-plane records" and no amount of fixing roles or licences
+  // could clear it - the refusal never reached the backend at all.
+  //
+  // It also made build-web-cloud-readonly.ps1's -ReadOnly switch dead:
+  // the bundle was read-only whether or not that switch was passed, and
+  // nothing in the repo passes it. Honour the switch instead.
+  //
+  // The other read-only surfaces keep their own, independent triggers:
+  // lan_client / lan_lite above (by URL path), the single-file client
+  // build via isClientViewMode() below, and viewer/client roles after
+  // that. The backend remains the real enforcement either way - RBAC and
+  // the licence gate are evaluated on every mutating request.
+  if (surface === "cloud" && FORCE_READONLY) return true;
   if (isClientViewMode()) return true;
   const role = _sessionRole || "";
   if (role === "viewer" || role === "client") return true;
@@ -519,12 +538,19 @@ export async function loginAuth(payloadOrUsername, maybePassword) {
     throw lastErr || new Error("Login failed: network timeout");
   }
   if (!res.ok) {
+    // Read the body ONCE. The previous shape called res.json() and then
+    // res.text() in the catch, but a Response body can only be consumed
+    // once: when the error body was not JSON, the catch itself threw
+    // "Failed to execute 'text' on 'Response': body stream already read",
+    // and THAT replaced the real message. A master account refused from the
+    // network (403, with instructions in the detail) was displayed on the
+    // portal login as a stream error, which says nothing about what to do.
+    const raw = await res.text().catch(() => "");
     let detail = "";
     try {
-      const body = await res.json();
-      detail = describeApiError(body);
+      detail = describeApiError(JSON.parse(raw));
     } catch {
-      detail = await res.text();
+      detail = String(raw || "").trim();
     }
     throw new Error(`Login failed (HTTP ${res.status})${detail ? `: ${detail}` : ""}`);
   }

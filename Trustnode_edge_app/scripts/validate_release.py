@@ -119,6 +119,23 @@ SOURCE_CHECKS = [
     # One rule replaced three intent-guessing guards: you may write what
     # you read (base_version).
     ("restart recovery + versioned writes", "test_restart_recovery.py"),
+    # 2026-10-22: the portal runs the CLOUD control-plane store, which
+    # re-implements ~21 methods of the SQLite one. upsert_license grew
+    # package_key/seats/limits on 2026-08-22; the cloud copy did not, so
+    # creating a licence raised TypeError and the portal showed a bare
+    # 500. Every SQLite-path test passed throughout.
+    ("cloud store matches the sqlite store", "test_cloud_store_signatures.py"),
+    # 2026-10-22: getRuntimeSurface() calls every hosted page "cloud", and
+    # isReadOnlySession() treated "cloud" as read-only unconditionally - so
+    # the DEVELOPER PORTAL refused every edit for a global admin, in the
+    # frontend, before any request reached the backend.
+    ("portal is writable for an admin", "test_portal_not_readonly.py"),
+    # 2026-10-22: the backend is spawned AFTER the splash, so anything that
+    # kills the process at the FIRST BrowserWindow presents as "the backend
+    # never responded" - and that death is native, so no JS handler fires
+    # and nothing is logged. A breadcrumb now makes the next launch fall
+    # back to software rendering instead of failing the same way.
+    ("app starts without a usable GPU", "test_first_window_safety.py"),
     ("deleted gateway stops; browser parity", "test_worker_and_browser_parity.py"),
     # 2026-08-31: a customer froze after 24 h. Connections were never closed
     # and each held up to 128 MB of page cache; the app now also records

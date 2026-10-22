@@ -455,11 +455,28 @@ class ControlPlaneStoreCloud(ControlPlaneStore):
                        plan_code: str = "standard", status: str = "active",
                        start_utc: str = "", end_utc: str = "",
                        max_edges: int = 3, max_users: int = 10,
-                       metadata: dict[str, Any] | None = None) -> dict[str, Any]:  # type: ignore[override]
+                       metadata: dict[str, Any] | None = None,
+                       package_key: str = "",
+                       seats: dict[str, Any] | None = None,
+                       limits: dict[str, Any] | None = None) -> dict[str, Any]:  # type: ignore[override]
         """Postgres rejects empty strings as `timestamptz`. The SQLite
         parent stores them as text and tolerates ''. Here we coerce
-        empty timestamps to NULL."""
+        empty timestamps to NULL.
+
+        2026-10-22: package_key/seats/limits were added to the SQLite parent
+        on 2026-08-22 (Phase G) but never to this override, so every licence
+        create through the portal raised
+
+            TypeError: upsert_license() got an unexpected keyword argument
+                       'package_key'
+
+        and came back as a bare 500. Creating a licence has been impossible
+        in cloud mode since then. The tier columns are written separately,
+        exactly as the parent does, so a caller that does not manage them
+        leaves whatever is already stored untouched.
+        """
         import secrets as _secrets
+        from app.services.control_plane_store import _normalize_seats
         from app.tenant import normalize_tenant_id
         tid = normalize_tenant_id(tenant_id)
         lid = str(license_id or "").strip() or f"lic-{_secrets.token_hex(4)}"
@@ -488,6 +505,17 @@ class ControlPlaneStoreCloud(ControlPlaneStore):
                     (lid, tid, str(customer_id or ""), str(plan_code or "standard"), str(status or "active"),
                      start_val, end_val, int(max_edges or 0), int(max_users or 0), payload, now, now),
                 )
+                # The tier columns are TEXT here, matching the SQLite parent,
+                # so a value read back parses identically in both stores.
+                if package_key:
+                    conn.execute("UPDATE cp_licenses SET package_key=? WHERE license_id=?",
+                                 (str(package_key), lid))
+                if seats is not None:
+                    conn.execute("UPDATE cp_licenses SET seats_json=? WHERE license_id=?",
+                                 (json.dumps(_normalize_seats(seats), separators=(",", ":"), sort_keys=True), lid))
+                if limits is not None:
+                    conn.execute("UPDATE cp_licenses SET limits_json=? WHERE license_id=?",
+                                 (json.dumps(limits or {}, separators=(",", ":"), sort_keys=True), lid))
                 row = conn.execute("SELECT * FROM cp_licenses WHERE license_id=?", (lid,)).fetchone()
         return dict(row) if row else {}
 
