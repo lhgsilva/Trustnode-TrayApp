@@ -1649,15 +1649,35 @@ class ControlPlaneStore:
         tenant_ids = self.list_user_tenants(username=uname)
         if not tenant_ids:
             return None
-        # Safe fallback only when username maps to exactly one active tenant.
-        unique_tenants = sorted(set(tenant_ids))
-        if len(unique_tenants) != 1:
-            return None
-        return self.authenticate_user(
-            tenant_id=unique_tenants[0],
-            username=uname,
-            password=password,
-        )
+        # 2026-10-22: this used to refuse outright whenever the username
+        # existed in more than one tenant ("safe fallback only when username
+        # maps to exactly one active tenant"). That is the NORMAL shape on an
+        # edge, not an edge case: the control-plane store carries a seeded
+        # 'admin' under tenant 'default', and activation adds the CUSTOMER's
+        # own 'admin' under tenant-cust-<id>. Two tenants for one username, so
+        # every freshly activated admin got 401 while the seeded account still
+        # worked - "it said it was activated but I cannot log in".
+        #
+        # Customers deliberately reuse ordinary names like 'admin'; those are
+        # per-tenant accounts and are never shared between customers.
+        #
+        # The PASSWORD is what disambiguates. Verify against every candidate
+        # tenant and accept only when exactly one matches, so a genuinely
+        # ambiguous credential (the same username AND password in two tenants)
+        # is still refused rather than guessed at.
+        match: dict[str, Any] | None = None
+        for tid in sorted(set(tenant_ids)):
+            row = self.authenticate_user(
+                tenant_id=tid,
+                username=uname,
+                password=password,
+            )
+            if not row:
+                continue
+            if match is not None:
+                return None  # ambiguous: same credentials in two tenants
+            match = row
+        return match
 
     def issue_activation_code(
         self,

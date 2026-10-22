@@ -28516,7 +28516,18 @@ const getGatewayHealth = (gateway) => {
                           </div>
                           {(cpUsersFiltered || []).map((row, idx) => {
                             const uname = String(row?.username || "");
-                            const isBuiltin = uname.toLowerCase() === "admin";
+                            // 2026-10-22: this used to grey out EVERY user called
+                            // "admin", in every tenant. Customers deliberately name
+                            // their own administrator "admin" - those accounts are
+                            // per-tenant and are never shared between customers - so
+                            // a customer's own admin arrived uneditable and
+                            // undeletable, with no explanation. The account that has
+                            // to stay protected is the BUILT-IN one in the developer
+                            // tenant, not a customer's account that happens to share
+                            // its name.
+                            const isBuiltin =
+                              uname.toLowerCase() === "admin"
+                              && String(row?.tenant_id || "").trim().toLowerCase() === "default";
                             const mustChange = Boolean(row?.must_change_password);
                             return (
                               <div className="trow" key={`cp-user-${idx}-${row?.tenant_id || ""}`}>

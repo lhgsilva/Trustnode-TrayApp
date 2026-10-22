@@ -243,6 +243,63 @@ check("  no admin/admin account was left behind", st != 200,
       "status={0} - a known default password is worse than a failed activation"
       .format(st))
 
+# 2026-10-22: customers name their own administrator "admin". Those accounts
+# are PER-TENANT and are never shared between customers. The edge already
+# carries a seeded "admin" under tenant "default", so the moment a customer
+# activated with that name the username mapped to two tenants and
+# authenticate_user_any_tenant refused outright:
+#
+#     unique_tenants = sorted(set(tenant_ids))
+#     if len(unique_tenants) != 1: return None
+#
+# Activation reported success and the account could never log in, while the
+# seeded one still worked. The password is what disambiguates.
+print()
+print("[two customers can both call their administrator 'admin']")
+BAY = dict(FINALIZE)
+BAY.update(tenant_id="tenant-cust-bay", customer_id="cust-bay",
+           edge_id="edge-bay-1", license_id="lic-bay-1",
+           admin_username="admin", admin_password="BayPass!2026aa")
+GLASS = dict(FINALIZE)
+GLASS.update(tenant_id="tenant-cust-glass", customer_id="cust-glass",
+             edge_id="edge-glass-1", license_id="lic-glass-1",
+             admin_username="admin", admin_password="GlassPass!2026b")
+for who, body in (("first", BAY), ("second", GLASS)):
+    st, r = call("POST", "/api/control-plane/edge-link/local-finalize", body=body)
+    check("the {0} customer activates as 'admin'".format(who), st == 200,
+          "status={0} {1}".format(st, str(r)[:110]))
+
+def login_backoff(username, password, tries=25):
+    """Log in, waiting out the per-IP rate limiter.
+
+    The checks above deliberately fail a lot of logins (wrong recovery
+    codes, old passwords), so by this point the limiter answers 429 and a
+    plain call would report a product failure that is really this test
+    tripping its own guard.
+    """
+    st, r = 0, None
+    for attempt in range(tries):
+        st, r = call("POST", "/api/auth/login",
+                     body={"username": username, "password": password})
+        if st != 429:
+            return st, r
+        time.sleep(4)
+    return st, r
+
+
+for who, body in (("first", BAY), ("second", GLASS)):
+    st, r = login_backoff("admin", body["admin_password"])
+    tid = (((r or {}).get("user") or {}) if isinstance(r, dict) else {}).get("tenant_id")
+    check("  the {0} customer's admin CAN LOG IN".format(who), st == 200,
+          "status={0}".format(st))
+    check("    and lands in their OWN tenant", tid == body["tenant_id"],
+          "{0} (wanted {1}) - customers must never share an account"
+          .format(tid, body["tenant_id"]))
+
+st, r = login_backoff("admin", "NotAnyonesPassword!9")
+check("  a wrong password is still refused", st not in (200, 429),
+      "status={0}".format(st))
+
 print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))
 finish(0 if not FAILS else 2)
