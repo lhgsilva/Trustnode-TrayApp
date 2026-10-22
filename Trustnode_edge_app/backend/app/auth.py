@@ -88,6 +88,14 @@ def create_access_token(user: Dict[str, Any], expires_seconds: int = 12 * 3600) 
         payload["tv"] = int(_as_tv.get_token_version(payload["sub"]))
     except Exception:
         payload["tv"] = 0
+    # 2026-10-22: a session minted by an emailed recovery code. The holder
+    # proved control of the account's registered mailbox but CANNOT know the
+    # current password - that is the whole point of recovery - so
+    # /change-password accepts a blank current password for this claim and
+    # for nothing else. It is never set on a password login, so an ordinary
+    # stolen token still cannot rotate a password.
+    if bool(user.get("pwreset")):
+        payload["pwreset"] = True
     header = {"alg": "HS256", "typ": "JWT"}
     part1 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
     part2 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))

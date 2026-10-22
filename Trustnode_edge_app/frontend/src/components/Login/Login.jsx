@@ -1,9 +1,9 @@
 import React, { useEffect, useState } from "react";
 import {
   loginAuth,
-  issuePublicPasswordReset,
-  applyPublicPasswordReset,
-  emailPasswordReset,
+  requestLoginCode,
+  verifyLoginCode,
+  getCodeReadiness,
   applyEmailPasswordReset,
   registerControlPlaneEdgeLink,
   registerControlPlaneEdgeLinkLogin,
@@ -38,12 +38,19 @@ export const Login = ({
   const [loginBusy, setLoginBusy] = useState(false);
   const [loginTab, setLoginTab] = useState("login");
   const [forgotResult, setForgotResult] = useState("");
+  // 2026-10-22: recovery is two steps and asks for ONE thing to start.
+  // It used to ask for a tenant, which no operator on a customer edge
+  // knows - and the tenant was only ever needed by the portal reset path
+  // this screen no longer uses. The edge resolves its own scope.
   const [forgotForm, setForgotForm] = useState({
-    tenant_id: "",
-    username: "",
+    identifier: "",
+    code: "",
     reset_token: "",
     new_password: "",
   });
+  const [forgotOpen, setForgotOpen] = useState(false);
+  const [forgotStep, setForgotStep] = useState("ask");   // "ask" | "code"
+  const [codeReadiness, setCodeReadiness] = useState(null);
   const [forgotBusy, setForgotBusy] = useState(false);
   const [edgeRegisterForm, setEdgeRegisterForm] = useState(() => {
     // 2026-08-25: a fresh computer knows no portal address, which used to make
@@ -137,42 +144,41 @@ export const Login = ({
     }
   };
 
-  const requestForgotPasswordCode = async () => {
-    const username = String(forgotForm.username || "").trim();
-    if (!username) {
-      setForgotResult("Enter your username first.");
-      return;
-    }
-    setForgotBusy(true);
+  // Recovery, 2026-10-22. The whole flow is: say who you are, get six
+  // digits by email, type them, set a password.
+  //
+  // What was here before called the PORTAL's reset endpoints
+  // (/api/control-plane/password-reset/public/issue), which need a tenant
+  // the operator does not know and a portal a fresh edge cannot reach. The
+  // Supabase code endpoints had existed since 2026-10-20 and no button on
+  // this screen called either of them, so not one code request was ever
+  // recorded in the audit log - the operator pressed "Request Code" and
+  // nothing at all was asked of the cloud.
+  const openForgot = () => {
+    setForgotOpen(true);
+    setForgotStep("ask");
     setForgotResult("");
-    try {
-      // 2026-10-20 (SECURITY): this used to read res.row.reset_token and
-      // PUT THE CODE ON SCREEN. That was the client half of an account
-      // takeover - the endpoint handed the token to any unauthenticated
-      // caller, so anyone at a login screen could reset anyone's password.
-      //
-      // The code now goes to the account's registered email and never comes
-      // back in the response. The operator types what they received.
-      const res = await issuePublicPasswordReset({
-        username,
-        tenant_id: String(forgotForm.tenant_id || "").trim(),
-        ttl_minutes: 15,
-      });
-      setForgotResult(String(res?.message || "")
-        || "If that account exists and has a registered email, a code has been sent to it.");
-    } catch (err) {
-      setForgotResult(`Code request failed: ${String(err?.message || err)}`);
-    } finally {
-      setForgotBusy(false);
-    }
+    setForgotForm((p) => ({
+      ...p,
+      identifier: p.identifier || String(loginForm.username || "").trim(),
+    }));
+    // Readiness is a property of THIS EDGE, never of an account, so asking
+    // it leaks nothing. Without it a machine with no cloud key still said
+    // "a code has been sent" and the operator waited for nothing.
+    getCodeReadiness()
+      .then((r) => setCodeReadiness(r || null))
+      .catch(() => setCodeReadiness(null));
   };
 
-  // Operator 2026-06-24: email-based forgot-password. Asks the edge
-  // to send a reset link to the user's registered email via SMTP.
-  // The endpoint always returns ok=True to avoid leaking whether the
-  // account exists.
-  const requestForgotPasswordEmail = async () => {
-    const identifier = String(forgotForm.username || "").trim();
+  const closeForgot = () => {
+    setForgotOpen(false);
+    setForgotBusy(false);
+    setForgotResult("");
+    setForgotForm((p) => ({ ...p, code: "", new_password: "" }));
+  };
+
+  const sendRecoveryCode = async () => {
+    const identifier = String(forgotForm.identifier || "").trim();
     if (!identifier) {
       setForgotResult("Enter your username or email first.");
       return;
@@ -180,36 +186,67 @@ export const Login = ({
     setForgotBusy(true);
     setForgotResult("");
     try {
-      await emailPasswordReset(identifier);
-      setForgotResult("If a matching account exists, a reset email has been sent. Check your inbox.");
+      const res = await requestLoginCode(identifier);
+      // The reply is the same whether or not the account exists - a
+      // different answer would tell an attacker which usernames are real.
+      setForgotResult(String(res?.message || "")
+        || "If that account exists and has a registered email, a 6-digit code has been sent to it.");
+      setForgotStep("code");
     } catch (err) {
-      setForgotResult(`Email request failed: ${String(err?.message || err)}`);
+      setForgotResult(`Could not request a code: ${String(err?.message || err)}`);
     } finally {
       setForgotBusy(false);
     }
   };
 
-  // Auto-fill the verification-code field when the user clicked an
-  // email reset link (URL carries ?reset_token=...). The Apply Reset
-  // button below then drives a single-step email-token apply via the
-  // new /api/auth/reset-password endpoint.
+  const verifyRecoveryCode = async () => {
+    const identifier = String(forgotForm.identifier || "").trim();
+    const code = String(forgotForm.code || "").trim();
+    if (!identifier || !code) {
+      setForgotResult("Enter the 6-digit code from your email.");
+      return;
+    }
+    setForgotBusy(true);
+    setForgotResult("");
+    try {
+      const res = await verifyLoginCode(identifier, code);
+      const user = res?.user || null;
+      if (!user) {
+        setForgotResult("That code is not valid.");
+        return;
+      }
+      // The code signed them in. The session is short and flagged, so the
+      // app opens "set your password" rather than a dashboard - they still
+      // do not know a password they can use next time.
+      setForgotResult("");
+      setForgotOpen(false);
+      onLoginSuccess?.(user);
+    } catch (err) {
+      setForgotResult(String(err?.message || err) || "That code is not valid.");
+    } finally {
+      setForgotBusy(false);
+    }
+  };
+
+  // A reset LINK that was emailed before this flow existed still has to
+  // work - someone may have one sitting in their inbox. The box only
+  // appears when the URL actually carries a token, so it adds nothing to
+  // the screen in the ordinary case.
   React.useEffect(() => {
     try {
       const sp = new URLSearchParams(window.location.search || "");
       const tok = String(sp.get("reset_token") || "").trim();
-      if (tok && !forgotForm.reset_token) {
+      if (tok) {
         setForgotForm((p) => ({ ...p, reset_token: tok }));
-        // No `forgotMode` state exists - the reset box is revealed by
-        // forgotResult below. The old setForgotMode(true) call threw a
-        // ReferenceError here, so an emailed reset link never opened the form.
-        setForgotResult("Reset link detected. Enter a new password and click Apply Reset.");
+        setForgotOpen(true);
+        setForgotStep("link");
+        setForgotResult("Reset link detected. Choose a new password below.");
       }
     } catch { /* ignore */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const applyForgotPasswordReset = async () => {
-    const username = String(forgotForm.username || "").trim();
     const reset_token = String(forgotForm.reset_token || "").trim();
     const new_password = String(forgotForm.new_password || "");
     if (!reset_token || !new_password) {
@@ -218,33 +255,9 @@ export const Login = ({
     }
     setForgotBusy(true);
     setForgotResult("");
-    // Operator 2026-06-24: try the edge-local email-reset path first
-    // (no username needed — the token IS the identifier). If that
-    // fails, fall back to the existing portal-issued-code flow which
-    // requires the username + tenant.
     try {
       await applyEmailPasswordReset(reset_token, new_password);
-      setForgotResult("Password reset completed. You can login now.");
-      if (username) setLoginForm((prev) => ({ ...prev, username }));
-      return;
-    } catch (err) {
-      // Fall through to portal-code path only if the user provided
-      // a username (the portal flow requires one).
-      if (!username) {
-        setForgotResult(`Reset failed: ${String(err?.message || err)}`);
-        setForgotBusy(false);
-        return;
-      }
-    }
-    try {
-      await applyPublicPasswordReset({
-        username,
-        tenant_id: String(forgotForm.tenant_id || "").trim(),
-        reset_token,
-        new_password,
-      });
-      setForgotResult("Password reset completed. You can login now.");
-      setLoginForm((prev) => ({ ...prev, username }));
+      setForgotResult("Password reset completed. You can sign in now.");
     } catch (err) {
       setForgotResult(`Reset failed: ${String(err?.message || err)}`);
     } finally {
@@ -674,7 +687,7 @@ export const Login = ({
                 <button
                   className="forgot-link"
                   type="button"
-                  onClick={() => setForgotResult("Fill username and click Request Code.")}
+                  onClick={openForgot}
                 >
                   Forgot password?
                 </button>
@@ -714,121 +727,123 @@ export const Login = ({
               <span className="remember-label">Remember this workstation</span>
             </label>
 
-            {forgotResult ? (
+            {forgotOpen ? (
               <div className="auth-forgot-box">
-                {/* 2026-10-22, reported from a customer machine: this panel
-                    appears the moment "Forgot password?" is clicked and
-                    NOTHING ever cleared forgotResult again, so there was no
-                    way back to a plain sign-in form - the operator was stuck
-                    looking at a reset flow they had opened by accident. */}
                 <div className="auth-forgot-head">
-                  <span>Reset a password</span>
+                  <span>Reset your password</span>
                   <button
                     type="button"
                     className="forgot-link"
-                    onClick={() => { setForgotResult(""); setForgotBusy(false); }}
+                    onClick={closeForgot}
                   >
                     Back to sign in
                   </button>
                 </div>
-                <label>
-                  <span>Tenant (optional)</span>
-                  <input
-                    placeholder="default"
-                    value={forgotForm.tenant_id}
-                    onChange={(e) =>
-                      setForgotForm((p) => ({
-                        ...p,
-                        tenant_id: e.target.value,
-                      }))
-                    }
-                  />
-                </label>
-                <label>
-                  <span>Username</span>
-                  <input
-                    value={forgotForm.username}
-                    onChange={(e) =>
-                      setForgotForm((p) => ({
-                        ...p,
-                        username: e.target.value,
-                      }))
-                    }
-                  />
-                </label>
-                <label>
-                  <span>Verification Code</span>
-                  <input
-                    value={forgotForm.reset_token}
-                    onChange={(e) =>
-                      setForgotForm((p) => ({
-                        ...p,
-                        reset_token: e.target.value,
-                      }))
-                    }
-                  />
-                </label>
-                <label>
-                  <span>New Password</span>
-                  <div className="pw-input-wrap">
-                    <div className="field-icon">
-                      <svg viewBox="0 0 24 24" fill="none">
-                        <rect x="3" y="11" width="18" height="10" rx="2" />
-                        <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-                      </svg>
-                    </div>
-                    <input
-                      type={showForgotNewPassword ? "text" : "password"}
-                      value={forgotForm.new_password}
-                      onChange={(e) =>
-                        setForgotForm((p) => ({
-                          ...p,
-                          new_password: e.target.value,
-                        }))
-                      }
-                    />
+
+                {codeReadiness && codeReadiness.can_send_codes === false ? (
+                  <div className="error">{codeReadiness.reason}</div>
+                ) : null}
+
+                {forgotStep === "link" ? (
+                  <>
+                    <label>
+                      <span>New password</span>
+                      <div className="pw-input-wrap">
+                        <input
+                          type={showForgotNewPassword ? "text" : "password"}
+                          value={forgotForm.new_password}
+                          onChange={(e) =>
+                            setForgotForm((p) => ({ ...p, new_password: e.target.value }))
+                          }
+                        />
+                        <button
+                          className="pw-icon-btn"
+                          onClick={() => setShowForgotNewPassword((v) => !v)}
+                          type="button"
+                          aria-label="Toggle new password visibility"
+                        >
+                          <EyeIcon open={showForgotNewPassword} />
+                        </button>
+                      </div>
+                    </label>
                     <button
-                      className="pw-icon-btn"
-                      onClick={() => setShowForgotNewPassword((v) => !v)}
+                      className="btn btn-primary"
                       type="button"
-                      aria-label="Toggle new password visibility"
+                      onClick={applyForgotPasswordReset}
+                      disabled={forgotBusy}
                     >
-                      <EyeIcon open={showForgotNewPassword} />
+                      {forgotBusy ? "Applying..." : "Apply reset"}
                     </button>
-                  </div>
-                </label>
-                <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-                  <button
-                    className="btn btn-primary"
-                    type="button"
-                    onClick={requestForgotPasswordCode}
-                    disabled={forgotBusy}
-                    style={{ flex: "1 1 130px" }}
-                    title="Generate a one-time code via the cloud portal"
-                  >
-                    {forgotBusy ? "Requesting..." : "Request Code"}
-                  </button>
-                  <button
-                    className="btn btn-secondary"
-                    type="button"
-                    onClick={requestForgotPasswordEmail}
-                    disabled={forgotBusy}
-                    style={{ flex: "1 1 130px" }}
-                    title="Email a reset link to the address registered on this user"
-                  >
-                    {forgotBusy ? "Sending..." : "Email reset link"}
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    type="button"
-                    onClick={applyForgotPasswordReset}
-                    disabled={forgotBusy}
-                    style={{ flex: "1 1 130px" }}
-                  >
-                    Apply Reset
-                  </button>
-                </div>
-                <div className="lock-note">{forgotResult}</div>
+                  </>
+                ) : (
+                  <>
+                    <label>
+                      <span>Username or email</span>
+                      <input
+                        value={forgotForm.identifier}
+                        autoComplete="username"
+                        onChange={(e) =>
+                          setForgotForm((p) => ({ ...p, identifier: e.target.value }))
+                        }
+                      />
+                    </label>
+
+                    {forgotStep === "code" ? (
+                      <label>
+                        <span>6-digit code from your email</span>
+                        <input
+                          value={forgotForm.code}
+                          inputMode="numeric"
+                          autoComplete="one-time-code"
+                          maxLength={10}
+                          placeholder="123456"
+                          onChange={(e) =>
+                            setForgotForm((p) => ({ ...p, code: e.target.value }))
+                          }
+                        />
+                      </label>
+                    ) : null}
+
+                    <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                      {forgotStep === "code" ? (
+                        <>
+                          <button
+                            className="btn btn-primary"
+                            type="button"
+                            onClick={verifyRecoveryCode}
+                            disabled={forgotBusy}
+                            style={{ flex: "1 1 150px" }}
+                          >
+                            {forgotBusy ? "Checking..." : "Verify and sign in"}
+                          </button>
+                          <button
+                            className="btn btn-secondary"
+                            type="button"
+                            onClick={sendRecoveryCode}
+                            disabled={forgotBusy}
+                            style={{ flex: "1 1 120px" }}
+                            title="Send another code to the registered address"
+                          >
+                            Resend
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          className="btn btn-primary"
+                          type="button"
+                          onClick={sendRecoveryCode}
+                          disabled={forgotBusy}
+                          style={{ flex: "1 1 150px" }}
+                          title="Email a 6-digit code to the address registered on this account"
+                        >
+                          {forgotBusy ? "Sending..." : "Send code"}
+                        </button>
+                      )}
+                    </div>
+                  </>
+                )}
+
+                {forgotResult ? <div className="lock-note">{forgotResult}</div> : null}
               </div>
             ) : null}
 

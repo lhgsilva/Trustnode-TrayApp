@@ -208,6 +208,26 @@ export function isReadOnlySession() {
   return false;
 }
 
+// Roles the BACKEND lets write shared configuration. Mirrors CONFIG_ROLES in
+// services/access_policy.py: any mutation not under an admin-only prefix needs
+// admin, super or engineer.
+//
+// 2026-10-22, reported from a customer edge: isReadOnlySession() only treats
+// viewer and client as read-only, so an OPERATOR session ran every debounced
+// config auto-save and the backend refused each one -
+//
+//   Database connections could not be saved: App store domain save failed
+//   (HTTP 403): Forbidden: role 'operator' may not PUT /api/app-store/domain
+//
+// The refusal is correct; attempting the write is not. An operator simply
+// opening a page must not be told their configuration failed to save.
+const _CONFIG_WRITE_ROLES = new Set(["admin", "super", "engineer"]);
+
+export function canWriteSharedConfig() {
+  if (isReadOnlySession()) return false;
+  return _CONFIG_WRITE_ROLES.has(String(_sessionRole || "").toLowerCase());
+}
+
 export function getWsStreamUrl() {
   const apiBase = getApiBase();
   const token = getAuthToken();
@@ -3647,6 +3667,18 @@ export async function applyControlPlanePasswordReset(payload, tenantId = "") {
 // sign-in by code alone ("email should be enough"). Supabase generates,
 // expires and delivers; the edge only verifies. None of these ever return
 // the code - it goes to the account's registered email and nowhere else.
+
+// Can this edge send a code at all? Asked separately from any account,
+// because /login-code/request deliberately answers the same way whatever
+// happens - which also hid "there is no Supabase key on this machine".
+export async function getCodeReadiness() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/auth/code-readiness`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" }
+  });
+  if (!res.ok) return { ok: false, can_send_codes: true, reason: "" };
+  return res.json();
+}
 
 export async function requestLoginCode(identifier) {
   const res = await fetchWithTimeout(`${getApiBase()}/api/auth/login-code/request`, {

@@ -229,6 +229,21 @@ SOURCE_CHECKS = [
     # the licence says - three were. And admins skipped the licence gate
     # outright, which is who actually uses a customer edge.
     ("the menu shows only licensed modules", "test_menu_licence_gating.py"),
+    # 2026-10-22, from a customer edge: a user whose role is `operator`
+    # was told "Database connections could not be saved ... role
+    # 'operator' may not PUT /api/app-store/domain" just by opening the
+    # page. The backend is right to refuse; seven debounced auto-savers
+    # asked anyway, because isReadOnlySession() only knows viewer and
+    # client. The guard must read currentUser.role - the api.js cache is
+    # filled by its own effect and would skip an ADMIN's save.
+    ("config writes follow the role, not read-only", "test_config_write_roles.py"),
+    # 2026-10-22: "forgot password is not working" and "the code is not
+    # being sent". login_audit held ZERO code requests, ever - the Forgot
+    # panel called the PORTAL's tenant-scoped reset while the Supabase
+    # code endpoints built two days earlier had no caller at all. And no
+    # local user had an email, because the create/edit paths sent the
+    # address to the cloud and dropped it locally.
+    ("forgot password: code, then set a password", "test_recovery_code_flow.py"),
     # 2026-10-22, from a customer install: after activation the locally
     # created users could not log in, and many sites have no internet at
     # all. This drives an ACTIVATED edge with every cloud variable stripped

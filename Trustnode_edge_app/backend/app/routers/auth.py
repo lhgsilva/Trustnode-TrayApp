@@ -544,24 +544,50 @@ def change_password(payload: ChangePasswordRequest, request: Request) -> Dict[st
     if _policy_err:
         raise HTTPException(status_code=400, detail=_policy_err)
 
-    # Verify the current password through the same path that issued the
-    # token. Force-change-password sessions still know their current
-    # (temporary) password, so this guards against stolen tokens.
-    auth_ok = control_plane_store.authenticate_user(
-        tenant_id=tenant_id, username=username, password=payload.current_password,
-    )
-    if not auth_ok:
-        # Try the any-tenant fallback used during login.
-        auth_ok = control_plane_store.authenticate_user_any_tenant(
-            username=username, password=payload.current_password,
+    # 2026-10-22: a session minted by /login-code/verify carries `pwreset`.
+    # That holder proved control of the registered mailbox and cannot know
+    # the current password - demanding it is what made recovery impossible
+    # to finish. Every other session still proves the current password.
+    _code_session = bool(jwt_payload.get("pwreset"))
+    auth_ok: Optional[Dict[str, Any]] = None
+    if _code_session:
+        try:
+            auth_ok = auth_store.get_user(username) or {}
+        except Exception:
+            auth_ok = {}
+    else:
+        # Verify the current password through the same path that issued the
+        # token. Force-change-password sessions still know their current
+        # (temporary) password, so this guards against stolen tokens.
+        auth_ok = control_plane_store.authenticate_user(
+            tenant_id=tenant_id, username=username, password=payload.current_password,
         )
-    if not auth_ok:
-        raise HTTPException(status_code=401, detail="current_password_incorrect")
+        if not auth_ok:
+            # Try the any-tenant fallback used during login.
+            auth_ok = control_plane_store.authenticate_user_any_tenant(
+                username=username, password=payload.current_password,
+            )
+        if not auth_ok:
+            raise HTTPException(status_code=401, detail="current_password_incorrect")
 
     row = control_plane_store.set_user_password(
         tenant_id=tenant_id, username=username,
         password=payload.new_password, must_change=False,
     )
+    if _code_session:
+        # The edge has TWO user stores and login accepts both. A one-store
+        # reset leaves the OLD password working - that has happened here
+        # before - so a recovery writes wherever the account actually lives,
+        # and succeeds if either store took it.
+        local_ok = False
+        try:
+            if auth_store.get_user(username):
+                local_hash = app_store._hash_password_if_needed(payload.new_password)
+                local_ok = bool(auth_store.set_user_password(username, local_hash))
+        except Exception:
+            local_ok = False
+        if row is None and local_ok:
+            row = dict(auth_ok or {}) or {"role": "viewer"}
     if row is None:
         raise HTTPException(status_code=404, detail="user_not_found")
 
@@ -836,6 +862,42 @@ def _recovery_address(u: Dict[str, Any]) -> str:
     return own
 
 
+@router.get("/code-readiness")
+def code_readiness() -> Dict[str, Any]:
+    """Can THIS edge send a recovery code at all?
+
+    2026-10-22. /login-code/request answers the same way whatever happens,
+    which is right - a different reply for "no such user" is a free
+    account-enumeration oracle. But it also hid the two failures that are
+    nothing to do with the account: no Supabase key on this machine, and no
+    company address to fall back to. The operator was told a code had been
+    sent every time, and nothing had been requested at all.
+
+    So readiness is reported SEPARATELY and says nothing about any
+    particular user: it is a property of the edge, not of an account.
+    """
+    from app.services import recovery_codes
+    url, anon = recovery_codes.supabase_config()
+    company = ""
+    try:
+        company = _recovery_address({})
+    except Exception:
+        company = ""
+    configured = bool(url and anon)
+    if configured:
+        reason = ""
+    elif url:
+        reason = ("This edge has no Supabase anon key, so it cannot send "
+                  "codes. Set TRUSTNODE_SUPABASE_ANON_KEY, or re-activate "
+                  "with a code issued by the current portal.")
+    else:
+        reason = ("This edge has no cloud connection configured, so it "
+                  "cannot email a code. Use the offline recovery option, or "
+                  "ask an administrator to reset the password.")
+    return {"ok": True, "can_send_codes": configured,
+            "company_fallback": bool(company), "reason": reason}
+
+
 @router.post("/login-code/request")
 def login_code_request(payload: _CodeRequestPayload, request: Request) -> Dict[str, Any]:
     """Email a sign-in code. Nobody types a password in this flow."""
@@ -890,16 +952,29 @@ def login_code_verify(payload: _CodeVerifyPayload, request: Request,
         # Same answer as a wrong password, for the same reason.
         raise HTTPException(status_code=401, detail="That code is not valid")
     user_public = _public_user(user)
-    _ttl = 4 * 3600
-    token = create_access_token(user_public, expires_seconds=_ttl)
+    # Recovery is deliberately short-lived and carries `pwreset`, which is
+    # the ONLY thing that lets /change-password accept a blank current
+    # password. The user came here because they cannot sign in; the session
+    # exists so they can set a password, not to be a day-long login.
+    _ttl = 30 * 60
+    token = create_access_token({**user_public, "pwreset": True},
+                                expires_seconds=_ttl)
     try:
         auth_store.clear_failed_attempts(user_public["username"])
         auth_store.record_login(user_public["username"], ok=True,
                                 remote_ip=client_host, detail="login_code")
     except Exception:
         pass
+    # must_change_password drives the modal the app already shows after a
+    # temporary password. Reusing it means the recovered user lands on
+    # "set your password" instead of a dashboard they cannot get back into.
+    # `pwreset` tells the app this session came from a code, so the
+    # set-password dialog does not ask for a current password the user by
+    # definition does not have.
+    user_public = {**user_public, "must_change_password": True,
+                   "pwreset": True}
     return {"ok": True, "token": token, "user": user_public,
-            "expires_in": _ttl}
+            "expires_in": _ttl, "password_reset_required": True}
 
 
 @router.post("/reset-password/code")

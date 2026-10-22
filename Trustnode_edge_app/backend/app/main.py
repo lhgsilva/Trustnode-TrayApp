@@ -1373,6 +1373,13 @@ PUBLIC_PATHS = {
     # CANNOT sign in - behind the auth gate they would be unreachable by the
     # only people who need them. Each is rate limited, audited, and answers
     # identically whether or not the account exists.
+    # Readiness is reachable unauthenticated for the same reason as the
+    # rest of this group: it is read by the LOGIN screen, by someone who
+    # cannot sign in. It describes this edge - whether a Supabase key is
+    # present - and never any account, so it is not an enumeration
+    # oracle. Behind the gate it returned 401 and the screen fell back
+    # to pretending a code had been sent.
+    "/api/auth/code-readiness",
     "/api/auth/login-code/request",
     "/api/auth/login-code/verify",
     "/api/auth/reset-password/code",

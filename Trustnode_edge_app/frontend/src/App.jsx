@@ -7697,7 +7697,12 @@ function AppShell() {
 
   useEffect(() => {
     if (!appStoreHydrated) return;
-    if (isReadOnlySession()) return; // Phase B 2026-08-22: never write for viewer/client sessions
+    // 2026-10-22: mirror the BACKEND's rule. isReadOnlySession() lets an
+    // operator through, so every one of these debounced savers fired and
+    // came back 403 "role 'operator' may not PUT /api/app-store/domain" -
+    // the operator was told their configuration had failed to save when
+    // they had only opened a page.
+    if (!canWriteSharedConfigNow()) return; // Phase B 2026-08-22: never write for viewer/client sessions
     if (dashboardDomainSaveTimerRef.current) {
       clearTimeout(dashboardDomainSaveTimerRef.current);
       dashboardDomainSaveTimerRef.current = null;
@@ -7799,7 +7804,12 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (isHostedWebClient) return;
-    if (isReadOnlySession()) return; // Phase B 2026-08-22
+    // 2026-10-22: mirror the BACKEND's rule. isReadOnlySession() lets an
+    // operator through, so every one of these debounced savers fired and
+    // came back 403 "role 'operator' may not PUT /api/app-store/domain" -
+    // the operator was told their configuration had failed to save when
+    // they had only opened a page.
+    if (!canWriteSharedConfigNow()) return; // Phase B 2026-08-22
     if (alarmsDomainSaveTimerRef.current) {
       clearTimeout(alarmsDomainSaveTimerRef.current);
       alarmsDomainSaveTimerRef.current = null;
@@ -7865,7 +7875,12 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (isHostedWebClient) return;
-    if (isReadOnlySession()) return; // Phase B 2026-08-22
+    // 2026-10-22: mirror the BACKEND's rule. isReadOnlySession() lets an
+    // operator through, so every one of these debounced savers fired and
+    // came back 403 "role 'operator' may not PUT /api/app-store/domain" -
+    // the operator was told their configuration had failed to save when
+    // they had only opened a page.
+    if (!canWriteSharedConfigNow()) return; // Phase B 2026-08-22
     if (triggersDomainSaveTimerRef.current) {
       clearTimeout(triggersDomainSaveTimerRef.current);
       triggersDomainSaveTimerRef.current = null;
@@ -7923,7 +7938,12 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (isHostedWebClient) return;
-    if (isReadOnlySession()) return; // Phase B 2026-08-22
+    // 2026-10-22: mirror the BACKEND's rule. isReadOnlySession() lets an
+    // operator through, so every one of these debounced savers fired and
+    // came back 403 "role 'operator' may not PUT /api/app-store/domain" -
+    // the operator was told their configuration had failed to save when
+    // they had only opened a page.
+    if (!canWriteSharedConfigNow()) return; // Phase B 2026-08-22
     if (gatewayConfigsSaveTimerRef.current) clearTimeout(gatewayConfigsSaveTimerRef.current);
     gatewayConfigsSaveTimerRef.current = setTimeout(async () => {
       if (gatewayConfigsPersistInFlightRef.current) return;
@@ -7995,7 +8015,12 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (isHostedWebClient) return;
-    if (isReadOnlySession()) return; // Phase B 2026-08-22
+    // 2026-10-22: mirror the BACKEND's rule. isReadOnlySession() lets an
+    // operator through, so every one of these debounced savers fired and
+    // came back 403 "role 'operator' may not PUT /api/app-store/domain" -
+    // the operator was told their configuration had failed to save when
+    // they had only opened a page.
+    if (!canWriteSharedConfigNow()) return; // Phase B 2026-08-22
     if (devicesSaveTimerRef.current) clearTimeout(devicesSaveTimerRef.current);
     devicesSaveTimerRef.current = setTimeout(async () => {
       if (devicesPersistInFlightRef.current) return;
@@ -8056,7 +8081,12 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (isHostedWebClient) return;
-    if (isReadOnlySession()) return; // Phase B 2026-08-22
+    // 2026-10-22: mirror the BACKEND's rule. isReadOnlySession() lets an
+    // operator through, so every one of these debounced savers fired and
+    // came back 403 "role 'operator' may not PUT /api/app-store/domain" -
+    // the operator was told their configuration had failed to save when
+    // they had only opened a page.
+    if (!canWriteSharedConfigNow()) return; // Phase B 2026-08-22
     if (dbConnectionsSaveTimerRef.current) clearTimeout(dbConnectionsSaveTimerRef.current);
     dbConnectionsSaveTimerRef.current = setTimeout(async () => {
       if (dbConnectionsPersistInFlightRef.current) return;
@@ -8119,7 +8149,12 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (isHostedWebClient) return;
-    if (isReadOnlySession()) return; // Phase B 2026-08-22
+    // 2026-10-22: mirror the BACKEND's rule. isReadOnlySession() lets an
+    // operator through, so every one of these debounced savers fired and
+    // came back 403 "role 'operator' may not PUT /api/app-store/domain" -
+    // the operator was told their configuration had failed to save when
+    // they had only opened a page.
+    if (!canWriteSharedConfigNow()) return; // Phase B 2026-08-22
     if (powerConfigSaveTimerRef.current) clearTimeout(powerConfigSaveTimerRef.current);
     powerConfigSaveTimerRef.current = setTimeout(async () => {
       if (powerConfigPersistInFlightRef.current) return;
@@ -12233,6 +12268,22 @@ function AppShell() {
   // flip-flopping state (e.g. expired → emergency-trial), the guard kept
   // re-routing, causing an infinite re-render loop that showed as the whole
   // app flickering. Stable identities break that loop; behavior is unchanged.
+  // Can THIS session write shared configuration? Mirrors CONFIG_ROLES in
+  // services/access_policy.py - admin, super or engineer.
+  //
+  // 2026-10-22: read from currentUser, NOT the module-level session-role
+  // cache in api.js. That cache is filled by its own effect, so a saver
+  // running first would see an empty role and skip - which for an ADMIN is a
+  // silently lost configuration write, the exact failure this file has been
+  // bitten by before. currentUser is already in scope here and is the thing
+  // the role comes from.
+  const canWriteSharedConfigNow = useCallback(() => {
+    if (isHostedWebClient) return false;
+    if (isReadOnlySession()) return false;
+    const role = String(currentUser?.role || "").trim().toLowerCase();
+    return role === "admin" || role === "super" || role === "engineer";
+  }, [currentUser, isHostedWebClient]);
+
   const canEditPage = useCallback((page) => {
     if (isReadonlyCloudMode) return false;
     // Phase C C.7 2026-08-22: viewer / client roles and read-only LAN
@@ -13122,7 +13173,22 @@ function AppShell() {
     }, ms));
     const timer = setInterval(call, LICENSE_CHECK_INTERVAL_MS);
     return () => { clearInterval(timer); retryTimers.forEach(clearTimeout); };
-  }, [currentUser, isHostedWebClient]);
+    // 2026-10-22: edgeProfile.edge_id is in the dependencies ON PURPOSE.
+    //
+    // runLicenseComplianceCheck() returns early when the edge id is not known
+    // yet - and on a freshly installed, freshly activated machine it is not:
+    // this effect fires as soon as the user logs in, before the edge profile
+    // has come back from the store. That early return sets no snapshot and,
+    // because it is not a CLOUD failure, leaves licenseSyncUnreachableRef
+    // false, so none of the self-heal retries above fire either.
+    //
+    // The result was an edge with NO licence at all: every feature in Add
+    // User read "NOT LICENSED", and the menu showed everything because an
+    // admin is deliberately not gated while the licence is UNKNOWN. Pressing
+    // refresh fixed it, which is what the customer reported - by then the
+    // profile had loaded. Re-running when the id arrives is the fix; the id
+    // is a plain string, so this adds one run, not identity churn.
+  }, [currentUser, isHostedWebClient, edgeProfile?.edge_id]);
 
   // Remember the page the user was on before the license guard forced a jump
   // to the "edge" activation screen, so we can put them back once the guard
@@ -21251,6 +21317,11 @@ const getGatewayHealth = (gateway) => {
       username: newUserForm.username.trim(),
       password: newUserForm.password,
       role: newUserForm.role,
+      // 2026-10-22: the form collects an address and the CLOUD payload below
+      // sent it, but this local object dropped it - so every user created on
+      // an edge had no email, and a recovery code had nowhere to go. All 29
+      // users in both local stores were in that state.
+      email: String(newUserForm.email || "").trim(),
       permissions: normalizePermissions(newUserForm.permissions, newUserForm.role),
       modules: deriveModuleKeysFromPermissions(normalizePermissions(newUserForm.permissions, newUserForm.role)),
     };
@@ -21902,6 +21973,10 @@ const getGatewayHealth = (gateway) => {
         ...u,
         role: String(editUserForm.role || "viewer"),
         password: String(editUserForm.password || ""),
+        // Same omission as the create path: an admin could type an address,
+        // see it saved to the cloud, and the local store keep none - which is
+        // the store recovery reads.
+        email: String(editUserForm.email || "").trim(),
         permissions: normPerms,
         // Persist the derived modules array so the nav refreshes
         // immediately. Without this the new permission set goes into
@@ -22043,7 +22118,13 @@ const getGatewayHealth = (gateway) => {
               // issues a temporary password. Pop the change-password
               // modal so the user can't skip it.
               if (user && user.must_change_password) {
-                setForceChangePassword({ current: "", next: "", confirm: "", error: "", busy: false });
+                // `pwreset` means they got here with an emailed code and
+                // have no current password to type - asking for one is what
+                // made recovery impossible to finish.
+                setForceChangePassword({
+                  current: "", next: "", confirm: "", error: "", busy: false,
+                  recovered: Boolean(user.pwreset),
+                });
               }
             }}
           />
@@ -34298,11 +34379,14 @@ const getGatewayHealth = (gateway) => {
           <div className="modal-card" style={{ minWidth: 420 }}>
             <h3>{forceChangePassword.voluntary ? "Change your password" : "Set your password"}</h3>
             <p style={{ fontSize: 13, lineHeight: 1.4, opacity: 0.85 }}>
-              {forceChangePassword.voluntary
-                ? "Enter your current password, then choose a new one."
-                : "An administrator issued you a temporary password. Choose your own password now before continuing."}
+              {forceChangePassword.recovered
+                ? "Your code has been accepted. Choose a password now - this session is for setting it and expires shortly."
+                : forceChangePassword.voluntary
+                  ? "Enter your current password, then choose a new one."
+                  : "An administrator issued you a temporary password. Choose your own password now before continuing."}
             </p>
             <div className="form-grid" style={{ marginTop: 8 }}>
+              {forceChangePassword.recovered ? null : (
               <label>
                 {forceChangePassword.voluntary ? "Current password" : "Current (temporary) password"}
                 <input
@@ -34312,6 +34396,7 @@ const getGatewayHealth = (gateway) => {
                   autoComplete="current-password"
                 />
               </label>
+              )}
               <label>
                 New password
                 <input
