@@ -218,6 +218,12 @@ SOURCE_CHECKS = [
     # HTTP endpoint, and while it was in neither the gate nor CI,
     # local-finalize returned 400 on every activation and nobody saw it.
     ("activation leaves a usable admin", "test_activation_creates_admin.py"),
+    # 2026-10-22: a new machine activates from the LOGIN screen, with no
+    # Authorization header. The edge fetched the licence modules with two
+    # upstream GETs forwarding that absent header; both were refused, the
+    # failure was swallowed, and the edge held NO entitlements - so every
+    # menu showed whatever was ticked on the licence.
+    ("activation carries the licence modules", "test_activation_carries_modules.py"),
     # 2026-10-20: the whole journey in one run - customer+email, licence,
     # edge, code, activation, login, recovery. The per-link tests each
     # build their own starting state, so none of them saw that activation

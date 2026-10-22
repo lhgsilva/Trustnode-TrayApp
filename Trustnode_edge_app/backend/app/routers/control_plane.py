@@ -1897,7 +1897,52 @@ def apply_activation_code(payload: ActivationCodeApplyRequest, request: Request)
             control_plane_store.mirror_activation_to_registry()
         except Exception:
             pass
-        return {"ok": True, "row": row}
+        # 2026-10-22: answer with the LICENCE AND ITS MODULES, not just the
+        # activation row.
+        #
+        # A brand-new machine activates from the login screen, so nobody is
+        # signed in and the request carries no Authorization header. The edge
+        # then tried to enrich the licence itself with two upstream GETs
+        # (/licenses and /licenses/{id}/modules) forwarding that absent
+        # header; both were refused, the failure was swallowed by a bare
+        # `except Exception: pass`, and `license.modules` arrived empty. The
+        # local finalize skips set_license_modules on an empty list, so the
+        # edge had NO entitlements - and a licence with no modules gates
+        # nothing, which is why every menu showed regardless of what was
+        # ticked when the licence was created.
+        #
+        # The activation code is the authorisation here: it already proved
+        # which tenant, customer, edge and licence this machine may have.
+        # Returning the entitlements with it means a fresh install needs no
+        # second, authenticated call.
+        license_payload: dict[str, Any] = {}
+        try:
+            # The activation ROW is the edge (cp_edges) and carries no
+            # license_id; the CODE row does. Resolving it from the code also
+            # keeps this honest about which licence the machine was issued.
+            lic_id = str(row.get("license_id") or "").strip()
+            if not lic_id:
+                code_row = control_plane_store.get_activation_code_row(
+                    activation_code=payload.activation_code) or {}
+                lic_id = str(code_row.get("license_id") or "").strip()
+            if lic_id:
+                lic_rows = control_plane_store.list_licenses(tenant_id=tid) or []
+                lic_row = next(
+                    (r for r in lic_rows
+                     if str(r.get("license_id") or "").strip() == lic_id),
+                    {},
+                )
+                license_payload = dict(lic_row or {})
+                license_payload.setdefault("license_id", lic_id)
+                license_payload["modules"] = (
+                    control_plane_store.list_license_modules(license_id=lic_id) or []
+                )
+        except Exception as exc:  # never fail an activation over the extras
+            logger.warning("activation apply: could not attach the licence: %s", exc)
+        out: dict[str, Any] = {"ok": True, "row": row}
+        if license_payload:
+            out["license"] = license_payload
+        return out
     except Exception as exc:
         control_plane_store.audit(
             actor_type=actor_type,
@@ -2350,10 +2395,29 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                         proxied_row = dict(data)
                         upstream_tenant_id, upstream_customer_id, upstream_license_id = _extract_scope_from_upstream(proxied_row)
                         upstream_license_obj: dict[str, Any] = {"license_id": str(upstream_license_id or data.get("license_id") or "")}
+                        # 2026-10-22: prefer the licence the cloud returned WITH the
+                        # activation. The enrichment below forwards this request's
+                        # Authorization header, and on a brand-new machine there is
+                        # none - the operator activates from the login screen - so
+                        # both GETs were refused, the failure was swallowed, and the
+                        # module entitlements arrived empty. An edge with no modules
+                        # gates nothing, so every menu showed regardless of what was
+                        # ticked on the licence. /activation-code/apply now answers
+                        # with the licence and its modules, authorised by the code
+                        # itself; the enrichment stays as a fallback for callers that
+                        # ARE signed in.
+                        _upstream_lic = data.get("license")
+                        if isinstance(_upstream_lic, dict) and _upstream_lic:
+                            upstream_license_obj.update(_upstream_lic)
+                            if not str(upstream_license_obj.get("license_id") or "").strip():
+                                upstream_license_obj["license_id"] = str(
+                                    upstream_license_id or data.get("license_id") or "")
                         # Enrich proxied license payload with full cloud license details/modules so local finalize
                         # can persist start/end and module entitlements immediately.
                         try:
-                            if cloud_url and upstream_license_obj.get("license_id"):
+                            if cloud_url and upstream_license_obj.get("license_id") and not (
+                                    isinstance(upstream_license_obj.get("modules"), list)
+                                    and upstream_license_obj.get("modules")):
                                 tenant_q = str(upstream_tenant_id or "default")
                                 auth = str(request.headers.get("Authorization") or "").strip()
                                 fwd_headers = {"Content-Type": "application/json"}
