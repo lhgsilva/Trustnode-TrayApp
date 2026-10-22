@@ -224,6 +224,11 @@ SOURCE_CHECKS = [
     # failure was swallowed, and the edge held NO entitlements - so every
     # menu showed whatever was ticked on the licence.
     ("activation carries the licence modules", "test_activation_carries_modules.py"),
+    # 2026-10-22: isPageLicensed() opens with `if (!required) return true`,
+    # so a page missing from MODULE_KEY_BY_PAGE shows on every edge whatever
+    # the licence says - three were. And admins skipped the licence gate
+    # outright, which is who actually uses a customer edge.
+    ("the menu shows only licensed modules", "test_menu_licence_gating.py"),
     # 2026-10-20: the whole journey in one run - customer+email, licence,
     # edge, code, activation, login, recovery. The per-link tests each
     # build their own starting state, so none of them saw that activation

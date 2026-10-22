@@ -2412,6 +2412,16 @@ const MODULE_KEY_BY_PAGE = {
   lan_sharing: "lan_access",
   opc_ua: "opcua",
   mqtt: "mqtt",
+  // 2026-10-22: these three had NO entry, and isPageLicensed() returns true
+  // for any page it cannot map ("if (!required) return true"), so they were
+  // visible on every edge no matter what the licence said. Reported from a
+  // new customer: Power Management, Email Notifications and the rest showed
+  // although none of them was on the licence. The keys are the ones the
+  // backend catalogue actually issues - see MODULE_CATALOG in
+  // services/control_plane_store.py.
+  power_configuration: "power_management",
+  email_and_notifications: "email_notifications",
+  scheduled_reports: "scheduled_reports",
 };
 
 function deriveModuleKeysFromPermissions(perms = {}) {
@@ -7310,7 +7320,16 @@ function AppShell() {
           return;
         }
 
-        const results = await Promise.all(
+        // 2026-10-22: this used to await Promise.all and merge once at the
+        // end, so EVERY chart stayed empty until the slowest tag answered -
+        // reported as "the dashboard takes a while to show data at startup".
+        // One tag on a large historian held up a whole screen of widgets that
+        // already had their rows.
+        //
+        // Each request now merges as it lands, so charts fill in as their own
+        // data arrives. The merge is the same one the live stream uses and is
+        // already order-independent, so arrival order does not matter.
+        await Promise.all(
           uniqueReqs.map((req) =>
             getAppStoreHistorianRange({
               gateway: req.gateway,
@@ -7318,18 +7337,18 @@ function AppShell() {
               limit: req.limit,
               offset: 0,
               cloudEdge: cloudEdgeApiFilter,
-            }).catch(() => ({ ok: false, rows: [] }))
+            })
+              .then((res) => {
+                if (cancelled) return;
+                if (res?.ok && Array.isArray(res.rows) && res.rows.length) {
+                  setDataLog((prev) => mergeHistorianRowsStable(
+                    res.rows, prev, 25000, { allowBackfill: true }));
+                }
+              })
+              .catch(() => { /* one tag failing must not blank the others */ })
           )
         );
         if (cancelled) return;
-
-        const mergedRows = [];
-        for (const res of results) {
-          if (res?.ok && Array.isArray(res.rows) && res.rows.length) mergedRows.push(...res.rows);
-        }
-        if (mergedRows.length) {
-          setDataLog((prev) => mergeHistorianRowsStable(mergedRows, prev, 25000, { allowBackfill: true }));
-        }
       } finally {
         if (!cancelled) dashboardHistorySeedRef.current = true;
       }
@@ -12164,13 +12183,24 @@ function AppShell() {
 
   const hasClientModuleAccess = useCallback(
     (page) => {
-      // Admins skip the license + module gate entirely (same rationale as
-      // canOpenPage above — never lock an admin out of the navigation
-      // because the license snapshot momentarily failed).
+      // 2026-10-22: admins used to skip the licence gate ENTIRELY. The
+      // rationale was sound - a transient snapshot miss (edge offline, slow
+      // boot, stale token) must never hide the navigation from an admin - but
+      // the customer's own administrator is who actually uses the edge, so in
+      // practice NOTHING was ever gated: a licence with eight modules still
+      // showed Power Management, OEE, Email Notifications, Connections,
+      // Remote Access, OPC UA and MQTT.
+      //
+      // Keep the protection, drop the blanket exemption: an admin is exempt
+      // only while the licence is UNKNOWN. Once we hold a good snapshot it
+      // applies to them too. Batch Management already worked this way, which
+      // is why it was the one module that hid correctly.
       const role = String(currentUser?.role || "").toLowerCase();
       const isAdmin = role === "admin" || role === "super";
-      if (isAdmin) return true;
+      const licenceKnown = Boolean(edgeLicenseSnapshot?.ok) && !licenseTampered;
+      if (isAdmin && !licenceKnown) return true;
       if (!isPageLicensed(page)) return false;
+      if (isAdmin) return true;
       if (!userHasModuleForPage(currentUser, page)) return false;
       const perms = currentUser?.permissions || {};
       if (page === "dashboard") return Boolean(perms.dashboard ?? perms.data_log ?? true);
@@ -12192,7 +12222,7 @@ function AppShell() {
       if (page === "interface") return resolveFeaturePermission(perms, "interface", "client_module_interface");
       return false;
     },
-    [currentUser, isPageLicensed]
+    [currentUser, isPageLicensed, edgeLicenseSnapshot?.ok, licenseTampered]
   );
 
   // Operator 2026-07-05 (FLICKER FIX): canEditPage / canOpenPage are memoized
@@ -12292,9 +12322,13 @@ function AppShell() {
     // In the LITE / CLIENT VIEW: hide the menu item entirely when missing.
     if (["connections_overview", "lan_sharing", "opc_ua", "mqtt"].includes(page)) {
       if (!isPageLicensed(page)) {
-        if (isClientView) return false; // hide entirely in lite/client view
-        // Full edge app: allow open so the lock icon explains the gate.
-        return true;
+        // 2026-10-22: the full edge app used to KEEP these in the menu and
+        // show a lock on the page body, "so the operator can see what they
+        // are missing". Operator decision: a menu must list what the customer
+        // bought, not what they did not - a new customer reported Connections,
+        // Remote Access, OPC UA and MQTT present although none was on their
+        // licence. Hidden everywhere now.
+        return false;
       }
     }
     // Single-file customer portal build: block ONLY edge-runtime config
