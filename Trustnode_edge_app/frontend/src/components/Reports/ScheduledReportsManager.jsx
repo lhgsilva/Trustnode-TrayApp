@@ -110,6 +110,137 @@ function makeId(prefix) {
 // It also refuses to let you build a condition that can never be true: a bit
 // is 0 or 1, so "> 1" never fires. A schedule was configured exactly that way
 // and silently never ran.
+// 2026-10-23, requested: file a report into a different folder, under a
+// different name, depending on what a tag holds - a stage, a result, a
+// line. One schedule, several destinations.
+//
+// Deliberately generic: the conditions, the folders and the names are all
+// the operator's. Nothing here knows any customer's naming, and the tokens
+// that work in the boxes above work here too - including a value mask, so
+// a numeric tag can print as a word:  {StageTag|1=setup,2=final}
+//
+// The first rule that matches wins, and anything a rule leaves blank falls
+// back to the boxes above it. A schedule with no rules behaves exactly as
+// it did before this existed.
+function DestinationRules({ rules, onChange, gatewayOptions,
+                            tagListForGateway, formatTagForDisplay }) {
+  const list = Array.isArray(rules) ? rules : [];
+  const patch = (i, next) => onChange(list.map((r, x) => (x === i ? { ...r, ...next } : r)));
+  const patchCond = (i, j, next) => patch(i, {
+    conditions: (list[i].conditions || []).map((c, y) => (y === j ? { ...c, ...next } : c)),
+  });
+  const addRule = () => onChange([...list, {
+    id: `dr_${Date.now().toString(36)}`, enabled: true, logic: "all",
+    conditions: [{ gateway_id: "", tag_name: "", operator: "==", value: "" }],
+    output_path: "",
+    destination_rules: [], file_name_pattern: "",
+  }]);
+  return (
+    <div className="sr-rules">
+      <div className="sr-rules-head">
+        <span>Send it somewhere else when a tag says so</span>
+        <button type="button" className="btn btn-secondary btn-sm" onClick={addRule}>
+          + Add rule
+        </button>
+      </div>
+      {list.length === 0 ? (
+        <p className="sr-token-hint">
+          No rules: every report goes to the folder and name above. Add one to
+          send some runs elsewhere - the first rule that matches decides, and
+          anything it leaves blank keeps the setting above.
+        </p>
+      ) : null}
+      {list.map((rule, i) => (
+        <div className="sr-rule" key={rule.id || i}>
+          <div className="sr-rule-head">
+            <label className="tn-checkbox">
+              <input type="checkbox" checked={rule.enabled !== false}
+                     onChange={(e) => patch(i, { enabled: e.target.checked })} />
+              Rule {i + 1}
+            </label>
+            <select value={rule.logic || "all"}
+                    title="Whether every condition must hold, or just one."
+                    onChange={(e) => patch(i, { logic: e.target.value })}>
+              <option value="all">match ALL conditions</option>
+              <option value="any">match ANY condition</option>
+            </select>
+            <button type="button" className="btn btn-secondary btn-sm"
+                    onClick={() => patch(i, {
+                      conditions: [...(rule.conditions || []),
+                                   { gateway_id: "", tag_name: "", operator: "==", value: "" }],
+                    })}>
+              + Condition
+            </button>
+            <button type="button" className="btn btn-secondary btn-sm"
+                    title="Remove this rule"
+                    onClick={() => onChange(list.filter((_, x) => x !== i))}>
+              Remove
+            </button>
+          </div>
+          {(rule.conditions || []).map((c, j) => (
+            <div className="sr-rule-cond" key={j}>
+              <select value={c.gateway_id || ""}
+                      onChange={(e) => patchCond(i, j, { gateway_id: e.target.value, tag_name: "" })}>
+                <option value="">Any gateway</option>
+                {(gatewayOptions || []).map((g) => (
+                  <option key={g.id} value={g.id}>{g.name || g.id}</option>
+                ))}
+              </select>
+              <select value={c.tag_name || ""}
+                      onChange={(e) => patchCond(i, j, { tag_name: e.target.value })}>
+                <option value="">Pick a tag…</option>
+                {/* An imported schedule may name a tag this edge does not
+                    have; keeping it listed stops the reference being lost
+                    the moment anyone opens the editor. */}
+                {c.tag_name && !(tagListForGateway(c.gateway_id || "") || []).includes(c.tag_name) ? (
+                  <option value={c.tag_name}>{c.tag_name} - not on this edge</option>
+                ) : null}
+                {(tagListForGateway(c.gateway_id || "") || []).map((t) => (
+                  <option key={t} value={t}>{formatTagForDisplay(t)}</option>
+                ))}
+              </select>
+              <select value={c.operator || "=="}
+                      onChange={(e) => patchCond(i, j, { operator: e.target.value })}>
+                <option value="==">is</option>
+                <option value="!=">is not</option>
+                <option value=">">is greater than</option>
+                <option value=">=">is at least</option>
+                <option value="<">is less than</option>
+                <option value="<=">is at most</option>
+              </select>
+              <input value={c.value ?? ""} placeholder="value"
+                     title="A number, or the text a state tag holds."
+                     onChange={(e) => patchCond(i, j, { value: e.target.value })} />
+              <button type="button" className="btn btn-secondary btn-sm"
+                      title="Remove this condition"
+                      onClick={() => patch(i, {
+                        conditions: (rule.conditions || []).filter((_, y) => y !== j),
+                      })}>
+                ×
+              </button>
+            </div>
+          ))}
+          <div className="sr-rule-dest">
+            <label>
+              Save to
+              <input value={rule.output_path || ""}
+                     placeholder="leave blank to keep the folder above"
+                     onChange={(e) => patch(i, { output_path: e.target.value })} />
+            </label>
+            <label>
+              File name
+              <input value={rule.file_name_pattern || ""}
+                     placeholder="leave blank to keep the name above"
+                     onChange={(e) => patch(i, { file_name_pattern: e.target.value })} />
+            </label>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
 function ConditionList({ conditions, logic, onLogic, onChange, gatewayOptions,
                          tagListForGateway, formatTagForDisplay, emptyHint }) {
   const rows = conditions || [];
@@ -869,6 +1000,22 @@ export function ScheduledReportsManager({
                           ))}
                         </select>
                       </label>
+                    </div>
+                  </fieldset>
+                </>
+              ) : null}
+
+              {/* 2026-10-23: these two lived inside CYCLE OPTIONS, in a grid
+                  of auto-fit 180px columns shared with small dropdowns - so a
+                  path field and a one-word select came out the same width and
+                  the block read as a jumble. Worse, a time-triggered schedule
+                  could not set a destination at all, although the backend has
+                  always honoured one for every trigger mode.
+
+                  Their own block now, full width, for every schedule. */}
+              <fieldset className="schedule-fieldset">
+                <legend>Where the file is written</legend>
+                <div className="sr-destination">
                       {/* 2026-10-07: "the location ... should be a option to
                           pick the folder and validated". Free text meant a
                           typo or an un-synced OneDrive folder only showed up
@@ -918,13 +1065,24 @@ export function ScheduledReportsManager({
                         <span className="sr-token-hint">
                           Use <code>{"{TagName}"}</code> for a tag value, plus{" "}
                           <code>{"{template}"}</code> <code>{"{id}"}</code>{" "}
-                          <code>{"{date}"}</code> <code>{"{time}"}</code>.
+                          <code>{"{date}"}</code> <code>{"{time}"}</code>{" "}
+                          <code>{"{n}"}</code>.{" "}
+                          <code>{"{n}"}</code> is the run number, used when a
+                          report would otherwise overwrite one already there.
+                          A tag can print as a word with{" "}
+                          <code>{"{TagName|1=first,2=second}"}</code>, and both
+                          work in the folder as well as the name.
                         </span>
                       </label>
-                    </div>
-                  </fieldset>
-                </>
-              ) : null}
+                </div>
+                <DestinationRules
+                  rules={draft.destination_rules || []}
+                  gatewayOptions={gatewayOptions}
+                  tagListForGateway={tagListForGateway}
+                  formatTagForDisplay={formatTagForDisplay}
+                  onChange={(next) => setDraft((p) => ({ ...p, destination_rules: next }))}
+                />
+              </fieldset>
 
               <fieldset className="schedule-fieldset">
                 <legend>Email delivery</legend>

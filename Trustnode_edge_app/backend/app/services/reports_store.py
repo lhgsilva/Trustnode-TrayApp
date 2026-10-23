@@ -498,6 +498,11 @@ class ReportsStore:
         template_ids = [str(t).strip() for t in (schedule.get("template_ids") or [])
                         if str(t or "").strip()]
         output_path = str(schedule.get("output_path") or "").strip()
+        # 2026-10-23: ordered destination rules. Listed in BOTH statements
+        # below for the reason written above - a field missing from either
+        # saves cleanly and then vanishes.
+        destination_rules = schedule.get("destination_rules")
+        destination_rules = destination_rules if isinstance(destination_rules, list) else []
         # Default ON: re-opening a cycle while the start bit is still high was
         # the bug, not the feature.
         start_edge = 0 if schedule.get("start_edge") is False else 1
@@ -555,7 +560,7 @@ class ReportsStore:
                           id_tag = ?, file_name_pattern = ?,
                           segment_tag = ?, segment_gateway = ?,
                           template_ids_json = ?, output_path = ?,
-                          start_edge = ?,
+                          start_edge = ?, destination_rules_json = ?,
                           updated_utc = ?
                         WHERE tenant_id = ? AND id = ?
                         """,
@@ -573,6 +578,7 @@ class ReportsStore:
                             segment_tag, segment_gateway,
                             json.dumps(template_ids, ensure_ascii=False), output_path,
                             start_edge,
+                            json.dumps(destination_rules, ensure_ascii=False),
                             now,
                             tid, sid,
                         ),
@@ -592,8 +598,9 @@ class ReportsStore:
                           id_tag, file_name_pattern,
                           segment_tag, segment_gateway,
                           template_ids_json, output_path, start_edge,
+                          destination_rules_json,
                           created_utc, updated_utc
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             sid, tid, name, template_id, enabled, trigger_mode,
@@ -609,6 +616,7 @@ class ReportsStore:
                             segment_tag, segment_gateway,
                             json.dumps(template_ids, ensure_ascii=False), output_path,
                             start_edge,
+                            json.dumps(destination_rules, ensure_ascii=False),
                             now, now,
                         ),
                     )
@@ -725,6 +733,7 @@ class ReportsStore:
             "tag_conditions": tag_conditions,
             "condition_logic": str(row["condition_logic"] or "all"),
             "stop_conditions": _json_list("stop_conditions_json"),
+            "destination_rules": _json_list("destination_rules_json"),
             "stop_condition_logic": _row_text("stop_condition_logic", "all"),
             "id_tag": _row_text("id_tag"),
             "file_name_pattern": _row_text("file_name_pattern"),

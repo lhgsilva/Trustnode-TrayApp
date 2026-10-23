@@ -126,6 +126,7 @@ class AppStore:
     DEFAULT_LOCAL_DB_ID = "local-sqlite-default"
 
     def __init__(self) -> None:
+        _t_ctor = time.time()
         # 2026-07-26: RLock (was Lock). With a plain Lock, any method that
         # holds the lock and calls another method that re-acquires it
         # SELF-DEADLOCKS FOREVER — the exact signature of the 11.5h overnight
@@ -179,7 +180,15 @@ class AppStore:
         self._force_sqlite_reads_env = str(
             os.environ.get("TRUSTNODE_FORCE_SQLITE_READS", "")
         ).strip().lower() in {"1", "true", "yes", "on"}
+        _t_path = time.time()
         self._db_path = self._resolve_db_path()
+        _ms_path = (time.time() - _t_path) * 1000.0
+        if _ms_path >= 250.0:
+            try:
+                print("[trustnode][boot] app_store: _resolve_db_path took %.1fs"
+                      % (_ms_path / 1000.0), flush=True)
+            except Exception:
+                pass
         # Repeated-failure collapse for append_log_rows(). See
         # _throttle_log_rows: one message was writing 3,600 rows an hour.
         self._log_repeat: Dict[tuple, Dict[str, Any]] = {}
@@ -286,11 +295,42 @@ class AppStore:
         self._edge_config_isolation_enabled = str(
             os.environ.get("TRUSTNODE_EDGE_CONFIG_ISOLATION", "1")
         ).strip().lower() in {"1", "true", "yes", "on"}
+        # 2026-10-23: boot spent ~18s between "instantiating
+        # TelemetryService" and the line below, and the log said nothing
+        # about WHICH step. Timing each one costs microseconds and turns a
+        # day of guessing into one boot - the WAL and the telemetry store
+        # were both blamed and measured innocent before this existed.
+        _t_boot = time.time()
+        try:
+            print("[trustnode][boot] app_store: prologue took %.1fs"
+                  % (_t_boot - _t_ctor), flush=True)
+        except Exception:
+            pass
+
+        def _step(name, fn):
+            _t = time.time()
+            try:
+                fn()
+            finally:
+                _ms = (time.time() - _t) * 1000.0
+                if _ms >= 250.0:
+                    try:
+                        print("[trustnode][boot] app_store: %s took %.1fs"
+                              % (name, _ms / 1000.0), flush=True)
+                    except Exception:
+                        pass
+
         self._local_edge_id = self._derive_local_edge_id()
-        self._ensure_schema()
-        self._ensure_required_config_domains()
-        self._ensure_local_edge_profile()
-        self._ensure_default_database_configuration()
+        _step("_ensure_schema", self._ensure_schema)
+        _step("_ensure_required_config_domains", self._ensure_required_config_domains)
+        _step("_ensure_local_edge_profile", self._ensure_local_edge_profile)
+        _step("_ensure_default_database_configuration",
+              self._ensure_default_database_configuration)
+        try:
+            print("[trustnode][boot] app_store: construction took %.1fs"
+                  % (time.time() - _t_boot), flush=True)
+        except Exception:
+            pass
         # Operator diagnostics: when a portable EXE runs with a different
         # working directory than expected, two app_store DBs can exist
         # in parallel. Logging the absolute path on every startup makes
@@ -5591,6 +5631,11 @@ class AppStore:
                     # edge (the default); 0 = the old level-triggered
                     # behaviour, for a start tag the PLC clears itself.
                     ("start_edge", "INTEGER NOT NULL DEFAULT 1"),
+                    # 2026-10-23: ordered rules that send a report to a
+                    # different folder or file name depending on what a tag
+                    # holds. Empty by default, so a schedule that has none
+                    # resolves its destination exactly as it always did.
+                    ("destination_rules_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ):
                     if _col not in sched_cols:
                         conn.execute("ALTER TABLE scheduled_reports ADD COLUMN %s %s"

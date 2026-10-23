@@ -9345,6 +9345,67 @@ textarea {
    be a option to pick the folder and validated". The result of that check
    sits under the field, so a bad path is visible while typing rather than
    discovered when a run fails overnight. */
+/* 2026-10-23: the destination fields used to sit in the cycle grid, whose
+   auto-fit 180px columns made a file path the same width as a one-word
+   select. Their own block, with the path given room. */
+.sr-destination {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: flex-start;
+}
+.sr-destination > label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--muted);
+  min-width: 0;
+}
+.sr-rules { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.sr-rules-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.sr-rule {
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--bg);
+}
+.sr-rule-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sr-rule-head > label { margin-right: auto; }
+.sr-rule-cond {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 0.8fr) auto;
+  gap: 6px;
+  align-items: center;
+}
+.sr-rule-dest {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 8px;
+}
+.sr-rule-dest label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--muted);
+  min-width: 0;
+}
+@media (max-width: 860px) {
+  .sr-destination,
+  .sr-rule-dest { grid-template-columns: minmax(0, 1fr); }
+  .sr-rule-cond { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+}
 .sr-path-field { min-width: 0; }
 .sr-path-row {
   display: flex;

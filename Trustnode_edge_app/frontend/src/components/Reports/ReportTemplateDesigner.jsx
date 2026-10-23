@@ -2247,12 +2247,44 @@ function TokenInput({ value, onChange, placeholder = "", className = "",
 }
 
 
+// 2026-10-23: a template exported from one edge and imported into another
+// names gateways and tags that do not exist on the target. Every picker in
+// this editor is a <select> whose options come from THIS machine, so an
+// unknown reference rendered BLANK, its tag list came back empty, and the
+// first edit to that section wrote the reference away for good. The export
+// carried every detail faithfully; the editor is where it was lost.
+//
+// The fix is to keep what the template already references. Walking the
+// section generically - any object carrying gateway_id / tag_name - means
+// a section type added later is covered without touching this again.
+function collectSectionRefs(node, acc) {
+  const out = acc || { gateways: new Set(), tags: new Map() };
+  if (!node || typeof node !== "object") return out;
+  if (Array.isArray(node)) {
+    for (const item of node) collectSectionRefs(item, out);
+    return out;
+  }
+  const gw = String(node.gateway_id ?? "").trim();
+  const tag = String(node.tag_name ?? "").trim();
+  if (gw) out.gateways.add(gw);
+  if (tag) {
+    if (!out.tags.has(gw)) out.tags.set(gw, new Set());
+    out.tags.get(gw).add(tag);
+  }
+  for (const key of Object.keys(node)) collectSectionRefs(node[key], out);
+  return out;
+}
+
+// Marked, never silently blended in: an operator must be able to tell a
+// gateway that exists here from one that only exists in the template.
+const FOREIGN_SUFFIX = " - not on this edge";
+
 function SectionEditor({
   section,
   index,
   total,
   prevType = "",
-  gatewayOptions,
+  gatewayOptions: localGatewayOptions,
   tagsByGateway,
   formatTagForDisplay,
   onChange,
@@ -2266,9 +2298,25 @@ function SectionEditor({
   const preset = SECTION_PRESETS.find((p) => p.type === type);
   // Configured sections start closed; a brand-new one opens so it can be set up.
   const [collapsed, setCollapsed] = useState(Boolean(section?.title));
+  // Everything this section points at, whether or not this edge has it.
+  const sectionRefs = useMemo(() => collectSectionRefs(section), [section]);
+  // Shadows the prop ON PURPOSE, so every picker below - there are ten of
+  // them - gets the preserved entries without ten separate edits.
+  const gatewayOptions = useMemo(() => {
+    const known = new Set((localGatewayOptions || []).map((g) => String(g.id)));
+    const extra = [...sectionRefs.gateways]
+      .filter((id) => !known.has(id))
+      .map((id) => ({ id, name: id + FOREIGN_SUFFIX }));
+    return [...(localGatewayOptions || []), ...extra];
+  }, [localGatewayOptions, sectionRefs]);
   const tagList = (gid) => {
-    const raw = tagsByGateway?.[String(gid || "")];
-    return Array.isArray(raw) ? raw : [];
+    const key = String(gid || "");
+    const raw = tagsByGateway?.[key];
+    const local = Array.isArray(raw) ? raw : [];
+    const referenced = sectionRefs.tags.get(key);
+    if (!referenced || !referenced.size) return local;
+    const known = new Set(local.map((t) => String(t)));
+    return [...local, ...[...referenced].filter((t) => !known.has(t))];
   };
 
   const cols = () => (section.header || []).length || 1;
@@ -2510,17 +2558,37 @@ function SectionEditor({
                   second control on the same key is why moving this did
                   nothing. This one places the band; the text inside it
                   follows Title style. */}
-              <label title="Where the band sits on the page. Needs Pill width = Fit to content to have any effect - a full-width band has nowhere to move.">
+              <label title={String(section.pill_fit || "fill") === "fill"
+                ? "Only moves a pill set to Fit to the text - a full-width band already spans the page. Use Text in the band to centre the words."
+                : "Where the band sits on the page."}>
                 Band position
                 <select value={section.pill_align || section.align || "left"}
+                        disabled={String(section.pill_fit || "fill") === "fill"}
                         onChange={(e) => onChange({ pill_align: e.target.value })}>
                   <option value="left">Left</option>
                   <option value="center">Centre</option>
                   <option value="right">Right</option>
                 </select>
               </label>
+              {/* 2026-10-23, reported: "when used as pill I don't have option
+                  to use full width and centralized the text". Full width was
+                  already there; this was not. The renderer has always read
+                  `title_align` for the words INSIDE the band and defaulted it
+                  to left, but no control anywhere in this editor wrote it - so
+                  a full-width pill could never be centred. Band position moves
+                  the band and does nothing when the band is the whole page,
+                  which is why it looked like the control was broken. */}
+              <label title="Where the words sit INSIDE the band. This is the one that centres the text of a full-width pill.">
+                Text in the band
+                <select value={section.title_align || "left"}
+                        onChange={(e) => onChange({ title_align: e.target.value })}>
+                  <option value="left">Left</option>
+                  <option value="center">Centre</option>
+                  <option value="right">Right</option>
+                </select>
+              </label>
               </>
-            ) : <><span /><span /><span /></>}
+            ) : <><span /><span /><span /><span /></>}
           </div>
           {section.as_pill ? (
             <p className="tn-token-help">
@@ -3820,8 +3888,13 @@ export function ReportTemplateDesigner({
       id: tpl.id,
       name: tpl.name || "",
       description: tpl.description || "",
+      // Spread first: rebuilding the definition as {sections} alone
+      // discards every sibling key, so anything stored beside the
+      // sections would be dropped by merely opening and saving.
       definition: {
-        sections: Array.isArray(tpl?.definition?.sections) ? tpl.definition.sections : [],
+        ...(tpl?.definition || {}),
+        sections: Array.isArray(tpl?.definition?.sections)
+          ? tpl.definition.sections : [],
       },
     });
   };
@@ -3847,7 +3920,14 @@ export function ReportTemplateDesigner({
           id: saved.id,
           name: saved.name || "",
           description: saved.description || "",
-          definition: { sections: Array.isArray(saved?.definition?.sections) ? saved.definition.sections : [] },
+          // Spread first: rebuilding the definition as {sections} alone
+          // discards every sibling key, so anything stored beside the
+          // sections would be dropped by merely opening and saving.
+          definition: {
+            ...(saved?.definition || {}),
+            sections: Array.isArray(saved?.definition?.sections)
+              ? saved.definition.sections : [],
+          },
         });
         setSelectedId(saved.id);
       }
@@ -3966,7 +4046,14 @@ export function ReportTemplateDesigner({
             id: found.id,
             name: found.name || "",
             description: found.description || "",
-            definition: { sections: Array.isArray(found?.definition?.sections) ? found.definition.sections : [] },
+            // Spread first: rebuilding the definition as {sections} alone
+            // discards every sibling key, so anything stored beside the
+            // sections would be dropped by merely opening and saving.
+            definition: {
+              ...(found?.definition || {}),
+              sections: Array.isArray(found?.definition?.sections)
+                ? found.definition.sections : [],
+            },
           });
         }
       }

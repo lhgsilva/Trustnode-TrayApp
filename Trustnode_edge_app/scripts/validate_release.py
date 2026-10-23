@@ -244,6 +244,17 @@ SOURCE_CHECKS = [
     # local user had an email, because the create/edit paths sent the
     # address to the cloud and dropped it locally.
     ("forgot password: code, then set a password", "test_recovery_code_flow.py"),
+    # 2026-10-23: reports file themselves into the customer's own folder
+    # tree now - rules on a tag value choose the folder and the name. The
+    # check with teeth is the one that was ALREADY broken: there was no
+    # collision handling at all, so two reports resolving to the same name
+    # silently overwrote each other and the earlier PDF was gone.
+    ("report destinations never overwrite", "test_report_destinations.py"),
+    # 2026-10-23, reported as "app not starting": the splash gave up at
+    # 120s. Boot was reading a 7.3 GB database with PRAGMA quick_check to
+    # decide whether it could delete safety copies that did not exist -
+    # 15.8s of a 15.9s AppStore(), on every boot, growing with history.
+    ("boot does not verify a store it will not change", "test_boot_reclaim_cost.py"),
     # 2026-10-22, from a customer install: after activation the locally
     # created users could not log in, and many sites have no internet at
     # all. This drives an ACTIVATED edge with every cloud variable stripped

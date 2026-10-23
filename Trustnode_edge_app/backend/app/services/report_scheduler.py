@@ -55,11 +55,17 @@ def _compare(value: float, operator: str, threshold: float, threshold2: float | 
 def _cycle_file_name(schedule: dict[str, Any], template: dict[str, Any],
                      window: tuple[str, str] | None, report_id: str) -> str:
     """The operator's naming pattern, resolved. Empty keeps the uuid name."""
-    from app.services.report_renderer import resolve_output_target
+    from app.services.report_renderer import resolve_destination
     # ONE resolver for both boxes. "Save to" used to win outright and discard
     # "File name", and a folder in Save to was then treated as the file
     # itself - so every run overwrote one PDF (2026-10-07).
-    return resolve_output_target(
+    #
+    # 2026-10-23: destination rules come first. They may redirect the folder,
+    # the name or both based on what a tag holds; with no rules, or none
+    # matching, this resolves exactly as it did before.
+    rules = (schedule or {}).get("destination_rules")
+    return resolve_destination(
+        rules if isinstance(rules, list) else [],
         str((schedule or {}).get("output_path") or "").strip(),
         str((schedule or {}).get("file_name_pattern") or "").strip(),
         template_name=str((template or {}).get("name") or ""),

@@ -1119,6 +1119,23 @@ def _drop_proven_safety_copies(db_path: str) -> None:
             return
     if not os.path.exists(db_path):
         return
+    # 2026-10-23: look for something to reclaim BEFORE verifying the live
+    # database. The quick_check below exists to make a DELETION safe, and
+    # reading a multi-gigabyte store to decide whether to delete files that
+    # do not exist is the most expensive no-op in the boot path.
+    #
+    # Measured on a 7.3 GB install with no `.pre_` copies at all:
+    # _resolve_db_path took 15.8s of a 15.9s AppStore() - effectively the
+    # whole of start-up - and it ran on EVERY boot. That is what made the
+    # splash give up after 120s on a new install, and it gets worse as a
+    # customer's history grows.
+    try:
+        candidates = [n for n in os.listdir(folder)
+                      if n.startswith(base + ".pre_")]
+    except Exception:
+        return
+    if not candidates:
+        return                  # nothing to delete, nothing to prove
     try:
         con = sqlite3.connect("file:%s?mode=ro" % db_path.replace("\\", "/"),
                               uri=True, timeout=10.0)
@@ -1130,9 +1147,7 @@ def _drop_proven_safety_copies(db_path: str) -> None:
     except Exception:
         return                  # cannot verify -> keep them
     freed = 0
-    for name in sorted(os.listdir(folder)):
-        if not name.startswith(base + ".pre_"):
-            continue
+    for name in sorted(candidates):
         victim = os.path.join(folder, name)
         try:
             size = os.path.getsize(victim)

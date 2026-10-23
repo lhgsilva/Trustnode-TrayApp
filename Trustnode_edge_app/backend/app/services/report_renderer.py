@@ -2256,7 +2256,25 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
     LEGEND_ROW_H = 13
 
     def _legend_label(meta: dict[str, Any]) -> str:
-        txt = str(meta.get("label") or meta.get("tag_name") or "")
+        """The operator's own words win.
+
+        2026-10-23, reported: "legend and labels that I did not add ... is
+        being shown on the pdf ... we need to respect the labels, legend and
+        names given in each section". This APPENDED to whatever was typed -
+        a series labelled "Temperature" printed as "Temperature (R) [C]",
+        and an imported template made it worse, because `unit` and `axis`
+        travel with the section from the edge it was built on while the
+        label on screen looked untouched.
+
+        So: a label the operator wrote is printed verbatim. The axis marker
+        and the unit are still added when there is NO label, because then
+        the text is a bare tag name and the extra context is the only thing
+        telling two scales apart.
+        """
+        given = str(meta.get("label") or "").strip()
+        if given:
+            return given[:48]
+        txt = str(meta.get("tag_name") or "")
         ax = norm_axis4(meta.get("axis"))
         # Say WHICH scale a series is read against. With four axes "(R)" is
         # not enough to tell right1 from right2.
@@ -3842,7 +3860,19 @@ _BARE_TOKEN_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_./-]*(?:\|[^}]*)?)\}")
 # every existing pattern.
 _RESERVED_TOKENS = frozenset({
     "template", "id", "start", "end", "date", "time", "initial",
+    # 2026-10-23: {n} is the run number for reports that would otherwise
+    # share a name - a second test against the same work order, say. It is
+    # reserved so it is never read as a tag called "n", and it survives
+    # sanitising as _SEQ_SLOT because the number is only knowable at write
+    # time, once the folder can be looked at.
+    "n",
 })
+
+#: Carries {n} through _safe_name_part, which strips braces AND trims
+#: leading/trailing "._" - an underscore-wrapped sentinel came out chewed
+#: ("job___tnseq"). Letters only, so it arrives exactly as written.
+_SEQ_SLOT = "TNSEQSLOT"
+_SEQ_TOKEN_RE = re.compile(r"\{n\}", re.I)
 
 
 class _BareMatch:
@@ -4310,6 +4340,9 @@ def build_report_file_name(pattern: str, *, template_name: str = "",
         return ""
     text = resolve_text_tokens(text, started, ended, gateway, fetch)
     text = _fill_name_placeholders(text, template_name, report_id, started, ended)
+    # The run number cannot be resolved here - it depends on what is already
+    # in the destination folder, which only the writer knows.
+    text = _SEQ_TOKEN_RE.sub(_SEQ_SLOT, text)
     return _safe_name_part(text, extension)
 
 
@@ -4446,6 +4479,143 @@ def _draw_section(section: dict[str, Any], styles, story: list) -> None:
                                styles["section_caption"]))
 
 
+def _destination_value(cond: dict[str, Any], started: str, ended: str,
+                       gateway: str, fetch) -> str:
+    """One condition's tag value, read exactly as a {token} would read it.
+
+    Deliberately the SAME path as the tokens: a rule that tests a tag and a
+    file name that prints it must never disagree about what that tag said.
+    """
+    tag = str((cond or {}).get("tag_name") or "").strip()
+    if not tag:
+        return ""
+    gw = str((cond or {}).get("gateway_id") or "").strip()
+    token = "{%s/%s}" % (gw, tag) if gw else "{%s}" % tag
+    return str(resolve_text_tokens(token, started, ended, gateway, fetch) or "").strip()
+
+
+def _destination_match(cond: dict[str, Any], value: str) -> bool:
+    """Compare as numbers when both sides are numbers, else as text.
+
+    A state tag may hold 1 or "PASS" depending on the PLC, and the operator
+    should not have to know which - so both compare sensibly.
+    """
+    want = str((cond or {}).get("value") or "").strip()
+    op = str((cond or {}).get("operator") or "==").strip()
+    try:
+        a, b = float(value), float(want)
+        numeric = True
+    except (TypeError, ValueError):
+        a = b = 0.0
+        numeric = False
+    if not numeric:
+        lhs, rhs = value.strip().lower(), want.lower()
+        if op in ("==", "=", "eq"):
+            return lhs == rhs
+        if op in ("!=", "<>", "ne"):
+            return lhs != rhs
+        return False
+    if op in ("==", "=", "eq"):
+        return a == b
+    if op in ("!=", "<>", "ne"):
+        return a != b
+    if op in (">", "gt"):
+        return a > b
+    if op in (">=", "gte"):
+        return a >= b
+    if op in ("<", "lt"):
+        return a < b
+    if op in ("<=", "lte"):
+        return a <= b
+    return False
+
+
+def resolve_destination(rules: list[dict[str, Any]] | None,
+                        default_path: str, default_name: str, *,
+                        template_name: str = "", report_id: str = "",
+                        started: str = "", ended: str = "",
+                        extension: str = ".pdf", gateway: str = "",
+                        fetch=None) -> str:
+    """Where this report goes, after the operator's rules have had a say.
+
+    2026-10-23, requested: different folders and names depending on what a
+    tag holds - a stage, a result, a line - so one schedule files its
+    reports the way the customer's folder tree is actually organised.
+
+    An ordered list; the FIRST rule whose conditions hold wins, and a rule
+    may set a folder, a name, or both - anything it leaves empty falls back
+    to the boxes above it. No rule matching is not an error: the schedule's
+    own Save to and File name are the default, so adding rules can never
+    stop an existing schedule from producing a report.
+
+    Nothing here is specific to any customer: the conditions, the folders
+    and the names are entirely the operator's, and tokens work in both.
+    """
+    folder = str(default_path or "")
+    name = str(default_name or "")
+    for rule in (rules or []):
+        if not isinstance(rule, dict) or not bool(rule.get("enabled", True)):
+            continue
+        conds = [c for c in (rule.get("conditions") or [])
+                 if isinstance(c, dict) and str(c.get("tag_name") or "").strip()]
+        if not conds:
+            continue                      # a rule with no test matches nothing
+        results = []
+        for c in conds:
+            try:
+                results.append(_destination_match(
+                    c, _destination_value(c, started, ended, gateway, fetch)))
+            except Exception:
+                results.append(False)
+        hit = any(results) if str(rule.get("logic") or "all").lower() == "any"             else all(results)
+        if not hit:
+            continue
+        if str(rule.get("output_path") or "").strip():
+            folder = str(rule["output_path"]).strip()
+        if str(rule.get("file_name_pattern") or "").strip():
+            name = str(rule["file_name_pattern"]).strip()
+        break
+    return resolve_output_target(
+        folder, name, template_name=template_name, report_id=report_id,
+        started=started, ended=ended, extension=extension,
+        gateway=gateway, fetch=fetch)
+
+
+def unique_output_path(path: Path) -> Path:
+    """A destination that does not already exist.
+
+    2026-10-23. There was no collision handling anywhere: two reports whose
+    pattern resolved to the same name - the second test of a work order, a
+    re-run of the same day - wrote over each other silently, and the earlier
+    PDF was simply gone. A report is a record; losing one is losing data.
+
+    Two behaviours, one rule:
+
+      * {n} in the pattern says WHERE the number goes. It starts at 1 and
+        counts up to the first free slot, so a numbered series reads in
+        order.
+      * No {n} and a name that is already taken gets `_2`, `_3` ... before
+        the extension. Nothing is overwritten either way.
+    """
+    path = Path(path)
+    stem, suffix = path.stem, path.suffix
+    if _SEQ_SLOT in stem:
+        n = 1
+        while True:
+            candidate = path.with_name(stem.replace(_SEQ_SLOT, str(n)) + suffix)
+            if not candidate.exists():
+                return candidate
+            n += 1
+    if not path.exists():
+        return path
+    n = 2
+    while True:
+        candidate = path.with_name("%s_%d%s" % (stem, n, suffix))
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
 def render_template_to_pdf(
     template: dict[str, Any],
     *,
@@ -4487,6 +4657,9 @@ def render_template_to_pdf(
         output_path = _resolve_reports_dir() / f"{uuid.uuid4().hex}.pdf"
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Last thing before writing, so EVERY caller - scheduler, cycle report,
+    # manual run - is covered by one rule rather than each remembering.
+    output_path = unique_output_path(output_path)
 
     styles = _build_styles()
     buffer = io.BytesIO()
