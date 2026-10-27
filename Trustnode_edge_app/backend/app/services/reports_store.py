@@ -503,6 +503,11 @@ class ReportsStore:
         # saves cleanly and then vanishes.
         destination_rules = schedule.get("destination_rules")
         destination_rules = destination_rules if isinstance(destination_rules, list) else []
+        # 2026-10-27: operator-defined columns for the Generated Reports
+        # list. Same rule as above - named in BOTH statements below or it
+        # saves cleanly and then vanishes.
+        report_columns = schedule.get("report_columns")
+        report_columns = report_columns if isinstance(report_columns, list) else []
         # Default ON: re-opening a cycle while the start bit is still high was
         # the bug, not the feature.
         start_edge = 0 if schedule.get("start_edge") is False else 1
@@ -561,6 +566,7 @@ class ReportsStore:
                           segment_tag = ?, segment_gateway = ?,
                           template_ids_json = ?, output_path = ?,
                           start_edge = ?, destination_rules_json = ?,
+                          report_columns_json = ?,
                           updated_utc = ?
                         WHERE tenant_id = ? AND id = ?
                         """,
@@ -598,9 +604,9 @@ class ReportsStore:
                           id_tag, file_name_pattern,
                           segment_tag, segment_gateway,
                           template_ids_json, output_path, start_edge,
-                          destination_rules_json,
+                          destination_rules_json, report_columns_json,
                           created_utc, updated_utc
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             sid, tid, name, template_id, enabled, trigger_mode,
@@ -617,6 +623,7 @@ class ReportsStore:
                             json.dumps(template_ids, ensure_ascii=False), output_path,
                             start_edge,
                             json.dumps(destination_rules, ensure_ascii=False),
+                            json.dumps(report_columns, ensure_ascii=False),
                             now, now,
                         ),
                     )
@@ -734,6 +741,7 @@ class ReportsStore:
             "condition_logic": str(row["condition_logic"] or "all"),
             "stop_conditions": _json_list("stop_conditions_json"),
             "destination_rules": _json_list("destination_rules_json"),
+            "report_columns": _json_list("report_columns_json"),
             "stop_condition_logic": _row_text("stop_condition_logic", "all"),
             "id_tag": _row_text("id_tag"),
             "file_name_pattern": _row_text("file_name_pattern"),

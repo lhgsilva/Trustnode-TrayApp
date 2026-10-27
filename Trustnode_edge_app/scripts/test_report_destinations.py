@@ -252,6 +252,89 @@ check("  and existing installs get the column",
       "destination_rules_json" in APP_STORE,
       "without the migration an upgraded edge fails every schedule save")
 
+# ------------------------------- no cloud configured, no backlog decision
+print()
+print("[a backlog is only a decision when there is somewhere to sync to]")
+APPJSX = io.open(os.path.join(ROOT, "frontend", "src", "App.jsx"),
+                 encoding="utf-8").read()
+check("the prompt requires a cloud DATABASE, not just a target flag",
+      "cloudSyncStatus?.cloud_database_configured" in APPJSX,
+      "cloud_target.enabled stays TRUE on an edge with no cloud at all - "
+      "the built-in config-sync pseudo-target has no host")
+check("  and it closes itself once the backlog drains",
+      "BACKLOG_PROMPT_ROWS / 2" in APPJSX,
+      "the screenshot showed 118 rows under a heading about a backlog too "
+      "large to ignore, because the figures are live")
+check("  the dialog says what it was when it fired",
+      "backlogPromptAtRows" in APPJSX)
+ROUTER = io.open(os.path.join(ROOT, "backend", "app", "routers",
+                              "app_store.py"), encoding="utf-8").read()
+check("the backend answers the real question",
+      "cloud_database_configured" in ROUTER
+      and "_get_cloud_database_target()" in ROUTER,
+      "it must use the SAME resolver the historian routing uses")
+
+# ------------------------------------------- operator-defined columns
+print()
+print("[a generated report keeps the values it was generated with]")
+SCHED = io.open(os.path.join(ROOT, "backend", "app", "services",
+                             "report_scheduler.py"), encoding="utf-8").read()
+check("columns are resolved when the report is generated",
+      "_resolve_report_columns(schedule, window)" in SCHED,
+      "the tag has moved on by the time anyone opens the list")
+check("  and stored with the row", '"columns": _resolve_report_columns' in SCHED)
+check("  using the SAME token language as the file name",
+      "resolve_text_tokens(pattern" in SCHED,
+      "a second syntax is a second thing to get wrong")
+STORE2 = io.open(os.path.join(ROOT, "backend", "app", "services",
+                              "reports_store.py"), encoding="utf-8").read()
+check("report_columns survives a save",
+      "report_columns_json = ?" in STORE2
+      and '"report_columns": _json_list' in STORE2
+      and "report_columns_json" in STORE2.split("INSERT INTO scheduled_reports")[1][:950],
+      "named in BOTH statements or it saves cleanly and vanishes")
+check("  and an upgraded edge gets the column",
+      "report_columns_json" in io.open(
+          os.path.join(ROOT, "backend", "app", "services", "app_store.py"),
+          encoding="utf-8").read())
+check("the list shows them", "extraColumns.map" in SRM
+      and "g?.meta?.columns" in SRM,
+      "read from the ROW, so a report keeps its columns after the schedule "
+      "changes")
+
+# --------------------------------- a local user can reach the LAN surfaces
+print()
+print("[a user created on the edge can open the LAN view]")
+import re as _re
+_start = APPJSX.index("function buildRolePermissions(role)")
+_body = APPJSX[_start:APPJSX.index(chr(10) + "function ", _start + 10)]
+
+
+def _flags_for(role):
+    key = 'role === "%s"' % role
+    if key not in _body:
+        return []
+    blk = _body[_body.index(key):]
+    blk = blk[:blk.index("    };")]
+    return [f for f in ("access_full", "access_client", "access_lite") if f in blk]
+
+
+# can_access_surface() ends at these per-user flags. No role default set any
+# of them, so every locally created non-admin was refused at every LAN
+# surface - an admin passed only because ADMIN_ROLES short-circuits first.
+for role, want in (("admin", "access_full"), ("engineer", "access_full"),
+                   ("operator", "access_client"), ("client", "access_client")):
+    got = _flags_for(role)
+    check("a new '%s' can reach the LAN" % role, want in got,
+          "has %s - can_access_surface falls through to these flags"
+          % (", ".join(got) or "none"))
+
+_tail = _body[_body.rindex("return {"):]
+check("  and so can a role the operator invents",
+      "access_client" in _tail,
+      "viewer and any custom role land here; the FULL app stays "
+      "admin/engineer by role, but read-only must not need a hidden tick")
+
 print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))
 sys.exit(0 if not FAILS else 2)

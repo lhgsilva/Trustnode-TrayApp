@@ -480,7 +480,34 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
     }
     return res;
   } catch (err) {
-    if (!timedOut) throw err;
+    if (!timedOut) {
+      // 2026-10-27, reported: banners reading "Database connections could
+      // not be saved ... Failed to fetch", and the same for telemetry,
+      // configuration and report templates. That string is the browser's,
+      // and it names nothing - a stopped backend, a blocked port, a LAN
+      // client pointed at the wrong address and an antivirus holding the
+      // exe all produce exactly those three words.
+      //
+      // Every call in the app goes through here, so naming the host once
+      // fixes the message everywhere at the same time. This repo already
+      // learned this on the cloud bundle: an error must name the host it
+      // tried, or a screenshot cannot be read.
+      const msg = String((err && err.message) || "");
+      const isNetwork = (typeof TypeError !== "undefined" && err instanceof TypeError)
+        || /failed to fetch|networkerror|load failed|connection refused/i.test(msg);
+      if (isNetwork) {
+        let target = String(url || "");
+        try { target = new URL(url, window.location.href).origin; } catch (_) { /* keep the raw url */ }
+        const wrapped = new Error(
+          `No response from ${target}. The service did not answer - check that `
+          + `TrustNode is running there, and that a firewall or antivirus is not `
+          + `blocking it.`);
+        wrapped.networkError = true;
+        wrapped.target = target;
+        throw wrapped;
+      }
+      throw err;
+    }
     // A read that timed out gets ONE more, longer, attempt.
     //
     // At start-up the backend is still doing its deferred init, so the first

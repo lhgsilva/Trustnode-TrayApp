@@ -1421,8 +1421,28 @@ def get_sync_status() -> dict:
             "host": str(sync_target.get("host") or ""),
             "enabled": bool(sync_target.get("enabled")),
         },
+        # 2026-10-27: whether a cloud DATABASE is actually configured, which
+        # is NOT what `cloud_target.enabled` says. On an edge with no customer
+        # database at all, that flag still reads True because the built-in
+        # "Automatic Cloud Config Sync" pseudo-target is enabled and carries
+        # no host - so anything gated on it fires on a machine with nowhere
+        # to sync to. A backlog is only a decision for the operator when
+        # there is somewhere for it to go.
+        "cloud_database_configured": bool(_cloud_database_configured()),
         "telemetry_v1": v1_summary,
     }
+
+
+def _cloud_database_configured() -> bool:
+    """Is there a cloud database for data to sync INTO?
+
+    Deliberately the same resolver the historian routing uses, so the UI and
+    the write path can never disagree about whether a cloud exists.
+    """
+    try:
+        return bool(app_store._get_cloud_database_target())   # noqa: SLF001
+    except Exception:
+        return False
 
 
 @router.get("/sync/health")

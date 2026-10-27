@@ -52,6 +52,44 @@ def _compare(value: float, operator: str, threshold: float, threshold2: float | 
     return False
 
 
+def _resolve_report_columns(schedule: dict[str, Any], window, gateway: str = "") -> dict:
+    """Values the operator wants to SEE beside each generated report.
+
+    2026-10-27, requested: "on the generated reports page we should be able
+    to customize the columns ... add a column of the report generated using
+    a tag used in the report, like work order".
+
+    A column cannot be filled in later: the work order a report covers is
+    whatever the tag held during ITS run, and by the time anyone opens the
+    list that tag has moved on. So each column is resolved here, against the
+    run's own window, and stored with the row.
+
+    Each entry is {label, pattern}; the pattern is the same token language
+    as the file name and the folder, so {Work_Order}, masks like
+    {Result|1=PASS,0=FAIL} and {date} all work without a second syntax.
+    """
+    cols = schedule.get("report_columns")
+    if not isinstance(cols, list) or not cols:
+        return {}
+    from app.services.report_renderer import resolve_text_tokens, fill_run_tokens
+    started, ended = (window or ("", ""))
+    out: dict[str, str] = {}
+    for entry in cols:
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label") or "").strip()
+        pattern = str(entry.get("pattern") or "").strip()
+        if not label or not pattern:
+            continue
+        try:
+            text = resolve_text_tokens(pattern, started, ended, gateway, None)
+            text = fill_run_tokens(text, started, ended)
+        except Exception:
+            text = ""
+        out[label] = str(text or "").strip()
+    return out
+
+
 def _cycle_file_name(schedule: dict[str, Any], template: dict[str, Any],
                      window: tuple[str, str] | None, report_id: str) -> str:
     """The operator's naming pattern, resolved. Empty keeps the uuid name."""
@@ -247,6 +285,10 @@ class ReportRunner:
                 "segment_count": len(segments or []),
                 "report_id": str(report_id or ""),
                 "trigger": str(triggered_by or ""),
+                # Operator-defined columns, resolved against THIS run's
+                # window. Stored because the tag they read has moved on by
+                # the time anyone looks at the list.
+                "columns": _resolve_report_columns(schedule, window),
             },
         })
 

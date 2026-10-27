@@ -2534,6 +2534,20 @@ function compareByOperator(value, operator, threshold) {
 function buildRolePermissions(role) {
   if (role === "admin") {
     return {
+      // 2026-10-27, reported: "users created locally cannot access the LAN".
+      // They could not: can_access_surface() falls through to these
+      // per-user flags, and NO role default set any of them - so every
+      // locally created non-admin was refused at every LAN surface while
+      // the tick boxes sat unticked on a page nobody knew to visit. An
+      // admin passed only because ADMIN_ROLES short-circuits earlier.
+      //
+      // Defaults now follow what the backend already allows: the FULL app
+      // over the LAN is admin/engineer only (it refuses anyone else by
+      // role anyway), so everybody else gets the read-only Local View.
+      // An admin can still untick any of these per user.
+      access_full: true,
+      access_client: true,
+      access_lite: true,
       dashboard: true,
       power_overview: true,
       historian: true,
@@ -2564,6 +2578,20 @@ function buildRolePermissions(role) {
   }
   if (role === "engineer") {
     return {
+      // 2026-10-27, reported: "users created locally cannot access the LAN".
+      // They could not: can_access_surface() falls through to these
+      // per-user flags, and NO role default set any of them - so every
+      // locally created non-admin was refused at every LAN surface while
+      // the tick boxes sat unticked on a page nobody knew to visit. An
+      // admin passed only because ADMIN_ROLES short-circuits earlier.
+      //
+      // Defaults now follow what the backend already allows: the FULL app
+      // over the LAN is admin/engineer only (it refuses anyone else by
+      // role anyway), so everybody else gets the read-only Local View.
+      // An admin can still untick any of these per user.
+      access_full: true,
+      access_client: true,
+      access_lite: true,
       dashboard: true,
       power_overview: true,
       historian: true,
@@ -2594,6 +2622,19 @@ function buildRolePermissions(role) {
   }
   if (role === "operator") {
     return {
+      // 2026-10-27, reported: "users created locally cannot access the LAN".
+      // They could not: can_access_surface() falls through to these
+      // per-user flags, and NO role default set any of them - so every
+      // locally created non-admin was refused at every LAN surface while
+      // the tick boxes sat unticked on a page nobody knew to visit. An
+      // admin passed only because ADMIN_ROLES short-circuits earlier.
+      //
+      // Defaults now follow what the backend already allows: the FULL app
+      // over the LAN is admin/engineer only (it refuses anyone else by
+      // role anyway), so everybody else gets the read-only Local View.
+      // An admin can still untick any of these per user.
+      access_client: true,
+      access_lite: true,
       dashboard: true,
       power_overview: true,
       historian: true,
@@ -2624,6 +2665,19 @@ function buildRolePermissions(role) {
   }
   if (role === "client") {
     return {
+      // 2026-10-27, reported: "users created locally cannot access the LAN".
+      // They could not: can_access_surface() falls through to these
+      // per-user flags, and NO role default set any of them - so every
+      // locally created non-admin was refused at every LAN surface while
+      // the tick boxes sat unticked on a page nobody knew to visit. An
+      // admin passed only because ADMIN_ROLES short-circuits earlier.
+      //
+      // Defaults now follow what the backend already allows: the FULL app
+      // over the LAN is admin/engineer only (it refuses anyone else by
+      // role anyway), so everybody else gets the read-only Local View.
+      // An admin can still untick any of these per user.
+      access_client: true,
+      access_lite: true,
       dashboard: true,
       power_overview: true,
       historian: true,
@@ -2658,6 +2712,12 @@ function buildRolePermissions(role) {
   // reachable. An admin who ticks `alarms: true` for a viewer no longer gets
   // that value shadowed by an explicit client_module_alarms: false default.
   return {
+    // Viewer, and any role the operator invents - a licence names the
+    // modules, the role names the job, and neither should decide that a
+    // user cannot open the read-only view on the LAN. The FULL app stays
+    // admin/engineer only; the backend refuses anyone else by role.
+    access_client: true,
+    access_lite: true,
     dashboard: true,
     power_overview: false,
     historian: true,
@@ -4425,6 +4485,8 @@ function AppShell() {
   const [backlogPromptDecision, setBacklogPromptDecision] = useState("");
   const [backlogPromptBusy, setBacklogPromptBusy] = useState(false);
   const [backlogPromptVisible, setBacklogPromptVisible] = useState(false);
+  // What the backlog was when the prompt fired - the live figure drains.
+  const [backlogPromptAtRows, setBacklogPromptAtRows] = useState(0);
   const [appMetadata, setAppMetadata] = useState({});
   const [showDefaultLocalDbBadge, setShowDefaultLocalDbBadge] = useState(false);
   const [forceSyncBusy, setForceSyncBusy] = useState(false);
@@ -7461,14 +7523,35 @@ function AppShell() {
   // Backlog-too-big popup gate. Threshold defaults to 10,000 pending rows
   // OR 1 hour of oldest unsynced data. We only ever show the popup ONCE
   // per session (until the user picks an option); the decision is sticky.
+  const BACKLOG_PROMPT_ROWS = 10000;
   useEffect(() => {
     if (!cloudSyncStatus) return;
-    if (backlogPromptVisible) return;
     if (backlogPromptDecision) return;
     const historianBacklog = Number(cloudSyncStatus?.historian_backlog || 0);
     const v1Depth = Number(cloudSyncStatus?.telemetry_v1?.outbox_depth || 0);
     const total = historianBacklog + v1Depth;
-    if (total >= 10000) {
+    // 2026-10-27, reported with a screenshot: this asked the operator to
+    // choose between pushing and discarding on an edge with NO cloud
+    // database configured at all. `cloud_target.enabled` is no help - the
+    // built-in "Automatic Cloud Config Sync" pseudo-target keeps it true
+    // with an empty host - so the backend now answers the real question.
+    // With nowhere to sync to there is no decision to make.
+    if (!cloudSyncStatus?.cloud_database_configured) {
+      if (backlogPromptVisible) setBacklogPromptVisible(false);
+      return;
+    }
+    if (backlogPromptVisible) {
+      // It drains while the dialog is open. The screenshot showed "Pending
+      // historian rows: 118" under a heading about a backlog too large to
+      // ignore, because the figures are live and the threshold that fired
+      // was long gone. Nothing left to decide - close it.
+      if (total < BACKLOG_PROMPT_ROWS / 2) setBacklogPromptVisible(false);
+      return;
+    }
+    if (total >= BACKLOG_PROMPT_ROWS) {
+      // Remember what it was when we asked, so the dialog states the case
+      // it is actually asking about rather than a number that has moved on.
+      setBacklogPromptAtRows(total);
       setBacklogPromptVisible(true);
     }
   }, [cloudSyncStatus, backlogPromptVisible, backlogPromptDecision]);
@@ -30009,6 +30092,10 @@ const getGatewayHealth = (gateway) => {
               <div>
                 <b>Pending historian rows:</b>{" "}
                 {Number(cloudSyncStatus?.historian_backlog || 0).toLocaleString()}
+                {backlogPromptAtRows
+                  && backlogPromptAtRows > Number(cloudSyncStatus?.historian_backlog || 0) ? (
+                  <> (was {Number(backlogPromptAtRows).toLocaleString()} when this appeared - it is draining)</>
+                ) : null}
               </div>
               {cloudSyncStatus?.telemetry_v1?.outbox_depth ? (
                 <div>

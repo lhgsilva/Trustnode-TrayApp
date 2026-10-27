@@ -5636,6 +5636,9 @@ class AppStore:
                     # holds. Empty by default, so a schedule that has none
                     # resolves its destination exactly as it always did.
                     ("destination_rules_json", "TEXT NOT NULL DEFAULT '[]'"),
+                    # 2026-10-27: columns the operator wants beside each
+                    # generated report (a work order read from a tag, say).
+                    ("report_columns_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ):
                     if _col not in sched_cols:
                         conn.execute("ALTER TABLE scheduled_reports ADD COLUMN %s %s"

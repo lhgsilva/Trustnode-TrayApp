@@ -122,6 +122,64 @@ function makeId(prefix) {
 // The first rule that matches wins, and anything a rule leaves blank falls
 // back to the boxes above it. A schedule with no rules behaves exactly as
 // it did before this existed.
+// 2026-10-27, requested: "on the generated reports page we should be able
+// to customize the columns ... add a column of the report generated using
+// a tag used in the report, like work order".
+//
+// A column cannot be filled in afterwards: the value a report covers is
+// whatever the tag held during ITS run. Each column is therefore resolved
+// when the report is generated and stored with it, so the list stays true
+// however long ago the run was.
+//
+// The pattern is the same token language as the file name and the folder -
+// one syntax for all three, including masks like {Result|1=PASS,0=FAIL}.
+function ReportColumns({ columns, onChange }) {
+  const list = Array.isArray(columns) ? columns : [];
+  const patch = (i, next) => onChange(list.map((c, x) => (x === i ? { ...c, ...next } : c)));
+  return (
+    <div className="sr-rules">
+      <div className="sr-rules-head">
+        <span>Extra columns on the Generated Reports list</span>
+        <button type="button" className="btn btn-secondary btn-sm"
+                onClick={() => onChange([...list, { label: "", pattern: "" }])}>
+          + Add column
+        </button>
+      </div>
+      {list.length === 0 ? (
+        <p className="sr-token-hint">
+          None: the list shows when each report was generated, its template
+          and schedule. Add a column to show a value from the run itself -
+          a work order, a batch, a result - read from a tag at the moment
+          the report was produced.
+        </p>
+      ) : null}
+      {list.map((col, i) => (
+        <div className="sr-rule-dest" key={i}>
+          <label>
+            Column heading
+            <input value={col.label || ""} placeholder="e.g. Work order"
+                   onChange={(e) => patch(i, { label: e.target.value })} />
+          </label>
+          <label>
+            Value
+            <div className="sr-path-row">
+              <input value={col.pattern || ""} placeholder="{TagName}"
+                     title="A tag value, or any mix of text and tokens - the same ones the file name uses."
+                     onChange={(e) => patch(i, { pattern: e.target.value })} />
+              <button type="button" className="btn btn-secondary btn-sm"
+                      title="Remove this column"
+                      onClick={() => onChange(list.filter((_, x) => x !== i))}>
+                Remove
+              </button>
+            </div>
+          </label>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
 function DestinationRules({ rules, onChange, gatewayOptions,
                             tagListForGateway, formatTagForDisplay }) {
   const list = Array.isArray(rules) ? rules : [];
@@ -133,7 +191,8 @@ function DestinationRules({ rules, onChange, gatewayOptions,
     id: `dr_${Date.now().toString(36)}`, enabled: true, logic: "all",
     conditions: [{ gateway_id: "", tag_name: "", operator: "==", value: "" }],
     output_path: "",
-    destination_rules: [], file_name_pattern: "",
+    destination_rules: [],
+    report_columns: [], file_name_pattern: "",
   }]);
   return (
     <div className="sr-rules">
@@ -713,6 +772,22 @@ export function ScheduledReportsManager({
     return generated.filter((g) => String(g.schedule_id || "") === String(filterScheduleId));
   }, [generated, filterScheduleId]);
 
+  // The headings actually present on the rows being shown. Taken from the
+  // rows rather than from the schedules, so a report keeps the columns it
+  // was generated with even after the schedule's columns are changed - and
+  // a report produced before any were configured simply has none.
+  const extraColumns = useMemo(() => {
+    const seen = [];
+    for (const g of filteredGenerated || []) {
+      const cols = g?.meta?.columns;
+      if (!cols || typeof cols !== "object") continue;
+      for (const key of Object.keys(cols)) {
+        if (!seen.includes(key)) seen.push(key);
+      }
+    }
+    return seen;
+  }, [filteredGenerated]);
+
   return (
     <div className="scheduled-reports-page">
       {loadState.failures > 0 ? (
@@ -1075,6 +1150,10 @@ export function ScheduledReportsManager({
                         </span>
                       </label>
                 </div>
+                <ReportColumns
+                  columns={draft.report_columns || []}
+                  onChange={(next) => setDraft((p) => ({ ...p, report_columns: next }))}
+                />
                 <DestinationRules
                   rules={draft.destination_rules || []}
                   gatewayOptions={gatewayOptions}
@@ -1226,6 +1305,7 @@ export function ScheduledReportsManager({
                 <thead>
                   <tr>
                     <th>Generated</th>
+                    {extraColumns.map((c) => <th key={c}>{c}</th>)}
                     <th>Template</th>
                     <th>Schedule</th>
                     <th>Trigger</th>
@@ -1238,6 +1318,9 @@ export function ScheduledReportsManager({
                   {filteredGenerated.map((g) => (
                     <tr key={g.id}>
                       <td>{g.created_utc || "-"}</td>
+                      {extraColumns.map((c) => (
+                        <td key={c}>{(g?.meta?.columns || {})[c] || "-"}</td>
+                      ))}
                       <td>{g.template_name || g.template_id || "-"}</td>
                       <td>{g.schedule_name || "-"}</td>
                       <td>{g.triggered_by || "-"}</td>
