@@ -68,8 +68,24 @@ def _resolve_report_columns(schedule: dict[str, Any], window, gateway: str = "")
     as the file name and the folder, so {Work_Order}, masks like
     {Result|1=PASS,0=FAIL} and {date} all work without a second syntax.
     """
-    cols = schedule.get("report_columns")
-    if not isinstance(cols, list) or not cols:
+    # 2026-10-27: columns may be defined ONCE for the whole edge, from the
+    # Generated Reports page where the operator is actually looking at the
+    # list, as well as per schedule. Defining "Work order" in one place and
+    # having every report carry it is what was asked for; a schedule can
+    # still add its own, and its entry wins on a clashing heading.
+    cols: list[Any] = []
+    try:
+        from app.state import app_store as _store
+        settings = _store.get_domain_scoped_fast("app_settings") or {}
+        glob = settings.get("report_columns")
+        if isinstance(glob, list):
+            cols.extend(glob)
+    except Exception:
+        pass
+    own = schedule.get("report_columns")
+    if isinstance(own, list):
+        cols.extend(own)
+    if not cols:
         return {}
     from app.services.report_renderer import resolve_text_tokens, fill_run_tokens
     started, ended = (window or ("", ""))

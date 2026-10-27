@@ -6,6 +6,8 @@ import {
   emailGeneratedReport,
   getReportSchedulerStatus,
   listGeneratedReports,
+  getAppStoreBootstrap,
+  saveAppStoreDomain,
   listReportTemplates,
   listScheduledReports,
   runScheduledReport,
@@ -772,6 +774,45 @@ export function ScheduledReportsManager({
     return generated.filter((g) => String(g.schedule_id || "") === String(filterScheduleId));
   }, [generated, filterScheduleId]);
 
+  // 2026-10-27, reported: the Generated Reports page offered no way to add
+  // a column, because the editor lived in the SCHEDULE editor and this page
+  // renders only the list. Columns are defined once for the whole edge from
+  // right here, where the operator is looking at the table they affect.
+  const [globalColumns, setGlobalColumns] = useState([]);
+  const [columnsOpen, setColumnsOpen] = useState(false);
+  const [columnsBusy, setColumnsBusy] = useState(false);
+  useEffect(() => {
+    if (!showGenerated) return;
+    let dead = false;
+    (async () => {
+      try {
+        const boot = await getAppStoreBootstrap();
+        const cols = boot?.app_settings?.report_columns;
+        if (!dead && Array.isArray(cols)) setGlobalColumns(cols);
+      } catch (_) { /* the list still works without them */ }
+    })();
+    return () => { dead = true; };
+  }, [showGenerated]);
+
+  const saveGlobalColumns = async (next) => {
+    setColumnsBusy(true);
+    try {
+      // Re-read and MERGE. app_settings holds far more than this; writing a
+      // partial document here would blank whatever else is in it, which is
+      // a mistake this codebase has made before and paid for.
+      const boot = await getAppStoreBootstrap();
+      const current = (boot && boot.app_settings) || {};
+      await saveAppStoreDomain("app_settings",
+        { ...current, report_columns: next }, "reports-columns");
+      setGlobalColumns(next);
+      onNotify?.({ type: "success", message: "Report columns saved." });
+    } catch (err) {
+      onNotify?.({ type: "error", message: `Columns could not be saved: ${String(err?.message || err)}` });
+    } finally {
+      setColumnsBusy(false);
+    }
+  };
+
   // The headings actually present on the rows being shown. Taken from the
   // rows rather than from the schedules, so a report keeps the columns it
   // was generated with even after the schedule's columns are changed - and
@@ -1283,6 +1324,11 @@ export function ScheduledReportsManager({
             <button type="button" className="icon-btn" onClick={refresh} title="Refresh list" aria-label="Refresh">
               <IconRefresh />
             </button>
+            <button type="button" className="btn btn-secondary btn-sm"
+                    onClick={() => setColumnsOpen((v) => !v)}
+                    title="Add a column showing a value from each report - a work order, a batch, a result - read from a tag when the report was generated">
+              {columnsOpen ? "Close columns" : "Columns"}
+            </button>
             {logoSrc ? (
               <img
                 src={logoSrc}
@@ -1297,10 +1343,56 @@ export function ScheduledReportsManager({
           </div>
         </header>
         <div className="tn-card-body">
+          {columnsOpen ? (
+              <div className="sr-rules" style={{ marginBottom: 10 }}>
+                <div className="sr-rules-head">
+                  <span>Columns on this list - defined once, applied to every report generated from now on</span>
+                  <button type="button" className="btn btn-secondary btn-sm"
+                          disabled={columnsBusy}
+                          onClick={() => setGlobalColumns([...(globalColumns || []), { label: "", pattern: "" }])}>
+                    + Add column
+                  </button>
+                </div>
+                <p className="sr-token-hint">
+                  The value is read from the run itself when the report is
+                  produced, so a report keeps what it was generated with.
+                  Use <code>{"{TagName}"}</code>, and{" "}
+                  <code>{"{TagName|1=PASS,0=FAIL}"}</code> to show a word
+                  instead of a number. Existing reports are not changed.
+                </p>
+                {(globalColumns || []).map((col, i) => (
+                  <div className="sr-rule-dest" key={i}>
+                    <label>
+                      Column heading
+                      <input value={col.label || ""} placeholder="e.g. Work order"
+                             onChange={(e) => setGlobalColumns(globalColumns.map((c, x) => x === i ? { ...c, label: e.target.value } : c))} />
+                    </label>
+                    <label>
+                      Value
+                      <div className="sr-path-row">
+                        <input value={col.pattern || ""} placeholder="{TagName}"
+                               onChange={(e) => setGlobalColumns(globalColumns.map((c, x) => x === i ? { ...c, pattern: e.target.value } : c))} />
+                        <button type="button" className="btn btn-secondary btn-sm"
+                                onClick={() => setGlobalColumns(globalColumns.filter((_, x) => x !== i))}>
+                          Remove
+                        </button>
+                      </div>
+                    </label>
+                  </div>
+                ))}
+                <div className="row" style={{ gap: 8 }}>
+                  <button type="button" className="btn btn-primary btn-sm"
+                          disabled={columnsBusy}
+                          onClick={() => saveGlobalColumns(globalColumns)}>
+                    {columnsBusy ? "Saving..." : "Save columns"}
+                  </button>
+                </div>
+              </div>
+            ) : null}
           {filteredGenerated.length === 0 ? (
             <p className="muted">No reports have been generated yet. Run a schedule or preview a template to see entries here.</p>
           ) : (
-            <div className="generated-reports-tablewrap">
+                        <div className="generated-reports-tablewrap">
               <table className="generated-reports-table">
                 <thead>
                   <tr>

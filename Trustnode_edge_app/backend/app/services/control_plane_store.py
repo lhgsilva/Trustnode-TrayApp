@@ -80,12 +80,25 @@ class ControlPlaneStore:
         {"key": "local_database", "label": "Local Database write access", "default_enabled": True, "group": "Admin"},
         {"key": "cloud_database", "label": "Cloud Database sync (Supabase)", "default_enabled": False, "group": "Admin"},
         {"key": "users_and_access_control", "label": "Users and Access Control", "default_enabled": False, "group": "Admin"},
+        # 2026-10-27: the three LAN modules default ON. They were opt-in,
+        # and the effect was that LAN sharing could not work on a new
+        # customer AT ALL: can_access_surface() checks the licence BEFORE
+        # the admin bypass, so an edge whose licence omitted them refused
+        # every LAN surface to everybody - admins included - and the
+        # middleware turned that into a bare 404. Reported three times
+        # from new installs as "LAN login does not work".
+        #
+        # Reaching the edge from a browser on the same plant network is
+        # part of the product, not an upsell. A licence can still turn any
+        # of them off explicitly; only the DEFAULT for a newly created
+        # licence changes here, and existing licences are never re-seeded -
+        # those need the module ticked in the portal.
         # --- Operator 2026-06-18: connectivity + cloud-access modules ----
         {"key": "connections", "label": "Connections page (LAN + OPC + MQTT)", "default_enabled": False, "group": "Connections"},
-        {"key": "lan_access", "label": "LAN Sharing & LAN Web Access", "default_enabled": False, "group": "Connections"},
+        {"key": "lan_access", "label": "LAN Sharing & LAN Web Access", "default_enabled": True, "group": "Connections"},
         {"key": "opcua", "label": "OPC UA Server (asyncua / .NET)", "default_enabled": False, "group": "Connections"},
         {"key": "mqtt", "label": "MQTT Broker (amqtt / Mosquitto)", "default_enabled": False, "group": "Connections"},
-        {"key": "local_web_app", "label": "Local Web App (LAN browser access)", "default_enabled": False, "group": "Cloud / Web"},
+        {"key": "local_web_app", "label": "Local Web App (LAN browser access)", "default_enabled": True, "group": "Cloud / Web"},
         {"key": "cloud_lite_access", "label": "Cloud Lite (web read-only)", "default_enabled": False, "group": "Cloud / Web"},
         {"key": "cloud_client_view", "label": "Cloud Client View (web)", "default_enabled": False, "group": "Cloud / Web"},
         # --- Operator 2026-08-21: remote runtime + share links (plan §3.1) ---
@@ -93,7 +106,7 @@ class ControlPlaneStore:
         # reached from a non-loopback address with an admin/engineer login.
         # view_share_links: no-login view-link tokens for Local View are allowed
         # (otherwise Local View always requires a login).
-        {"key": "remote_admin_lan", "label": "TrustNode Edge over LAN (remote admin/engineer access)", "default_enabled": False, "group": "Cloud / Web"},
+        {"key": "remote_admin_lan", "label": "TrustNode Edge over LAN (remote admin/engineer access)", "default_enabled": True, "group": "Cloud / Web"},
         {"key": "view_share_links", "label": "Local View share links (no-login tokens)", "default_enabled": False, "group": "Cloud / Web"},
         # --- Operator 2026-06-30: bolt-on application modules ------------
         # Both default_enabled=False so existing licenses are untouched

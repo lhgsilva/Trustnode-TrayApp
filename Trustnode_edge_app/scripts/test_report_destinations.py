@@ -335,6 +335,34 @@ check("  and so can a role the operator invents",
       "viewer and any custom role land here; the FULL app stays "
       "admin/engineer by role, but read-only must not need a hidden tick")
 
+# ------------------------------- LAN must work on a NEW customer licence
+print()
+print("[a licence created with defaults can use the LAN]")
+CPS = io.open(os.path.join(ROOT, "backend", "app", "services",
+                           "control_plane_store.py"), encoding="utf-8").read()
+for mod in ("local_web_app", "remote_admin_lan", "lan_access"):
+    i = CPS.index('"key": "%s"' % mod)
+    entry = CPS[i:CPS.index("}", i)]
+    check("'%s' is on by default" % mod, '"default_enabled": True' in entry,
+          "can_access_surface() checks the licence BEFORE the admin bypass, "
+          "so an edge without this refuses every LAN surface to EVERYONE - "
+          "and the middleware turns that into a bare 404")
+
+# ---------------------------- columns are editable where the list is shown
+print()
+print("[columns can be added from the Generated Reports page]")
+check("the generated view has a column editor",
+      "setColumnsOpen" in SRM and "saveGlobalColumns" in SRM,
+      "the editor was in the SCHEDULE editor, which that page does not render")
+check("  it merges instead of replacing app_settings",
+      "...current, report_columns: next" in SRM,
+      "app_settings holds much more; a partial write would blank it")
+SCHED2 = io.open(os.path.join(ROOT, "backend", "app", "services",
+                              "report_scheduler.py"), encoding="utf-8").read()
+check("  and the scheduler reads the global set",
+      'settings.get("report_columns")' in SCHED2,
+      "columns defined once must apply to every schedule")
+
 print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))
 sys.exit(0 if not FAILS else 2)
