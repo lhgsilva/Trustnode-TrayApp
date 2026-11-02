@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""The TN-Link tunnel: framing, conflict refusal, and the agent's end.
+"""The LS-Link tunnel: framing, conflict refusal, and the agent's end.
 
 The agent's end is the part that can hurt a machine - it enables IP
 forwarding and creates a NAT rule - so it is brought up and torn down
@@ -63,7 +63,7 @@ def ps(cmd):
     return (r.stdout or "").strip()
 
 
-say("TrustNode Link - the tunnel")
+say("LS-Link - the tunnel")
 say("")
 
 # --------------------------------------------------------------------------
@@ -128,7 +128,7 @@ sent = []
 ep = TT.Endpoint(TT.AGENT_IP, lambda p: sent.append(p))
 try:
     ep.up()
-    check("the TN-Link adapter came up", bool(ep.adapter and ep.adapter.index),
+    check("the LS-Link adapter came up", bool(ep.adapter and ep.adapter.index),
           "ifIndex=%d" % (ep.adapter.index if ep.adapter else 0))
     st = ps("(Get-NetIPAddress -InterfaceIndex %d -AddressFamily IPv4 | "
             "Where-Object { $_.IPAddress -eq '%s' }).AddressState"
@@ -156,7 +156,7 @@ finally:
     ep.down()
     time.sleep(1.5)
 
-gone_ad = ps("if (Get-NetAdapter -Name 'TN-Link' -ErrorAction "
+gone_ad = ps("if (Get-NetAdapter -Name 'LS-Link' -ErrorAction "
              "SilentlyContinue) { 'present' } else { 'gone' }")
 check("the adapter is gone", gone_ad == "gone", gone_ad)
 gone_nat = ps("if (Get-NetNat -Name '%s' -ErrorAction SilentlyContinue) "

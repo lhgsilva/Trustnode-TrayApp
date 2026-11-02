@@ -55,7 +55,7 @@ def settings():
 
 
 def main() -> int:
-    print("TN-Link: a permanent unit id and a usable address book")
+    print("LS-Link: a permanent unit id and a usable address book")
     # The peer must actually send its id, or none of this can be keyed.
     with open(os.path.join(HERE, "tnlink.py"), encoding="utf-8") as fh:
         src = fh.read()

@@ -3,7 +3,7 @@
 
     engineer's PC                         plant PC
     -------------                         --------
-    RSLinx -> TN-Link (L3 adapter)        this stack
+    RSLinx -> LS-Link (L3 adapter)        this stack
               raw IP over the relay  -->  terminates the TCP
                                           and opens an ORDINARY socket
                                           to 192.168.10.240:44818

@@ -5,9 +5,9 @@ New-NetNat needs Hyper-V on Windows 10 Pro, and Hyper-V would break the
 VMware the PLC software runs in. But Internet Connection Sharing has done
 NAT on every Windows since XP, needs no optional feature and no reboot.
 
-This is the decisive test, and it is the real data path: a TN-Link adapter
-is created, ICS is switched on with the plant NIC as "public" and TN-Link
-as "private", and then a packet is INJECTED into TN-Link exactly as the
+This is the decisive test, and it is the real data path: a LS-Link adapter
+is created, ICS is switched on with the plant NIC as "public" and LS-Link
+as "private", and then a packet is INJECTED into LS-Link exactly as the
 tunnel would inject one arriving from the remote engineer:
 
     ICMP echo   src 192.168.137.2 (the far end of the tunnel)
@@ -133,7 +133,7 @@ def icmp_echo(ident, seq, payload=b"trustnode-link"):
     return struct.pack(">BBHHH", 8, 0, c, ident, seq) + payload
 
 
-say("TrustNode Link - NAT without Hyper-V, via Internet Connection Sharing")
+say("LS-Link - NAT without Hyper-V, via Internet Connection Sharing")
 say("  plant network : %s" % PLANT_CIDR)
 say("  PLC           : %s" % PLC)
 say("")
@@ -156,22 +156,22 @@ say("")
 ep = None
 shared = False
 try:
-    say("[1. a TN-Link adapter]")
+    say("[1. a LS-Link adapter]")
     ep = TT.Endpoint(ICS_PRIVATE, lambda p: None)
     ep.up()
     check("adapter up", bool(ep.adapter), "ifIndex=%d" % ep.adapter.index)
 
     say("")
-    say("[2. switch ICS on: %s -> %s]" % ("TN-Link", lan_name))
-    ok, out = set_sharing(lan_name, "TN-Link", 1)
+    say("[2. switch ICS on: %s -> %s]" % ("LS-Link", lan_name))
+    ok, out = set_sharing(lan_name, "LS-Link", 1)
     shared = ok
     check("ICS accepted the configuration", ok, out[-160:] if out else "")
     time.sleep(3)
     addr = ps("(Get-NetIPAddress -InterfaceIndex %d -AddressFamily IPv4 "
               "-ErrorAction SilentlyContinue).IPAddress -join ','"
               % ep.adapter.index)
-    say("      TN-Link now holds: %s" % (addr or "(none)"))
-    check("  ICS put its address on TN-Link",
+    say("      LS-Link now holds: %s" % (addr or "(none)"))
+    check("  ICS put its address on LS-Link",
           ICS_PRIVATE in (addr or ""),
           "ICS always uses %s - that becomes the tunnel subnet"
           % ICS_PRIVATE)
@@ -226,12 +226,12 @@ finally:
     say("")
     say("[4. undo everything]")
     if shared:
-        ok, out = set_sharing(lan_name, "TN-Link", 0)
+        ok, out = set_sharing(lan_name, "LS-Link", 0)
         check("ICS sharing switched off", ok, out[-120:] if out else "")
     if ep:
         ep.down()
     time.sleep(2)
-    left = ps("if (Get-NetAdapter -Name 'TN-Link' -ErrorAction "
+    left = ps("if (Get-NetAdapter -Name 'LS-Link' -ErrorAction "
               "SilentlyContinue) { 'present' } else { 'gone' }")
     check("  the adapter is gone", left == "gone", left)
     lan_ip = ps("(Get-NetIPAddress -InterfaceIndex %d -AddressFamily IPv4 "

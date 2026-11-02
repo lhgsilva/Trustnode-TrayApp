@@ -60,7 +60,7 @@ def list_identity(host, port, timeout=8):
         s.close()
 
 
-print("TrustNode Link - does CIP survive the forward?")
+print("LS-Link - does CIP survive the forward?")
 print("  PLC: %s" % PLC)
 print()
 

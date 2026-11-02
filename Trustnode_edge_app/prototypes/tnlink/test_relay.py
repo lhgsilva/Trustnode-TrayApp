@@ -47,7 +47,7 @@ def check(name, ok, detail=""):
     return bool(ok)
 
 
-print("TrustNode Link - the relay path, outbound only at both ends")
+print("LS-Link - the relay path, outbound only at both ends")
 print()
 
 # --------------------------------------------------------------------------
@@ -135,7 +135,7 @@ except T.AuthError as exc:
 except Exception as exc:
     verdict = "%s: %s" % (type(exc).__name__, exc)
 took = time.time() - t0
-check("it says no server is waiting", "no TrustNode Link server" in verdict,
+check("it says no server is waiting", "no LS-Link server" in verdict,
       verdict)
 check("  and it says so quickly", took < 10, "%.1fs" % took)
 

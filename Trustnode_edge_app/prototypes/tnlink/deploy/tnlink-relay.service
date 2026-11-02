@@ -1,5 +1,5 @@
 [Unit]
-Description=TrustNode Link relay (rendezvous for remote service access)
+Description=LS-Link relay (rendezvous for remote service access)
 After=network-online.target
 Wants=network-online.target
 

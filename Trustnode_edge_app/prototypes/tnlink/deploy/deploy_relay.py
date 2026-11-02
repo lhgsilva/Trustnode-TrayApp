@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Install the TrustNode Link relay on the VPS, in ONE ssh session.
+"""Install the LS-Link relay on the VPS, in ONE ssh session.
 
 Many rapid SSH sessions trip fail2ban on this host, so everything is
 batched into a single connection and a single shell script.
@@ -72,7 +72,7 @@ if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>
   firewall-cmd --reload >/dev/null 2>&1 || true
   echo "firewalld ports: $(firewall-cmd --list-ports 2>/dev/null)"
 elif command -v ufw >/dev/null 2>&1; then
-  ufw allow {p}/tcp comment 'TrustNode Link relay' >/dev/null 2>&1 || true
+  ufw allow {p}/tcp comment 'LS-Link relay' >/dev/null 2>&1 || true
   ufw status 2>/dev/null | grep -E "{p}" || echo "(no ufw rule shown)"
 else
   echo "(no firewalld/ufw - check the provider firewall for TCP {p})"
@@ -109,7 +109,7 @@ def main() -> int:
             print("missing local file: %s" % p)
             return 2
 
-    print("TrustNode Link relay - deploy")
+    print("LS-Link relay - deploy")
     print("  target : %s@%s:%d" % (user, host, port))
     print("  install: %s  (port %d)" % (REMOTE_DIR, a.port))
     print("  files  : tnlink_relay.py, tnlink-relay.service")

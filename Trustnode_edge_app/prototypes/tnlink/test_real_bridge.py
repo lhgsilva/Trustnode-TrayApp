@@ -33,8 +33,8 @@ OUT = os.path.join(HERE, "_realbridge_result.txt")
 LOG = []
 FAILS = []
 
-A_NAME = "TN-Link"
-B_NAME = "TN-Link-B"
+A_NAME = "LS-Link"
+B_NAME = "LS-Link-B"
 MAGIC = b"TRUSTNODE-BRIDGE-PROBE"
 
 
@@ -96,7 +96,7 @@ def invoke_bridge(conn):
     return (r.stdout or "").strip()
 
 
-say("TrustNode Link - a REAL bridge, proven by forwarding a frame")
+say("LS-Link - a REAL bridge, proven by forwarding a frame")
 say("  (two throwaway TAP adapters; the plant NIC is NOT touched)")
 say("")
 check("running elevated", tap.is_admin())

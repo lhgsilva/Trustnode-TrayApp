@@ -1,4 +1,4 @@
-# Deploying the TrustNode Link relay
+# Deploying the LS-Link relay
 
 The relay is what lets the prototype work between any two computers with
 internet access. Both ends dial **out** to it, so neither needs an open
@@ -37,7 +37,7 @@ systemctl status tnlink-relay --no-pager
 Open the port:
 
 ```bash
-ufw allow 7443/tcp comment 'TrustNode Link relay'
+ufw allow 7443/tcp comment 'LS-Link relay'
 ```
 
 Check it:

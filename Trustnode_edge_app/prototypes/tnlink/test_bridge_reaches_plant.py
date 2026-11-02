@@ -4,10 +4,10 @@
 The bridge now has both members:
 
     bridge  : Network Bridge
-    members : TN-Link, Ethernet 3
+    members : LS-Link, Ethernet 3
 
 That is the configuration. This is the proof. An ARP request is written
-into the TN-Link adapter exactly as the remote PC's frames will arrive,
+into the LS-Link adapter exactly as the remote PC's frames will arrive,
 and the PLC's own reply has to come back out of it:
 
     who-has 192.168.10.240  tell 192.168.10.77
@@ -96,21 +96,21 @@ def _crash(exc_type, exc, tb):
 
 sys.excepthook = _crash
 
-say("TrustNode Link - does the bridge reach the plant network?")
+say("LS-Link - does the bridge reach the plant network?")
 say("  asking:  who-has %s   tell %s" % (PLC, FAKE_IP))
 say("")
 check("running elevated", tap.is_admin())
 if not tap.is_admin():
     finish(2)
 
-st = B.bridge_state("TN-Link")
+st = B.bridge_state("LS-Link")
 say("  bridge  : %s" % (st["bridge"] or "(none)"))
 say("  members : %s" % (", ".join(st["members"]) or "(none)"))
-if not check("TN-Link is a bridge member", st["ready"],
-             "the bridge must contain TN-Link and the plant adapter"):
+if not check("LS-Link is a bridge member", st["ready"],
+             "the bridge must contain LS-Link and the plant adapter"):
     finish(2)
 check("  the plant adapter is in it too",
-      any(m != "TN-Link" for m in st["members"]), st["members"])
+      any(m != "LS-Link" for m in st["members"]), st["members"])
 
 plant_ip = B.plant_address(PLANT)
 say("  plant address: %s" % (plant_ip or "(none)"))
@@ -120,13 +120,13 @@ check("the plant PC still holds an address on that network",
 dev = None
 try:
     say("")
-    say("[open TN-Link and listen]")
+    say("[open LS-Link and listen]")
     guid = ""
     for g, nm in tap.list_instances():
-        if nm == "TN-Link":
+        if nm == "LS-Link":
             guid = g
             break
-    if not check("found the TN-Link adapter", bool(guid), guid):
+    if not check("found the LS-Link adapter", bool(guid), guid):
         finish(2)
     dev = tap.Tap(guid).open()
     check("opened it, media up", bool(dev.handle))

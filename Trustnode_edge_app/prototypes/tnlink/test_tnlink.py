@@ -42,7 +42,7 @@ def check(name, ok, detail=""):
     return bool(ok)
 
 
-print("TrustNode Link - prototype self-test")
+print("LS-Link - prototype self-test")
 print()
 
 # --------------------------------------------------------------------------

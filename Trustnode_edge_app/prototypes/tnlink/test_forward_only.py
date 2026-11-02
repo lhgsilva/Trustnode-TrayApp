@@ -8,7 +8,7 @@ the gateway candidates are this very PC - then replies for the tunnel
 subnet come back here on their own and no NAT, no Hyper-V and no ICS are
 needed at all.
 
-So: a TN-Link adapter, IP forwarding (already on), and one packet
+So: a LS-Link adapter, IP forwarding (already on), and one packet
 injected exactly as the tunnel would deliver it:
 
     ICMP echo   src 10.77.0.2   dst <the PLC>
@@ -94,7 +94,7 @@ def echo_packet(src, dst, ident):
     return hdr + icmp
 
 
-say("TrustNode Link - is forwarding alone enough?")
+say("LS-Link - is forwarding alone enough?")
 say("  PLC: %s" % PLC)
 say("")
 check("running elevated", wintun.is_admin())
@@ -111,7 +111,7 @@ for cand in ("192.168.10.1", "192.168.10.110", "192.168.10.254"):
 ep = None
 try:
     say("")
-    say("[1. a TN-Link adapter, forwarding only - NO NAT]")
+    say("[1. a LS-Link adapter, forwarding only - NO NAT]")
     ep = TT.Endpoint(TT.AGENT_IP, lambda p: None)
     ep.up()
     check("adapter up at %s" % TT.AGENT_IP, bool(ep.adapter),
@@ -152,7 +152,7 @@ finally:
     if ep:
         ep.down()
     time.sleep(1.5)
-    left = ps("if (Get-NetAdapter -Name 'TN-Link' -ErrorAction "
+    left = ps("if (Get-NetAdapter -Name 'LS-Link' -ErrorAction "
               "SilentlyContinue) { 'present' } else { 'gone' }")
     check("the adapter is gone", left == "gone", left)
     net = ps("if (Test-Connection 8.8.8.8 -Count 1 -Quiet -ErrorAction "

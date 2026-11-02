@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""A TN-Link Ethernet adapter - Layer 2, so the segment can be BRIDGED.
+"""A LS-Link Ethernet adapter - Layer 2, so the segment can be BRIDGED.
 
 Why not the Layer 3 adapter: an L3 adapter carries IP packets, not
 Ethernet frames, so it cannot be put into a network bridge. Everything
@@ -14,7 +14,7 @@ to change, and no address is special.
 
 The driver is the prebuilt signed tap-windows6 from OpenVPN Inc., shipped
 unmodified under its GPLv2 licence (vendor/TAP-LICENSE.txt, with source
-available from the project). The CONNECTION is named TN-Link; the device
+available from the project). The CONNECTION is named LS-Link; the device
 description stays as the driver ships it, because changing it would mean
 re-signing the driver.
 
@@ -32,7 +32,7 @@ import threading
 from ctypes import wintypes
 
 HWID = "tap0901"
-CONN_NAME = "TN-Link"
+CONN_NAME = "LS-Link"
 
 # CTL_CODE(FILE_DEVICE_UNKNOWN=0x22, function, METHOD_BUFFERED=0, FILE_ANY_ACCESS=0)
 def _ctl(function: int) -> int:
@@ -128,7 +128,7 @@ def install_driver() -> tuple:
 
 
 def list_instances() -> list:
-    """Every TN-Link style adapter, as (interface GUID, connection name).
+    """Every LS-Link style adapter, as (interface GUID, connection name).
 
     Asked of Get-NetAdapter directly. An earlier version walked the
     registry for NetCfgInstanceId and returned nothing, which also made
@@ -210,7 +210,7 @@ def rename_connection(guid: str, name: str = CONN_NAME) -> tuple:
 # the device itself
 # --------------------------------------------------------------------------
 class Tap:
-    """Read and write Ethernet frames on a TN-Link adapter."""
+    """Read and write Ethernet frames on a LS-Link adapter."""
 
     def __init__(self, guid: str):
         self.guid = guid

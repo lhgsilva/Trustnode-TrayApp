@@ -3,9 +3,9 @@
 
     RSLinx (remote PC)
         |
-    TN-Link  (TAP, Layer 2)
+    LS-Link  (TAP, Layer 2)
         |   Ethernet frames, over the encrypted relay
-    TN-Link  (TAP, Layer 2)  --+
+    LS-Link  (TAP, Layer 2)  --+
                                |  Windows Network Bridge  (made ONCE, by hand)
     Ethernet 3  192.168.10.110-+
         |
@@ -24,7 +24,7 @@ Windows refuses to let a program create one:
 
 and the shell's "Bridge Connections" verb needs two connections selected
 at the same time, which cannot be driven one adapter at a time. So the
-TN-Link adapter is created once and LEFT IN PLACE, the operator bridges
+LS-Link adapter is created once and LEFT IN PLACE, the operator bridges
 it to the plant NIC once, and after that the app only opens the adapter
 and moves frames. The bridge survives reboots.
 
@@ -49,8 +49,8 @@ import time
 
 import tap
 
-CLIENT_NAME = "TN-Link"
-AGENT_NAME = "TN-Link"
+CLIENT_NAME = "LS-Link"
+AGENT_NAME = "LS-Link"
 MAX_FRAME = 2048
 
 
@@ -122,7 +122,7 @@ def adapter_for_subnet(cidr: str) -> tuple:
 # the one-time setup on the plant PC
 # --------------------------------------------------------------------------
 def bridge_state(member: str = AGENT_NAME) -> dict:
-    """Is there a Network Bridge, and is TN-Link a member of it?
+    """Is there a Network Bridge, and is LS-Link a member of it?
 
     Membership is the ms_implat binding - measured, not guessed. The
     bridge device itself is COMPOSITEBUS\\MS_IMPLAT_MP, and its
@@ -218,7 +218,7 @@ def survey(cidr: str, member: str = AGENT_NAME) -> dict:
 
 
 def prepare_adapter(name: str = AGENT_NAME) -> list:
-    """Strip TN-Link back to IPv4 so the bridge will accept it.
+    """Strip LS-Link back to IPv4 so the bridge will accept it.
 
     ONE PowerShell call for all of them. Ten separate calls took fourteen
     seconds, which is most of the time the operator spent waiting.
@@ -331,7 +331,7 @@ class PlantWatchdog:
 
 
 def ensure_adapter(name: str = AGENT_NAME) -> tuple:
-    """Make sure a TN-Link adapter exists. Does NOT remove anything.
+    """Make sure a LS-Link adapter exists. Does NOT remove anything.
 
     Returns (guid, created, message).
     """
@@ -524,7 +524,7 @@ class FrameFilter:
 
 
 class L2Endpoint:
-    """A TN-Link adapter and the frame pump behind it."""
+    """A LS-Link adapter and the frame pump behind it."""
 
     def __init__(self, send_frame, name: str = CLIENT_NAME,
                  keep_adapter: bool = False, filter_flood: bool = True):
@@ -600,7 +600,7 @@ class L2Endpoint:
         if self.created and not self.keep_adapter:
             ok, why = tap.remove_instance(guid=self.guid)
             if not ok:
-                print("  note: could not remove the TN-Link adapter - %s"
+                print("  note: could not remove the LS-Link adapter - %s"
                       % why)
 
     # -- the client's address on the shared segment -----------------------

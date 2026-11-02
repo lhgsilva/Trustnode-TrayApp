@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Does the bridge forward while the adapter is held open?
 
-The bindings are right - TN-Link matches Ethernet 3 exactly
+The bindings are right - LS-Link matches Ethernet 3 exactly
 (ms_implat=True, ms_tcpip=False). But a bridge does not forward to a port
 whose media is down, and a TAP adapter only reports connected while a
 program holds its device handle open.
@@ -76,7 +76,7 @@ def ip2b(a):
     return bytes(int(x) for x in a.split("."))
 
 
-say("TrustNode Link - does the bridge forward while the port is held open?")
+say("LS-Link - does the bridge forward while the port is held open?")
 say("")
 check("running elevated", tap.is_admin())
 if not tap.is_admin():
@@ -84,9 +84,9 @@ if not tap.is_admin():
 
 guid = ""
 for g, nm in tap.list_instances():
-    if nm == "TN-Link":
+    if nm == "LS-Link":
         guid = g
-if not check("found TN-Link", bool(guid), guid):
+if not check("found LS-Link", bool(guid), guid):
     finish(2)
 
 dev = None
@@ -96,7 +96,7 @@ try:
 
     st = ""
     for _ in range(30):
-        st = ps("(Get-NetAdapter -Name 'TN-Link').Status")
+        st = ps("(Get-NetAdapter -Name 'LS-Link').Status")
         if st.strip().lower() == "up":
             break
         time.sleep(0.5)

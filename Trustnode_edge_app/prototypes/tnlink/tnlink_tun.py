@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""The TN-Link tunnel: a real adapter at each end, raw IP in between.
+"""The LS-Link tunnel: a real adapter at each end, raw IP in between.
 
-    RSLinx -> TN-Link (client) -> encrypted link -> TN-Link (agent)
+    RSLinx -> LS-Link (client) -> encrypted link -> LS-Link (agent)
                                                  -> Windows routes + NAT
                                                  -> 192.168.10.240 (PLC)
 
@@ -54,16 +54,16 @@ def _ps(cmd, timeout=60):
                  "-Command", cmd], timeout)
 
 
-def local_prefixes(ignore_adapter: str = "TN-Link") -> list:
+def local_prefixes(ignore_adapter: str = "LS-Link") -> list:
     """Every IPv4 subnet this machine is directly on.
 
-    Our own TN-Link adapter is skipped. A leftover one from an earlier
+    Our own LS-Link adapter is skipped. A leftover one from an earlier
     session sat on the plant range and made the conflict check refuse to
     route the very network it was there to reach - the tool arguing with
     itself.
     """
     # 2026-10-29, from a live site: the customer's PLC was on 192.168.0.1
-    # and TN-Link refused to share 192.168.0.0/24 saying "this PC is
+    # and LS-Link refused to share 192.168.0.0/24 saying "this PC is
     # already on" it - while ipconfig on that VM showed no 192.168.0.x
     # anywhere. The two were asking Windows different questions.
     # Get-NetIPAddress reports the address of an adapter whose cable is
@@ -86,7 +86,8 @@ def local_prefixes(ignore_adapter: str = "TN-Link") -> list:
                   "$_.IPAddress -notlike '169.254.*' -and "
                   "$_.AddressState -ne 'Invalid' -and "
                   "$up.ContainsKey($_.InterfaceIndex) -and "
-                  "$_.InterfaceAlias -notlike '%s*' } | "
+                  "$_.InterfaceAlias -notlike '%s*' -and "
+                  "$_.InterfaceAlias -notlike 'TN-Link*' } | "
                   "ForEach-Object { '{0}/{1}' -f $_.IPAddress, "
                   "$_.PrefixLength }" % ignore_adapter)
     out_list = []
@@ -123,7 +124,7 @@ def conflicts(remote_cidrs: list) -> list:
 class Endpoint:
     """One end of the tunnel: the adapter, its config, and the pump."""
 
-    def __init__(self, ip: str, send_packet, name: str = "TN-Link"):
+    def __init__(self, ip: str, send_packet, name: str = "LS-Link"):
         self.ip = ip
         self.name = name
         self.send_packet = send_packet       # callable(bytes) -> to peer
@@ -138,7 +139,7 @@ class Endpoint:
     def up(self) -> None:
         if not wintun.is_admin():
             raise wintun.WintunError(
-                "the TN-Link adapter needs administrator rights")
+                "the LS-Link adapter needs administrator rights")
         self.adapter = wintun.Adapter(self.name, self.name).create()
         # Session first - see wintun.Session for why.
         self.session = wintun.Session(self.adapter).start()

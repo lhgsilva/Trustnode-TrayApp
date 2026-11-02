@@ -3,7 +3,7 @@
 
 This is what option 6 now does on the plant side. It needs no adapter and
 no administrator rights, so it can be tested directly: craft the packets
-Windows would put on the TN-Link adapter, hand them to the stack, and see
+Windows would put on the LS-Link adapter, hand them to the stack, and see
 what comes back.
 
 Proves:
@@ -91,7 +91,7 @@ def tcp_parts(pkt):
     return sport, dport, seq, ack, seg[13], seg[off:]
 
 
-print("TrustNode Link - the userspace stack, against the real PLC")
+print("LS-Link - the userspace stack, against the real PLC")
 print("  plant %s   PLC %s" % (PLANT, PLC))
 print()
 

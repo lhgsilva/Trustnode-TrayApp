@@ -42,7 +42,7 @@ def ipv4(dst4, proto=17, sport=0, dport=0):
     return h + sport.to_bytes(2, "big") + dport.to_bytes(2, "big") + b"\x00" * 4
 
 
-print("TrustNode Link - the flood filter keeps what matters")
+print("LS-Link - the flood filter keeps what matters")
 print()
 
 f = B.FrameFilter()

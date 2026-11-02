@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""TN-Link as a service: the tray drives the real app, not a copy of it.
+"""LS-Link as a service: the tray drives the real app, not a copy of it.
 
 2026-10-28. `tnlink_tray.py` draws the menus and knows nothing about the
 protocol; `tnlink.py` owns connecting, sharing and tearing down. This file
@@ -9,8 +9,8 @@ calls, so a fix to either is a fix to both.
 
 Run it the way the operator will:
 
-    TrustNode-Link.exe --tray          (role asked once, then remembered)
-    TrustNode-Link.exe --tray --role server
+    LS-Link.exe --tray          (role asked once, then remembered)
+    LS-Link.exe --tray --role server
 
 What the tray can do, and what it deliberately cannot:
 
@@ -280,7 +280,7 @@ class LinkService:
                         code = str(getattr(a, "code", "") or "").strip()
                         if not code:
                             self.error = "no connection code yet"
-                            self._notify("TN-Link",
+                            self._notify("LS-Link",
                                          "Enter the plant's connection code first.")
                             return
                         # 2026-10-28: this passed the RELAY as `host` and
@@ -317,7 +317,7 @@ class LinkService:
                         # or someone else holds the room. Not a code problem -
                         # the stored code stays.
                         self.error = msg
-                        self._notify("TN-Link", msg)
+                        self._notify("LS-Link", msg)
                     elif unit and self.role != "server" and isinstance(exc, tnlink.AuthError):
                         # 2026-11-02: a saved connection whose stored code the
                         # plant refused - it made a new code, or was
@@ -330,9 +330,9 @@ class LinkService:
                         self.error = ("The plant refused the stored code - it has a "
                                       "new one. Ask for the current code and connect "
                                       "with it once; after that it reconnects on its own.")
-                        self._notify("TN-Link", self.error)
+                        self._notify("LS-Link", self.error)
                     else:
-                        self._notify("TN-Link stopped", self.error)
+                        self._notify("LS-Link stopped", self.error)
 
             self._thread = threading.Thread(target=_run, name="tnlink-service",
                                             daemon=True)
@@ -362,7 +362,7 @@ class LinkService:
 
     def restart(self) -> None:
         self._reconnect()
-        self._notify("TN-Link", "Service restarted.")
+        self._notify("LS-Link", "Service restarted.")
 
     def _reconnect(self, label: str = "") -> None:
         """Swap the running app for a fresh one, quietly.
@@ -376,7 +376,7 @@ class LinkService:
         self.app = None
         self.start()
         if label:
-            self._notify("TN-Link", "Connecting to %s ..." % label)
+            self._notify("LS-Link", "Connecting to %s ..." % label)
 
     def _notify(self, title: str, msg: str) -> None:
         if self._tray is not None:
@@ -395,7 +395,7 @@ class LinkService:
         def rename_connection(unit="", name=""):
             """Give a machine the name the operator calls it by."""
             ok = bool(tnlink.rename_connection(str(unit or ""), str(name or "")))
-            self._notify("TN-Link",
+            self._notify("LS-Link",
                          ("Renamed to %s." % name) if ok and name
                          else ("Name cleared." if ok else "No such connection."))
             return {"ok": ok}
@@ -411,9 +411,9 @@ class LinkService:
         def copy_code():
             code = self.snapshot().get("code") or ""
             if code and _clip(code):
-                self._notify("TN-Link", "Connection code copied.")
+                self._notify("LS-Link", "Connection code copied.")
             elif not code:
-                self._notify("TN-Link", "No connection code yet.")
+                self._notify("LS-Link", "No connection code yet.")
 
         def new_code():
             # Regenerating invalidates the old code on purpose: that is how
@@ -421,9 +421,9 @@ class LinkService:
             try:
                 self.args.code = tnlink.new_code()
                 self._reconnect()
-                self._notify("TN-Link", "New code: %s" % self.args.code)
+                self._notify("LS-Link", "New code: %s" % self.args.code)
             except Exception as exc:                     # noqa: BLE001
-                self._notify("TN-Link", "Could not make a new code: %s" % exc)
+                self._notify("LS-Link", "Could not make a new code: %s" % exc)
 
         def show_qr():
             # A phone reads the code off the screen; the console already
@@ -458,7 +458,7 @@ class LinkService:
             except Exception:
                 code = ""
             if not code:
-                self._notify("TN-Link",
+                self._notify("LS-Link",
                              "No stored code for that machine yet - pair once "
                              "with a code it gives you, and reconnecting is "
                              "automatic after that.")
@@ -481,11 +481,11 @@ class LinkService:
 
         def open_in_browser():
             if not tnlink_tray.open_in_browser():
-                self._notify("TN-Link", "Could not open the interface.")
+                self._notify("LS-Link", "Could not open the interface.")
 
         def stop_sharing():
             self.stop()
-            self._notify("TN-Link", "Sharing stopped.")
+            self._notify("LS-Link", "Sharing stopped.")
 
         def disconnect_peer(_pid=None):
             self.stop()
@@ -502,7 +502,7 @@ class LinkService:
                 self._tray.actions = self.actions()
                 self._tray._icon.menu = self._tray._build_menu() if self._tray._icon else None
             self.start()
-            self._notify("TN-Link", "This computer is now the %s."
+            self._notify("LS-Link", "This computer is now the %s."
                          % ("plant" if role == "server" else "engineer"))
 
         def become_plant():
@@ -526,7 +526,7 @@ class LinkService:
                 self._tray.actions = self.actions()
                 if self._tray._icon:
                     self._tray._icon.menu = self._tray._build_menu()
-            self._notify("TN-Link", "Choose what this computer is.")
+            self._notify("LS-Link", "Choose what this computer is.")
 
         def scan_devices():
             """Find what is on the plant network, for the window to list."""
@@ -703,7 +703,7 @@ class LinkService:
         def copy_unit_id():
             uid = self.snapshot().get("unit_id") or ""
             if uid and _clip(uid):
-                self._notify("TN-Link", "Unit ID copied: %s" % uid)
+                self._notify("LS-Link", "Unit ID copied: %s" % uid)
 
         def open_logs():
             # Requested: the logs are a menu entry that opens the

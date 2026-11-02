@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""A TN-Link virtual network adapter, driven from Python with ctypes.
+"""A LS-Link virtual network adapter, driven from Python with ctypes.
 
 This is the piece that makes the remote PLC network behave like a local
 one: a real Windows network adapter appears at each end, Windows does all
@@ -10,7 +10,7 @@ That is the whole reason no userspace TCP stack is needed, and why no
 compiler, no Go toolchain and no VPN software are needed either.
 
 The adapter's NAME and TUNNEL TYPE are supplied by us, so it shows in
-Windows as "TN-Link" - the driver vendor's name appears nowhere in the
+Windows as "LS-Link" - the driver vendor's name appears nowhere in the
 product, which its licence also requires (it forbids using their names to
 promote anything built on it).
 
@@ -135,9 +135,9 @@ def _run(args, timeout=40) -> tuple:
 
 
 class Adapter:
-    """A TN-Link adapter. Created on enter, destroyed on exit."""
+    """A LS-Link adapter. Created on enter, destroyed on exit."""
 
-    def __init__(self, name: str = "TN-Link", tunnel_type: str = "TN-Link"):
+    def __init__(self, name: str = "LS-Link", tunnel_type: str = "LS-Link"):
         self.name = name
         self.tunnel_type = tunnel_type
         self.handle = None

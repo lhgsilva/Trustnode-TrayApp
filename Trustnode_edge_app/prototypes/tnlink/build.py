@@ -38,21 +38,21 @@ EXCLUDE = ["tkinter", "unittest", "pydoc", "doctest",
 # silently changed what it did. One binary now asks once and remembers;
 # --role still overrides, and the old per-role names keep working for
 # anyone who already has them.
-APP_NAME = "tnlink"
+APP_NAME = "lslink"
 
 #: Two exes, asked for 2026-10-29: "always build two apps exe, one with
 #: everything and one that would be used only the browser".
 #:
-#:   tnlink.exe      everything inside, including the Electron window.
+#:   lslink.exe      everything inside, including the Electron window.
 #:                   ~140 MB, nothing to install, opens its own window.
-#:   tnlink-web.exe  the same app without the runtime. ~30 MB, and the
+#:   lslink-web.exe  the same app without the runtime. ~30 MB, and the
 #:                   interface opens in the machine's own browser.
 #:
 #: Same source, same behaviour: only the window differs, and the small one
 #: still falls back to an app-mode Chromium window when one is there.
 VARIANTS = (
-    ("tnlink", True),
-    ("tnlink-web", False),
+    ("lslink", True),
+    ("lslink-web", False),
 )
 
 
@@ -126,15 +126,31 @@ def main() -> int:
     except Exception as exc:
         print("  could not write the build stamp: %r" % exc)
 
-    print("TrustNode Link - build")
+    print("LS-Link - build")
     print("  source: %s" % SRC)
     print()
+
+    # The exe icon IS the tray icon (asked 2026-11-02). Rendered here from the
+    # tray's own drawing, so the two can never differ.
+    icon_ico = os.path.join(WORK, "lslink.ico")
+    icon_png = os.path.join(HERE, "ui", "lslink.png")
+    try:
+        os.makedirs(WORK, exist_ok=True)
+        sys.path.insert(0, HERE)
+        import tnlink_tray as _tray
+        have_icon = _tray.write_icon_file(icon_ico) and _tray.write_icon_file(icon_png)
+    except Exception as exc:                                # noqa: BLE001
+        print("  icon NOT rendered: %s" % exc)
+        have_icon = False
+    print("  exe icon: %s" % ("rendered from the tray drawing" if have_icon else "DEFAULT (no PIL?)"))
 
     for name, with_electron in VARIANTS:
         print("  building %s.exe ..." % name)
         cmd = [sys.executable, "-m", "PyInstaller", "--onefile", "--console",
                "--name", name, "--distpath", DIST, "--workpath", WORK,
                "--specpath", WORK, "--noconfirm", "--clean"]
+        if have_icon:
+            cmd += ["--icon", icon_ico]
         # The adapter driver has to travel inside the exe, or the tool is
         # useless on a machine that has never seen it. tap.py looks in
         # sys._MEIPASS first for exactly this reason.
@@ -147,7 +163,7 @@ def main() -> int:
             # directory would have carried all of it into the one exe that
             # is meant to be copied to a plant PC on a memory stick.
             for leaf in ("index.html", "main.js", "preload.js",
-                         "package.json"):
+                         "package.json", "lslink.png"):
                 f = os.path.join(uid, leaf)
                 if os.path.isfile(f):
                     cmd += ["--add-data", "%s%sui" % (f, os.pathsep)]
@@ -217,7 +233,7 @@ def main() -> int:
         p = subprocess.run([exe, "--help"], stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, text=True,
                            errors="replace", timeout=120)
-        good = p.returncode == 0 and "tnlink" in (p.stdout or "").lower()
+        good = p.returncode == 0 and "lslink" in (p.stdout or "").lower()
         print("      --help -> exit %d, %s"
               % (p.returncode, "usable" if good else "BROKEN"))
         if not good:

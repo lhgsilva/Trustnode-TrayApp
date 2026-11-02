@@ -60,7 +60,7 @@ def _raw_pair(code, timeout=6.0):
 
 
 def main() -> int:
-    print("TN-Link: the newest pairing wins and the code dies at pairing")
+    print("LS-Link: the newest pairing wins and the code dies at pairing")
     code0 = T.new_code()
     srv = T.Server(code0, ["127.0.0.0/8"], PORT, 0, "127.0.0.1", firewall=False)
     threading.Thread(target=srv.serve, daemon=True).start()

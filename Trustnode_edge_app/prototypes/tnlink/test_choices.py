@@ -62,7 +62,7 @@ def _client_with_two_lans():
 
 
 def main() -> int:
-    print("TN-Link: prompts become choices the window can answer")
+    print("LS-Link: prompts become choices the window can answer")
     T._is_admin = lambda: True                    # the bridge needs admin; not the point here
 
     # ---- the console path is untouched ------------------------------------

@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""The TN-Link Ethernet adapter, standalone - the piece that can be BRIDGED.
+"""The LS-Link Ethernet adapter, standalone - the piece that can be BRIDGED.
 
 Proves, before any bridge or tunnel is involved:
 
   1. the signed driver installs and an adapter instance appears,
-  2. the connection is called TN-Link in Network Connections,
+  2. the connection is called LS-Link in Network Connections,
   3. the device opens and reports media CONNECTED (without that the
      adapter reads "cable unplugged" and Windows will not bridge it),
   4. Ethernet frames arrive from Windows - including ARP, which is the
@@ -84,7 +84,7 @@ def ip2b(a):
     return bytes(int(x) for x in a.split("."))
 
 
-say("TrustNode Link - the TN-Link Ethernet (L2) adapter")
+say("LS-Link - the LS-Link Ethernet (L2) adapter")
 say("")
 check("running elevated", tap.is_admin())
 if not tap.is_admin():
@@ -123,7 +123,7 @@ try:
                "'%s' }; if ($a) { $a.Name + '|' + $a.InterfaceDescription "
                "+ '|' + $a.Status }" % guid)
     say("      Windows shows: %s" % shown)
-    check("  the connection is named TN-Link",
+    check("  the connection is named LS-Link",
           shown.split("|")[0] == tap.CONN_NAME, shown)
 
     say("")
@@ -228,7 +228,7 @@ finally:
     time.sleep(2)
     left = ps("if (Get-NetAdapter -Name '%s' -ErrorAction SilentlyContinue)"
               " { 'present' } else { 'gone' }" % tap.CONN_NAME)
-    check("  TN-Link is gone", left == "gone", left)
+    check("  LS-Link is gone", left == "gone", left)
     net = ps("if (Test-Connection 8.8.8.8 -Count 1 -Quiet -ErrorAction "
              "SilentlyContinue) { 'ok' } else { 'BROKEN' }")
     check("  internet still fine", net == "ok", net)

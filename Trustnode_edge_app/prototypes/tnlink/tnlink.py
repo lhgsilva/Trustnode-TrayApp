@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""TrustNode Link - remote access to the machine network. PROTOTYPE.
+"""LS-Link - remote access to the machine network. PROTOTYPE.
 
 Two roles in one file, built as two exes:
 
@@ -140,7 +140,7 @@ _SINGLE_INSTANCE_HANDLE = None
 
 
 def _other_instances() -> list:
-    """PIDs of other TN-Link processes on this machine.
+    """PIDs of other LS-Link processes on this machine.
 
     Matched by image name, and only when we are the frozen exe. From
     source the process is called python.exe, and sweeping THAT would kill
@@ -171,7 +171,7 @@ def _other_instances() -> list:
         me = os.getpid()
         # A one-file build is TWO processes of the same name: the
         # bootloader that unpacks, and the app it then runs. Measured
-        # 2026-10-29 - a single start reported "TN-Link is already
+        # 2026-10-29 - a single start reported "LS-Link is already
         # running (pid 3912)" and refused ITSELF, so the exe could not be
         # started at all. Our own parent and our own children are us.
         try:
@@ -201,7 +201,7 @@ def _other_instances() -> list:
 
 
 def _claim_single_instance() -> bool:
-    """True when THIS process is the only TN-Link on the machine.
+    """True when THIS process is the only LS-Link on the machine.
 
     A lock FILE cannot do this job: a process that is killed leaves the
     file behind, and the operator is then told the app is running when it
@@ -488,7 +488,7 @@ def relay_dial(relay: str, code: str, is_agent: bool,
             return s
         s.close()
         raise AuthError({
-            R_NO_AGENT: "no TrustNode Link server is waiting with that "
+            R_NO_AGENT: "no LS-Link server is waiting with that "
                         "Connection Code (is it running, and is the code "
                         "current?)",
             R_BUSY: "someone else is already connected to that server",
@@ -496,7 +496,10 @@ def relay_dial(relay: str, code: str, is_agent: bool,
         }.get(b, "unexpected reply from the relay"))
 
 
-FW_RULE = "TrustNode Link (prototype)"
+FW_RULE = "LS-Link"
+#: The rule the app wrote under its old name. Removed when we are elevated,
+#: so Windows Firewall does not keep showing a name the product no longer has.
+FW_RULE_LEGACY = "TrustNode Link (prototype)"
 
 
 def _is_admin() -> bool:
@@ -976,7 +979,7 @@ def pack_data(sid: int, payload: bytes) -> bytes:
 
 
 def pack_tun(packet: bytes) -> bytes:
-    """One raw IP packet, straight off a TN-Link adapter."""
+    """One raw IP packet, straight off a LS-Link adapter."""
     return bytes([TUN]) + packet
 
 
@@ -1117,7 +1120,7 @@ class Server:
 
     def _banner_relay(self) -> None:
         print()
-        print("  TN-Link - server  (%s)" % VERSION_FULL)
+        print("  LS-Link - server  (%s)" % VERSION_FULL)
         print("  " + "=" * 64)
         print()
         print("    UNIT ID : %s   (this PC, always the same)" % unit_id())
@@ -1153,7 +1156,7 @@ class Server:
         ranked = self._ranked()
         best = ranked[0]["ip"] if ranked else "<this-pc-address>"
         print()
-        print("  TN-Link - server  (%s)" % VERSION_FULL)
+        print("  LS-Link - server  (%s)" % VERSION_FULL)
         print("  " + "=" * 64)
         print()
         print("    UNIT ID : %s   (this PC, always the same)" % unit_id())
@@ -1212,6 +1215,16 @@ class Server:
             return
         if not _is_admin():
             return
+        # First elevated run after the rename: the rule written under the
+        # old name is replaced by one under the new one.
+        if _fw_rule_exists(FW_RULE_LEGACY):
+            try:
+                subprocess.run(["netsh", "advfirewall", "firewall", "delete", "rule",
+                                "name=" + FW_RULE_LEGACY],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+                log("firewall rule under the old name removed")
+            except Exception:                               # noqa: BLE001
+                pass
         ok, why = _fw_add(self.port)
         if ok:
             log("firewall rule added - %s" % why)
@@ -1373,7 +1386,7 @@ class Server:
             print()
             print("  Cannot listen on %s:%d - %s"
                   % (self.bind, self.port, exc.strerror or exc))
-            print("  Another TN-Link server is almost certainly")
+            print("  Another LS-Link server is almost certainly")
             print("  already running. Close its window, or start this one")
             print("  with a different port:  --port %d" % (self.port + 1))
             print()
@@ -2501,7 +2514,7 @@ class Client:
     def cmd_bridge(self, arg: str = "") -> None:
         """Join the plant network itself - the real thing.
 
-        A TN-Link adapter appears on this PC and on the plant PC, the
+        A LS-Link adapter appears on this PC and on the plant PC, the
         plant PC bridges its end to the network the PLC is on, and this PC
         becomes a member of that segment. The PLC keeps its address, this
         PC just gets one on the same range, and PLC software sees
@@ -2515,7 +2528,7 @@ class Client:
             print("  already up - type  bridge down  first")
             return
         if not _is_admin():
-            print("  the TN-Link adapter needs administrator rights.")
+            print("  the LS-Link adapter needs administrator rights.")
             print("  Close this and re-run tnlink.exe with")
             print("  right-click > Run as administrator.")
             return
@@ -2567,7 +2580,7 @@ class Client:
                               filter_flood=False)
             ep.up()
         except Exception as exc:                            # noqa: BLE001
-            print("  could not create the TN-Link adapter here: %s" % exc)
+            print("  could not create the LS-Link adapter here: %s" % exc)
             self.sec.send(pack_ctrl({"op": "bridge_down"}))
             self._await("bridge_down", 60)
             return
@@ -2575,7 +2588,7 @@ class Client:
         self.tunnel_info = r
 
         print()
-        print("  TN-Link is UP - this PC is now on %s" % r.get("subnet"))
+        print("  LS-Link is UP - this PC is now on %s" % r.get("subnet"))
 
     def cmd_bridge_ip(self, spec: str) -> None:
         if not self.tunnel:
@@ -2616,11 +2629,11 @@ class Client:
             self._await("bridge_down", 120)
         except Exception:                                   # noqa: BLE001
             pass
-        print("  TN-Link removed at both ends (%d frames out, %d in)"
+        print("  LS-Link removed at both ends (%d frames out, %d in)"
               % (st.get("out", 0), st.get("in", 0)))
 
     def cmd_tunnel(self, arg: str = "") -> None:
-        """Bring up a TN-Link adapter at both ends, and route the plant
+        """Bring up a LS-Link adapter at both ends, and route the plant
         network over it.
 
         After this the PLC is reachable at its OWN address - RSLinx and
@@ -2635,7 +2648,7 @@ class Client:
             print("  the tunnel is already up - type  tunnel down  first")
             return
         if not _is_admin():
-            print("  the TN-Link adapter needs administrator rights.")
+            print("  the LS-Link adapter needs administrator rights.")
             print("  Close this and re-run tnlink.exe with")
             print("  right-click > Run as administrator.")
             return
@@ -2740,7 +2753,7 @@ class Client:
                              lambda pkt: self.sec.send(pack_tun(pkt)))
             ep.up()
         except Exception as exc:                            # noqa: BLE001
-            print("  could not create the TN-Link adapter: %s" % exc)
+            print("  could not create the LS-Link adapter: %s" % exc)
             self.sec.send(pack_ctrl({"op": "tunnel_down"}))
             self._await("tunnel_down", 60)
             return
@@ -2756,7 +2769,7 @@ class Client:
         print()
         print("  THE PLANT NETWORK IS NOW SHARED WITH THIS PC")
         print("  " + "-" * 60)
-        print("    adapter   : TN-Link  (%s, MTU %d)" % (ep.ip, TT.MTU))
+        print("    adapter   : LS-Link  (%s, MTU %d)" % (ep.ip, TT.MTU))
         for c in done:
             print("    reaching  : %s  - every device, at its OWN address"
                   % c)
@@ -2790,7 +2803,7 @@ class Client:
             self._await("tunnel_down", 60)
         except Exception:                                   # noqa: BLE001
             pass
-        print("  TN-Link removed at both ends "
+        print("  LS-Link removed at both ends "
               "(%d packets out, %d in)" % (st.get("out", 0), st.get("in", 0)))
 
     def _plc_real_address(self, ip: str) -> bool:
@@ -2833,14 +2846,14 @@ class Client:
                                  lambda pkt: self.sec.send(pack_tun(pkt)))
                 ep.up()
             except Exception as exc:                     # noqa: BLE001
-                # 2026-10-28, seen in a live test: "the TN-Link adapter
+                # 2026-10-28, seen in a live test: "the LS-Link adapter
                 # needs administrator rights". The real address depends on
                 # an adapter, the adapter depends on elevation, and without
                 # it this quietly dropped back to 127.0.0.1 - which is why
                 # the operator kept seeing the loopback address and could
                 # not tell why. Say what to do about it.
                 msg = str(exc)
-                print("  could not create the TN-Link adapter: %s" % msg)
+                print("  could not create the LS-Link adapter: %s" % msg)
                 if "administrator" in msg.lower():
                     print()
                     print("  The REAL address needs the adapter, and the")
@@ -3353,7 +3366,7 @@ class Client:
                    "    bridge dhcp            or let their DHCP answer",
                    "    bridge down            remove it everywhere"],
         "tunnel": ["tunnel   |   tunnel down",
-                   "  THE REAL ONE. Creates a TN-Link network adapter on",
+                   "  THE REAL ONE. Creates a LS-Link network adapter on",
                    "  this PC and on the plant PC, and routes the plant",
                    "  network over it. The PLC keeps its own address, so",
                    "  RSLinx and Studio 5000 need no special settings -",
@@ -3655,7 +3668,7 @@ class Client:
 
     def console(self) -> int:
         print()
-        print("  TN-Link - client  (%s)" % VERSION_FULL)
+        print("  LS-Link - client  (%s)" % VERSION_FULL)
         print("  " + "-" * 62)
         self.cmd_info()
         print("  " + "-" * 62)
@@ -3759,7 +3772,7 @@ class Client:
             except Exception as exc:
                 print("  %s: %s" % (type(exc).__name__, exc))
         if self.tunnel:
-            print("  removing the TN-Link adapter ...")
+            print("  removing the LS-Link adapter ...")
             try:
                 if hasattr(self.tunnel, "bridge_with"):
                     self.cmd_bridge_down()
@@ -4029,7 +4042,7 @@ def _preamble_send(sock, unit: str) -> None:
 def _preamble_recv(sock) -> str:
     blob = _recv_exact(sock, PREAMBLE)
     if not blob.startswith(PREAMBLE_MAGIC):
-        raise AuthError("this is not a TN-Link endpoint (bad preamble)")
+        raise AuthError("this is not a LS-Link endpoint (bad preamble)")
     return blob[len(PREAMBLE_MAGIC):].rstrip(b"\x00").decode("ascii", "replace")
 
 
@@ -4236,7 +4249,7 @@ def main(argv=None) -> int:
         role_default = remembered_role() or None
 
     ap = argparse.ArgumentParser(
-        prog="tnlink", description="TrustNode Link prototype")
+        prog="lslink", description="LS-Link")
     ap.add_argument("--role", choices=("server", "client"),
                     default=role_default,
                     help="defaults to whichever the exe name says")
@@ -4340,7 +4353,7 @@ def main(argv=None) -> int:
             print("  second instance allowed (TNLINK_API_FILE is set)")
         elif not _claim_single_instance():
             others = _other_instances()
-            print("  TN-Link is already running%s - opening its window."
+            print("  LS-Link is already running%s - opening its window."
                   % (" (pid %s)" % ", ".join(str(p) for p in others)
                      if others else ""))
             try:
@@ -4373,7 +4386,7 @@ def main(argv=None) -> int:
         # both sides dial OUT to it. No address, no port, no firewall.
         if not code and _interactive():
             print()
-            print("  TN-Link - client  (%s)" % VERSION_FULL)
+            print("  LS-Link - client  (%s)" % VERSION_FULL)
             print("  " + "=" * 64)
             print()
             print("    Enter the Connection Code from tnlink.exe:")
@@ -4394,7 +4407,7 @@ def main(argv=None) -> int:
     else:
         if not a.server and _interactive():
             print()
-            print("  TN-Link - client  (%s)  DIRECT mode" % VERSION_FULL)
+            print("  LS-Link - client  (%s)  DIRECT mode" % VERSION_FULL)
             print("  " + "=" * 64)
             print()
             print("    Paste the line from tnlink.exe, for example:")

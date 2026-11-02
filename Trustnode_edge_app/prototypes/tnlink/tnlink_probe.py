@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""A portable TrustNode Link client, for proving the chain from outside.
+"""A portable LS-Link client, for proving the chain from outside.
 
 Runs on Linux, so the VPS can act as a genuinely remote engineer:
 
@@ -175,7 +175,7 @@ def main():
     ap.add_argument("--plc", default="192.168.10.240")
     a = ap.parse_args()
 
-    print("TrustNode Link - remote probe")
+    print("LS-Link - remote probe")
     print("  relay : %s" % a.relay)
     print("  PLC   : %s" % a.plc)
     print()

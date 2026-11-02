@@ -76,7 +76,7 @@ def can_bind(ip, port=0):
         s.close()
 
 
-say("TrustNode Link - elevated claim mechanism")
+say("LS-Link - elevated claim mechanism")
 say("  test address: %s  (NOT the PLC)" % IP)
 say("")
 check("this process is elevated", T._is_admin())

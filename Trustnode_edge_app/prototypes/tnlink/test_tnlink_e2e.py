@@ -51,7 +51,7 @@ def check(name: str, ok: bool, detail: str = "") -> bool:
 
 
 class End:
-    """One running TN-Link, talked to the way the interface talks to it."""
+    """One running LS-Link, talked to the way the interface talks to it."""
 
     def __init__(self, role: str, exe: str, extra=()):
         self.role = role
@@ -166,7 +166,7 @@ def electron_window(end: End) -> None:
              "Where-Object { $_.MainWindowTitle -ne '' } | "
              "Select-Object -First 1 -Expand MainWindowTitle"],
             capture_output=True, text=True).stdout.strip()
-        check("the window opens", title == "TN-Link", title or "no window")
+        check("the window opens", title == "LS-Link", title or "no window")
         # Counting connections ONCE proved nothing: TIME_WAIT lingers for
         # two minutes, so the count was non-zero even with the page dead.
         # The page polls every 2 s, so what distinguishes a live window
@@ -216,7 +216,7 @@ def _quit_default_instance(timeout: float = 20.0) -> bool:
 
 
 def only_one(exe: str) -> None:
-    """There must never be two TN-Links running at once.
+    """There must never be two LS-Links running at once.
 
     2026-10-29, reported: "we have multiple instances open at the same
     time, this should not be possible... we just need to make sure there
@@ -295,7 +295,7 @@ def main(argv) -> int:
     if not os.path.isfile(exe):
         print("  no exe at %s - build it first" % exe)
         return 2
-    print("TN-Link end to end")
+    print("LS-Link end to end")
     print("  exe: %s (%.1f MB)" % (exe, os.path.getsize(exe) / 1e6))
     print()
 

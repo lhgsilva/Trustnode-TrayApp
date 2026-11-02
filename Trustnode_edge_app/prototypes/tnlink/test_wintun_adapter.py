@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""The TN-Link adapter, on its own, before any tunnel is wired to it.
+"""The LS-Link adapter, on its own, before any tunnel is wired to it.
 
 Proves the four things the whole design rests on:
 
-  1. a real Windows network adapter can be created and is called TN-Link -
+  1. a real Windows network adapter can be created and is called LS-Link -
      no driver vendor's name anywhere a user would look,
   2. an address can be put on it,
   3. packets Windows sends INTO it arrive in this program (receive path),
@@ -37,7 +37,7 @@ OUT = os.path.join(HERE, "_wintun_result.txt")
 LOG = []
 FAILS = []
 
-ADAPTER = "TN-Link"
+ADAPTER = "LS-Link"
 OURS = "10.77.0.1"
 PEER = "10.77.0.2"
 PREFIX = 24
@@ -100,7 +100,7 @@ def icmp_echo_reply(pkt: bytes):
     return bytes(ip) + bytes(icmp)
 
 
-say("TrustNode Link - the TN-Link adapter, standalone")
+say("LS-Link - the LS-Link adapter, standalone")
 say("  adapter : %s" % ADAPTER)
 say("  address : %s/%d   (peer %s)" % (OURS, PREFIX, PEER))
 say("")

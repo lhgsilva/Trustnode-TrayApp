@@ -8,7 +8,7 @@ WHAT THIS CAN AND CANNOT TEST
 -----------------------------
 Options 1-5 and 7 are protocol operations and are tested for real.
 
-Option 6 (share the whole network) needs a TN-Link adapter at BOTH ends,
+Option 6 (share the whole network) needs a LS-Link adapter at BOTH ends,
 and the adapter driver is Windows-only - this probe is Linux. So its
 AGENT half is tested properly (adapter created, protocols stripped,
 bridge membership checked, teardown), and the client half is reported as
@@ -71,7 +71,7 @@ def main():
     ap.add_argument("--plc", default="192.168.10.240")
     a = ap.parse_args()
 
-    print("TrustNode Link - full option test, from the VPS")
+    print("LS-Link - full option test, from the VPS")
     print("  relay %s   PLC %s" % (a.relay, a.plc))
     print()
 
@@ -185,7 +185,7 @@ def main():
         check("  and it offered the plant subnets",
               bool(tu.get("subnets")), ", ".join(tu.get("subnets") or []))
         skip("  the client half",
-             "needs a TN-Link adapter; this probe is Linux")
+             "needs a LS-Link adapter; this probe is Linux")
         ctrl(sec, {"op": "tunnel_down"})
         td = wait(sec, "tunnel_down", 120) or {}
         check("  and it released cleanly", bool(td.get("ok")),

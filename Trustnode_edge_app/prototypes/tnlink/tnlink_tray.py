@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""TN-Link in the notification area: start it once, leave it running.
+"""LS-Link in the notification area: start it once, leave it running.
 
 2026-10-28, requested: "make the app a tray service app that can be kept on
 on the tray with menu option actions straight from the menu, like restart,
@@ -92,6 +92,35 @@ def _icon_image(state: str = "stopped"):
     return img
 
 
+def write_icon_file(path: str, state: str = "connected",
+                    sizes=(16, 24, 32, 48, 64, 128, 256)) -> bool:
+    """The tray's own icon, as a .ico (or .png) on disk.
+
+    2026-11-02, asked: "use the same icon used for the tray to be the app exe
+    icon". The tray draws its icon in code (above), so the exe gets the same
+    drawing rendered at every size Windows asks for - no second artwork that
+    could drift from the one in the notification area.
+    """
+    if Image is None:
+        return False
+    rgb = _COLOURS.get(state, _COLOURS["stopped"])
+    big = 256
+    img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    k = big / 64.0
+    d.ellipse((4 * k, 4 * k, 60 * k, 60 * k), fill=rgb)
+    d.ellipse((18 * k, 22 * k, 34 * k, 42 * k), outline=(255, 255, 255, 235), width=int(4 * k))
+    d.ellipse((30 * k, 22 * k, 46 * k, 42 * k), outline=(255, 255, 255, 235), width=int(4 * k))
+    try:
+        if str(path).lower().endswith(".ico"):
+            img.save(path, format="ICO", sizes=[(n, n) for n in sizes])
+        else:
+            img.save(path, format="PNG")
+        return True
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
 class TrayApp:
     """The notification-area front end.
 
@@ -121,7 +150,7 @@ class TrayApp:
         try:
             fn(*a)
         except Exception as exc:                          # noqa: BLE001
-            self.notify("TN-Link", "%s failed: %s" % (name, exc))
+            self.notify("LS-Link", "%s failed: %s" % (name, exc))
 
     def notify(self, title: str, message: str) -> None:
         try:
@@ -352,7 +381,7 @@ class TrayApp:
             state = "connected" if int(s.get("peers") or 0) > 0 else "waiting"
         try:
             self._icon.icon = _icon_image(state)
-            self._icon.title = "TN-Link - " + self._status_text().replace("Status: ", "")
+            self._icon.title = "LS-Link - " + self._status_text().replace("Status: ", "")
             self._icon.update_menu()
         except Exception:
             pass
@@ -363,8 +392,8 @@ class TrayApp:
             print("  the tray needs pystray and Pillow:")
             print("      pip install pystray pillow")
             return 2
-        self._icon = pystray.Icon("tnlink", _icon_image("waiting"),
-                                  "TN-Link", self._build_menu())
+        self._icon = pystray.Icon("lslink", _icon_image("waiting"),
+                                  "LS-Link", self._build_menu())
 
         def _ticker():
             # The menu is rebuilt from the live state, so a connection that

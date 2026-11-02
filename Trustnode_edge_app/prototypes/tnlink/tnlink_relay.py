@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""TrustNode Link relay - the rendezvous that makes this work anywhere.
+"""LS-Link relay - the rendezvous that makes this work anywhere.
 
 Runs on a host both sides can reach (your VPS). Both the agent (the PC on
 the PLC network) and the client (the engineer) dial OUT to it, so neither
@@ -260,7 +260,7 @@ def main() -> int:
               % (a.bind, a.port, exc.strerror or exc), file=sys.stderr)
         return 2
     srv.listen(128)
-    log("TrustNode Link relay listening on %s:%d" % (a.bind, a.port))
+    log("LS-Link relay listening on %s:%d" % (a.bind, a.port))
     log("it pairs by room id and never sees a Connection Code")
     threading.Thread(target=reaper, daemon=True).start()
     try:

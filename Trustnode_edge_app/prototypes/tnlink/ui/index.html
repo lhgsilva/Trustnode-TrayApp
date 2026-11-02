@@ -6,7 +6,7 @@
       content="default-src 'none'; script-src 'self' 'unsafe-inline';
                style-src 'self' 'unsafe-inline'; img-src 'self' data:;
                connect-src 'self' http://127.0.0.1:*">
-<title>TN-Link</title>
+<title>LS-Link</title>
 <style>
   /* The page itself never scrolls - neither column. Anything that can
      grow without limit (the device list, the log) owns a share of its
@@ -105,7 +105,7 @@
   <header>
     <span class="dot" id="dot"></span>
     <div>
-      <h1 id="title">TN-Link</h1>
+      <h1 id="title">LS-Link</h1>
       <div class="sub" id="subtitle">starting…</div>
     </div>
     <span class="grow"></span>
@@ -118,7 +118,7 @@
   <main>
     <section class="col">
       <div id="offline" class="banner" hidden>
-        TN-Link is not running. Start it from the tray, then reopen this window.
+        LS-Link is not running. Start it from the tray, then reopen this window.
       </div>
       <div id="error" class="banner" hidden></div>
 
@@ -577,8 +577,8 @@ async function refresh() {
   const err = (!running && s.error) ? String(s.error) : "";
   $("error").textContent = err;
   $("error").hidden = !err;
-  $("title").textContent = !s.role ? "TN-Link"
-      : (plant ? "TN-Link - at the plant" : "TN-Link - engineer");
+  $("title").textContent = !s.role ? "LS-Link"
+      : (plant ? "LS-Link - at the plant" : "LS-Link - engineer");
 
   $("unit").textContent = s.unit_id || "-";
   $("role").textContent = !s.role ? "not chosen" : (plant ? "plant" : "engineer");

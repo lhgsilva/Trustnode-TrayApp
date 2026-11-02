@@ -1,4 +1,4 @@
-// TN-Link interface shell.
+// LS-Link interface shell.
 //
 // 2026-10-28. The window shows what the core says and asks the core to do
 // things - it holds no state of its own. The core writes its port and a
@@ -12,7 +12,7 @@ const os = require("os");
 
 // 2026-10-28, reported: "the browser version is working but the electron
 // app is not". The browser was opened AT the live port; this window looked
-// the endpoint up in a file - and a second TN-Link rewrites that file, so
+// the endpoint up in a file - and a second LS-Link rewrites that file, so
 // the window talked to a core that had gone. The core now hands its port
 // and token to the window directly, and the file is only the fallback.
 function endpoint() {
@@ -26,7 +26,7 @@ function endpoint() {
 
 async function callCore(route, method, body) {
   const ep = endpoint();
-  if (!ep) throw new Error("TN-Link is not running");
+  if (!ep) throw new Error("LS-Link is not running");
   try {
     const res = await fetch(`http://127.0.0.1:${ep.port}${route}`, {
       method: method || "GET",
@@ -38,16 +38,18 @@ async function callCore(route, method, body) {
   } catch (err) {
     // Name the host and the route. A dead core and a refused request look
     // identical in a screenshot otherwise.
-    console.error(`[tnlink] ${method || "GET"} ${route} -> ${err.message}`);
+    console.error(`[lslink] ${method || "GET"} ${route} -> ${err.message}`);
     throw err;
   }
 }
 
 let win = null;
 function createWindow() {
+  const iconFile = path.join(__dirname, "lslink.png");   // rendered by the build from the tray icon
   win = new BrowserWindow({
     width: 1040, height: 720, minWidth: 880, minHeight: 600,
-    title: "TN-Link",
+    title: "LS-Link",
+    ...(require("fs").existsSync(iconFile) ? { icon: iconFile } : {}),
     backgroundColor: "#0f1115",
     autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, "preload.js"),
@@ -59,7 +61,7 @@ function createWindow() {
     if (level >= 2) console.error(`[page] ${message}`);
   });
   win.webContents.on("did-fail-load", (_e, code, desc) => {
-    console.error(`[tnlink] page failed to load: ${desc} (${code})`);
+    console.error(`[lslink] page failed to load: ${desc} (${code})`);
   });
   win.loadFile(path.join(__dirname, "index.html"));
   // Closing the WINDOW must not stop the service: the plant PC keeps the

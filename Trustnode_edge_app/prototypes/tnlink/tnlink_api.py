@@ -13,7 +13,7 @@ beside it.
 Safety, because this is a listening socket on a machine with a PLC behind
 it:
 
-  * 127.0.0.1 ONLY. Never 0.0.0.0 - the whole point of TN-Link is that
+  * 127.0.0.1 ONLY. Never 0.0.0.0 - the whole point of LS-Link is that
     nothing is exposed until an engineer pairs, and a convenience API
     bound to every interface would undo that in one line.
   * A token, minted per run, required on every call. Loopback is not a
