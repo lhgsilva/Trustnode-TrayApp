@@ -805,6 +805,33 @@ def local_subnets() -> list:
 # --------------------------------------------------------------------------
 # Transport: X25519 + PSK confirmation, then ChaCha20-Poly1305 per frame
 # --------------------------------------------------------------------------
+#: 2026-11-02, asked: "all the options in the prompting should be moved to
+#: action buttons so the user has control of everything". The console still
+#: asks with input(); under the tray/window - where nobody can type into a
+#: console - a command that needs a decision raises NeedChoice instead, the
+#: service returns it to the page, and the page shows the options as buttons.
+#: Picking one runs the same action again with the choice filled in.
+UI_CHOICES = False
+
+
+class NeedChoice(Exception):
+    """A command needs the operator to pick something first."""
+
+    def __init__(self, title: str, options: list, action: str = "",
+                 param: str = "value", note: str = "", text_input: dict | None = None):
+        super().__init__(title)
+        self.title = title
+        self.options = list(options or [])
+        self.action = action
+        self.param = param
+        self.note = note
+        self.text_input = dict(text_input or {})
+
+    def payload(self) -> dict:
+        return {"title": self.title, "options": self.options, "action": self.action,
+                "param": self.param, "note": self.note, "text_input": self.text_input}
+
+
 class AuthError(Exception):
     pass
 
@@ -2000,7 +2027,20 @@ class Client:
     def connect(self) -> None:
         relay = getattr(self, "relay", "")
         if relay:
-            s = relay_dial(relay, self.code, is_agent=False)
+            # 2026-11-02: the plant re-dials the relay right after a session
+            # ends (or, on a current build, right after it pairs), so for a
+            # few seconds the room may not exist yet. "No server is waiting"
+            # in that window is timing, not a wrong code - wait for it.
+            deadline = time.time() + 20.0
+            while True:
+                try:
+                    s = relay_dial(relay, self.code, is_agent=False)
+                    break
+                except AuthError as exc:
+                    if "is waiting" in str(exc) and time.time() < deadline:
+                        time.sleep(2.0)
+                        continue
+                    raise
         else:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(15.0)
@@ -2486,6 +2526,13 @@ class Client:
             print("  the plant PC reported no ordinary network to share")
             return
         if len(lans) > 1 and not arg:
+            if UI_CHOICES:
+                raise NeedChoice(
+                    "Which network should be shared?",
+                    [{"value": a["cidr"],
+                      "label": "%s  (%s)" % (a["cidr"], str(a.get("desc") or "")[:40])}
+                     for a in lans],
+                    action="share_bridge", param="subnet")
             print("  which network should be shared?")
             for a in lans:
                 print("    bridge %-18s (%s)"
@@ -2649,6 +2696,18 @@ class Client:
                 print()
                 print("  Type the device addresses to reach, comma separated")
                 print("  (e.g. the PLC), or press Enter to stop:")
+                if UI_CHOICES:
+                    try:
+                        self.sec.send(pack_ctrl({"op": "tunnel_down"}))
+                        self._await("tunnel_down", 60)
+                    except Exception:                       # noqa: BLE001
+                        pass
+                    raise NeedChoice(
+                        "Every offered network clashes with one this PC is already on",
+                        [], action="", param="",
+                        note="The whole range cannot be routed here. Press Find devices, "
+                             "then Connect the devices you need one by one - each keeps "
+                             "its real address.")
                 raw = input("  devices> ").strip()
                 wanted = [x.strip() for x in raw.split(",") if x.strip()]
                 if not wanted:
@@ -2874,6 +2933,15 @@ class Client:
                      ("%d ms" % d["rtt_ms"]) if d.get("rtt_ms") is not None else "",
                      ("  ports %s" % extra) if extra else ""))
         print()
+        if UI_CHOICES:
+            raise NeedChoice(
+                "Which computer should Remote Desktop open?",
+                [{"value": d["ip"],
+                  "label": "%s  %s%s" % (
+                      d["ip"], "controller" if 44818 in (d.get("ports") or []) else "device",
+                      ("  %d ms" % d["rtt_ms"]) if d.get("rtt_ms") is not None else "")}
+                 for d in found],
+                action="remote_desktop", param="ip")
         while True:
             pick = input("  which one (1-%d, or Enter to cancel)> " % len(found)).strip()
             if not pick:

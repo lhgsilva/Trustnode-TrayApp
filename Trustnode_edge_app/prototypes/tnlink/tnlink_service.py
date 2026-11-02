@@ -309,7 +309,16 @@ class LinkService:
                 except Exception as exc:                 # noqa: BLE001
                     self.error = "%s: %s" % (type(exc).__name__, exc)
                     unit = str(getattr(self, "_saved_unit", "") or "")
-                    if unit and self.role != "server" and isinstance(exc, tnlink.AuthError):
+                    msg = str(exc)
+                    refused = ("does not match" in msg or "code confirmation" in msg)
+                    if self.role != "server" and isinstance(exc, tnlink.AuthError) and not refused:
+                        # The relay answered, but not with a pairing: the plant
+                        # is not waiting (not running, or still re-dialling),
+                        # or someone else holds the room. Not a code problem -
+                        # the stored code stays.
+                        self.error = msg
+                        self._notify("TN-Link", msg)
+                    elif unit and self.role != "server" and isinstance(exc, tnlink.AuthError):
                         # 2026-11-02: a saved connection whose stored code the
                         # plant refused - it made a new code, or was
                         # reinstalled. Say so, and stop offering a code that
@@ -560,13 +569,13 @@ class LinkService:
             buf = _io.StringIO()
             tnlink_api.log(label)
             try:
-                # redirect_stdout is process-wide, so a line printed by the
-                # session thread during these few seconds lands in the log
-                # instead of the console. The console is hidden under the
-                # tray anyway, and the log is where the operator is
-                # looking, so nothing is lost either way.
                 with contextlib.redirect_stdout(buf):
                     fn(*a)
+            except tnlink.NeedChoice as ch:
+                # The command stopped to ask. The page shows the options as
+                # buttons and calls the action again with the answer.
+                tnlink_api.log(ch.title, "warn")
+                return {"choice": ch.payload()}
             finally:
                 for line in buf.getvalue().splitlines():
                     if line.strip():
@@ -592,7 +601,7 @@ class LinkService:
             app = _engineer()
             return _console("scanning the plant network ...", app.cmd_devices)
 
-        def remote_desktop():
+        def remote_desktop(ip=""):
             """Menu 3, and then actually open it.
 
             cmd_rdp forwards 3389 to a free local port and PRINTS where.
@@ -602,7 +611,9 @@ class LinkService:
             """
             app = _engineer()
             before = len(getattr(app, "maps", []) or [])
-            _console("forwarding Remote Desktop ...", app.cmd_rdp)
+            out = _console("forwarding Remote Desktop ...", app.cmd_rdp, str(ip or ""))
+            if isinstance(out, dict):
+                return out                  # it asked which computer; the page shows the options
             maps = getattr(app, "maps", []) or []
             if len(maps) <= before:
                 raise RuntimeError("the Remote Desktop forward was not set up")
@@ -638,10 +649,36 @@ class LinkService:
             return _console("sharing the whole plant network ...",
                             app.menu_share_network)
 
-        def share_bridge():
+        def share_bridge(subnet=""):
             """Menu 8. Layer 2, for broadcast browsing only."""
             app = _engineer()
-            return _console("sharing at Layer 2 ...", app.cmd_bridge, "")
+            out = _console("sharing at Layer 2 ...", app.cmd_bridge, str(subnet or ""))
+            if isinstance(out, dict) or not getattr(app, "tunnel", None):
+                return out
+            # The console asked "automatic or type one"; here: try automatic,
+            # and only if the network has no DHCP ask for an address.
+            _console("asking the network for an address ...", app.cmd_bridge_ip, "dhcp")
+            got = ""
+            try:
+                got = app.tunnel.address() if app.tunnel else ""
+            except Exception:
+                got = ""
+            if got:
+                return True
+            cidr = str(subnet or "")
+            example = "192.168.10.77/24"
+            if cidr and "/" in cidr:
+                example = "%s.77/%s" % (cidr.split("/")[0].rsplit(".", 1)[0], cidr.split("/")[1])
+            return {"choice": {"title": "No DHCP on that network - type an address for this PC",
+                               "options": [], "action": "bridge_address", "param": "address",
+                               "note": "", "text_input": {"placeholder": example, "label": "Use"}}}
+
+        def bridge_address(address=""):
+            app = _engineer()
+            spec = str(address or "").strip()
+            if not spec:
+                raise ValueError("type an address like 192.168.10.77/24")
+            return _console("setting %s ..." % spec, app.cmd_bridge_ip, spec)
 
         def stop_everything():
             """Menu 7. Everything this PC put up, taken back down."""
@@ -721,6 +758,7 @@ class LinkService:
             "what_is_set_up": what_is_set_up,
             "share_network": share_network,
             "share_bridge": share_bridge,
+            "bridge_address": bridge_address,
             "stop_everything": stop_everything,
             "disconnect_peer": disconnect_peer,
             "become_plant": become_plant,
@@ -737,8 +775,10 @@ class LinkService:
 
 def run_tray(role: str, args: Any) -> int:
     """Start the service and show the tray. Blocks until the operator quits."""
+    import tnlink
     import tnlink_tray
     svc = LinkService(role, args)
+    tnlink.UI_CHOICES = True        # prompts become buttons in the window
     # One API, consumed by the tray AND the window, so the two front ends
     # cannot tell the operator different stories about the same session.
     try:

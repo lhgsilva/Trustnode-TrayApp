@@ -120,6 +120,7 @@
       <div id="offline" class="banner" hidden>
         TN-Link is not running. Start it from the tray, then reopen this window.
       </div>
+      <div id="error" class="banner" hidden></div>
 
       <!-- One card for identity. "Start" and "This unit" said the same
            thing in two places; the role buttons live with the role. -->
@@ -192,6 +193,21 @@
           <div id="reach-empty" class="empty">
             Nothing connected yet. Pick a device below and press Connect.
           </div>
+        </div>
+      </div>
+
+      <!-- 2026-11-02: a command that needs a decision asks HERE, with
+           buttons, instead of printing a question into the log. -->
+      <div class="card" id="card-choice" hidden>
+        <h2 id="choice-title">Choose</h2>
+        <div class="sub" id="choice-note" hidden></div>
+        <table id="choice"><tbody></tbody></table>
+        <div class="row" id="choice-input-row" style="margin-top:8px" hidden>
+          <input id="choice-input" class="text mono" placeholder="">
+          <button class="primary sm" id="choice-input-btn">Use</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="sm" id="choice-cancel">Cancel</button>
         </div>
       </div>
 
@@ -281,7 +297,11 @@ async function run(name, body) {
   if (busy) { queued = [name, body]; note("queued " + name); return; }
   busy = true;
   document.body.style.cursor = "progress";
-  try { await link.run(name, body || {}); }
+  try {
+    const res = await link.run(name, body || {});
+    const ch = res && res.result && res.result.choice;
+    if (ch) showChoice(ch);
+  }
   catch (e) { note(String((e && e.message) || e), "error"); }
   finally {
     busy = false; document.body.style.cursor = "";
@@ -289,6 +309,52 @@ async function run(name, body) {
     if (q) { run(q[0], q[1]); } else { refresh(); }
   }
 }
+
+// A question from a command, answered with buttons rather than typed.
+let choice = null;
+function showChoice(ch) {
+  choice = ch;
+  const card = $("card-choice");
+  $("choice-title").textContent = ch.title || "Choose";
+  const noteEl = $("choice-note");
+  noteEl.textContent = ch.note || "";
+  noteEl.hidden = !ch.note;
+  const tb = document.querySelector("#choice tbody");
+  tb.innerHTML = "";
+  for (const o of (ch.options || [])) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.textContent = o.label || o.value;
+    const act = document.createElement("td");
+    const b = document.createElement("button");
+    b.className = "primary";
+    b.textContent = "Select";
+    b.onclick = () => {
+      hideChoice();
+      const body = {}; body[ch.param || "value"] = o.value;
+      run(ch.action, body);
+    };
+    act.appendChild(b);
+    tr.appendChild(td); tr.appendChild(act);
+    tb.appendChild(tr);
+  }
+  const ti = ch.text_input || null;
+  $("choice-input-row").hidden = !ti;
+  if (ti) {
+    $("choice-input").value = "";
+    $("choice-input").placeholder = ti.placeholder || "";
+    $("choice-input-btn").textContent = ti.label || "Use";
+    $("choice-input-btn").onclick = () => {
+      const v = $("choice-input").value.trim();
+      if (!v) return;
+      hideChoice();
+      const body = {}; body[ch.param || "value"] = v;
+      run(ch.action, body);
+    };
+  }
+  card.hidden = false;
+}
+function hideChoice() { choice = null; $("card-choice").hidden = true; }
 
 let notes = [];
 function note(text, kind) {
@@ -506,6 +572,11 @@ async function refresh() {
   $("dot").className = "dot " + (running ? (peers ? "on" : "wait") : "");
   $("subtitle").textContent = !s.role ? "choose what this PC is"
       : (peers ? "connected" : (running ? "waiting to pair" : "stopped"));
+  // 2026-11-02: a failed connect used to leave "stopped" and nothing else;
+  // the reason lived in the tray notification that a browser never sees.
+  const err = (!running && s.error) ? String(s.error) : "";
+  $("error").textContent = err;
+  $("error").hidden = !err;
   $("title").textContent = !s.role ? "TN-Link"
       : (plant ? "TN-Link - at the plant" : "TN-Link - engineer");
 
@@ -549,6 +620,7 @@ $("btn-plant").onclick    = () => run("become_plant");
 $("btn-engineer").onclick = () => run("become_engineer");
 $("btn-copy").onclick     = () => run("copy_code");
 $("btn-newcode").onclick  = () => run("new_code");
+$("choice-cancel").onclick = () => hideChoice();
 $("btn-stop").onclick     = () => run("stop_everything");
 $("btn-scan").onclick     = () => run("find_devices");
 $("btn-join").onclick     = () => run("connect_to", { code: $("join-code").value.trim() });
