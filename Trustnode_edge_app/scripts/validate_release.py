@@ -366,6 +366,17 @@ SOURCE_CHECKS = [
     # capped at 5 000 rows that switched to minutes past two hours; the
     # dashboard had no aggregation at all.
     ("a chart aggregates every N seconds, end to end", "test_chart_bucket_seconds.py"),
+    # 2026-11-02, from a customer edge the evening the minute rollup tick
+    # shipped: collection stalled ("no fresh sample in 90 s"), every API call
+    # timed out, a report stuck on "Generating...". The first rollup pass
+    # over months of 1 Hz history held the write lock chunk after chunk and
+    # nothing yielded - invisible on a small store. Measured: persist p50
+    # 0.15 s -> 1.35 s, max 5 s, on only 3 days of data.
+    ("the rollup yields to collection", "test_rollup_yields_to_collection.py"),
+    # 2026-11-02 review of the fix above: the first pass is bounded to a week,
+    # and the rollup/live merge read live only the TAIL - a chart over an
+    # older window started a week late. The head is read live too.
+    ("a window older than the rollup keeps its head", "test_rollup_floor_keeps_old_data.py"),
     # 2026-10-30, asked for directly: "every new installer can be installed
     # in existing computer with all fixes and updates". Boots the PACKAGED
     # backend on a copy of a real workspace with NO data-dir override - the

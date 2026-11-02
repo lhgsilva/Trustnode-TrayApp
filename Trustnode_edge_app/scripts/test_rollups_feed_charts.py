@@ -94,7 +94,14 @@ def main() -> int:
           len(before) >= 2 * 170 and all(r.get("source") != "historian_rollup" for r in before),
           "%d rows" % len(before))
 
+    # 2026-11-02 (later): a pass is bounded to a few seconds of lock time per
+    # call, so the first materialisation of a window takes several ticks.
     summary = retention_engine.run_once(reason="test", force=True)
+    for _ in range(40):
+        more = retention_engine.rollup_once(reason="test")
+        summary["rollups"].extend(more)
+        if not any(int(r.get("rows") or 0) > 0 for r in more):
+            break
     con = sqlite3.connect(os.environ["TRUSTNODE_APP_STORE_PATH"])
     n_min = con.execute("SELECT COUNT(*) FROM historian_rollup WHERE resolution_s=60").fetchone()[0]
     n_hour = con.execute("SELECT COUNT(*) FROM historian_rollup WHERE resolution_s=3600").fetchone()[0]
@@ -135,6 +142,7 @@ def main() -> int:
 
     # A second pass is idempotent and does not re-roll what is done.
     again = retention_engine.run_once(reason="test", force=True)
+    again["rollups"] = [r for r in again.get("rollups") or [] if int(r.get("rows") or 0) > 0]
     check("a second pass has nothing new to materialise",
           not any(int(r.get("rows") or 0) > 0 for r in (again.get("rollups") or [])
                   if r.get("tier") == "r60"),

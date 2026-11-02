@@ -634,7 +634,27 @@ export function ScheduledReportsManager({
   const shoutedRef = useRef("");
   const retryRef = useRef(null);
 
-  const refresh = async () => {
+  // 2026-11-02, from a customer edge: this ran from the 15 s timer, from the
+  // retry timers AND every 3 s while a row was pending - four requests each
+  // time, no guard - so calls piled up in the browser's six sockets and
+  // expired there: "did not answer in time" every 30 s on a backend that was
+  // storing every second and logged no slow request. One refresh at a time.
+  // Timers and retries share one in-flight refresh (coalesced). A user
+  // action (save, delete, run, regenerate, email) must see its own result,
+  // so it waits for any refresh in flight and then runs a fresh one - the
+  // review of 2026-11-02 found the plain guard dropped exactly those.
+  const refreshInFlightRef = useRef(null);
+  const refresh = () => {
+    if (refreshInFlightRef.current) return refreshInFlightRef.current;
+    const p = refreshNow().finally(() => { refreshInFlightRef.current = null; });
+    refreshInFlightRef.current = p;
+    return p;
+  };
+  const refreshFresh = async () => {
+    try { await (refreshInFlightRef.current || Promise.resolve()); } catch (_) { /* reported by that refresh */ }
+    return refresh();
+  };
+  const refreshNow = async () => {
     // 2026-10-30: these four were a Promise.all, so ONE failing request
     // threw away three good answers - the templates and the generated list
     // were already on screen and the banner still said "Reports could not
@@ -744,7 +764,7 @@ export function ScheduledReportsManager({
       const res = await saveScheduledReport(payload);
       const saved = res?.schedule;
       if (saved) loadSchedule(saved);
-      await refresh();
+      await refreshFresh();
       onNotify({ type: "success", message: "Schedule saved" });
     } catch (e) {
       onNotify({ type: "error", message: `Save failed: ${e?.message || e}` });
@@ -759,7 +779,7 @@ export function ScheduledReportsManager({
     try {
       await deleteScheduledReport(draft.id);
       handleNewSchedule();
-      await refresh();
+      await refreshFresh();
       onNotify({ type: "success", message: "Schedule deleted" });
     } catch (e) {
       onNotify({ type: "error", message: `Delete failed: ${e?.message || e}` });
@@ -775,7 +795,7 @@ export function ScheduledReportsManager({
     setBusy("run");
     try {
       const res = await runScheduledReport(draft.id, emailSettings, { force });
-      await refresh();
+      await refreshFresh();
       onNotify({
         type: "success",
         message: `Report generated. ${res?.email?.message ? `Email: ${res.email.message}` : ""}`,
@@ -802,15 +822,32 @@ export function ScheduledReportsManager({
   // and becomes "ready" (PDF on disk) or "failed" (with the reason). Its
   // data is kept with the record, so it can be previewed whatever the PDF
   // did, and the PDF can be rebuilt for the same window. While any row is
-  // pending the list refreshes every 3 s so the state lands on its own.
+  // pending the LIST (one request, never overlapping) is re-read every 5 s
+  // for up to ten minutes; after that the 15 s timer alone carries on. A row
+  // that stays pending longer than that belongs to a process that is gone,
+  // and the backend reports it as failed on its own.
   const [dataPreview, setDataPreview] = useState(null); // { target, data, source, loading, error }
   const anyPending = useMemo(
     () => (generated || []).some((g) => String(g?.render_state || "ready") === "pending"),
     [generated],
   );
+  const pendingPollInFlightRef = useRef(false);
   useEffect(() => {
     if (!anyPending) return undefined;
-    const t = setInterval(() => { refresh(); }, 3000);
+    const started = Date.now();
+    const t = setInterval(async () => {
+      if (Date.now() - started > 10 * 60 * 1000) { clearInterval(t); return; }
+      if (pendingPollInFlightRef.current) return;
+      pendingPollInFlightRef.current = true;
+      try {
+        const res = await listGeneratedReports({ limit: 200 });
+        setGenerated(Array.isArray(res?.generated) ? res.generated : []);
+      } catch (_) {
+        // the 15 s refresh reports failures; this poll only follows a state
+      } finally {
+        pendingPollInFlightRef.current = false;
+      }
+    }, 5000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [anyPending]);
@@ -827,7 +864,7 @@ export function ScheduledReportsManager({
     try {
       await regenerateGeneratedReport(g.id);
       onNotify({ type: "info", message: `Regenerating "${g.file_name || g.template_name || g.id}" - the row updates when the PDF lands.` });
-      await refresh();
+      await refreshFresh();
     } catch (e) {
       onNotify({ type: "error", message: `Regenerate failed: ${e?.message || e}` });
     }
@@ -887,7 +924,7 @@ export function ScheduledReportsManager({
       });
       if (res?.ok) onNotify({ type: "success", message: `Email sent: ${res.message || ""}` });
       else onNotify({ type: "error", message: `Email failed: ${res?.message || "Unknown error"}` });
-      await refresh();
+      await refreshFresh();
       setEmailDialog(null);
     } catch (e) {
       onNotify({ type: "error", message: `Email failed: ${e?.message || e}` });
@@ -898,7 +935,7 @@ export function ScheduledReportsManager({
     if (!window.confirm("Delete this generated report? The PDF file will be removed.")) return;
     try {
       await deleteGeneratedReport(g.id);
-      await refresh();
+      await refreshFresh();
     } catch (e) {
       onNotify({ type: "error", message: `Delete failed: ${e?.message || e}` });
     }

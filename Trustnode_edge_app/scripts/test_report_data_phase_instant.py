@@ -210,8 +210,10 @@ def main() -> int:
         t0 = time.perf_counter()
         path, n, _ = rr.render_template_to_pdf(tpl)
         render_s = time.perf_counter() - t0
-        check("a 2-chart/9-KPI/pie/table report renders in under 1.5 s with collection running",
-              render_s < 1.5 and n > 10000, "%.2fs, %d bytes" % (render_s, n))
+        # 2.5 s: measured 0.8-1.2 s here, 1.5 s while an installer build shared
+        # the CPU; the regression this guards was 7.0 s.
+        check("a 2-chart/9-KPI/pie/table report renders in under 2.5 s with collection running",
+              render_s < 2.5 and n > 10000, "%.2fs, %d bytes" % (render_s, n))
     finally:
         stop.set()
         th.join(timeout=2)

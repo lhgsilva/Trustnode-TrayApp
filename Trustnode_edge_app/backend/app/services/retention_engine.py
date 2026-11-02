@@ -74,8 +74,29 @@ RETENTION_TICK_S = _env_int("TRUSTNODE_RETENTION_TICK_S", 1800, 10, 86400)
 # minute of tail is nothing. Rollups tick on their own, short cadence;
 # pruning, backups and hygiene keep the long one.
 ROLLUP_TICK_S = _env_int("TRUSTNODE_ROLLUP_TICK_S", 60, 10, 3600)
+# 2026-11-02, from a customer edge the evening the minute tick shipped: the
+# FIRST pass over months of 1 Hz history ran chunk after chunk under
+# BEGIN IMMEDIATE with nothing yielding to the collection writer - the
+# gateway reported "no fresh sample in 90 s", every API call timed out and a
+# report sat on "Generating...". Invisible on a small store, where the whole
+# backfill takes seconds. Three rules now bound it:
+#   * at most this much chunk work per tick, then the lock is free again;
+ROLLUP_WORK_PER_TICK_S = _env_int("TRUSTNODE_ROLLUP_WORK_PER_TICK_S", 3, 1, 60)
+#   * a pause after every chunk at least as long as the chunk took, so the
+#     writer always gets in between two of them;
+# The pause is proportional to the hold: a 20 ms chunk pauses 50 ms, a 1 s
+# chunk pauses 1 s - the writer is never kept out longer than one chunk and
+# the lock's duty cycle stays at or under a half. (A flat 0.25 s floor made a
+# policy pass over days of 5-minute chunks take minutes of pure sleeping.)
+ROLLUP_CHUNK_PAUSE_S = 0.05
+#   * without a policy, history older than this is left raw - the charts read
+#     it live as they always did - so the backfill is a week, not the archive.
+NO_POLICY_BACKFILL_S = _env_int("TRUSTNODE_ROLLUP_BACKFILL_S", 7 * 86400, 3600, 365 * 86400)
 # Rollup reads one source chunk at a time so a single statement stays short.
-ROLLUP_CHUNK_S = _env_int("TRUSTNODE_RETENTION_ROLLUP_CHUNK_S", 3600, 60, 86400)
+# 2026-11-02 review: a one-hour chunk of a dense store (many tags at 1 Hz) can
+# hold BEGIN IMMEDIATE longer than the collection writer's busy timeout. Five
+# minutes bounds a single hold to a fraction of a second on any store seen so far.
+ROLLUP_CHUNK_S = _env_int("TRUSTNODE_RETENTION_ROLLUP_CHUNK_S", 300, 60, 86400)
 # Adaptive delete batch bounds. Start small; grow while batches stay fast.
 DELETE_BATCH_MIN = _env_int("TRUSTNODE_RETENTION_DELETE_MIN", 1000, 100, 100000)
 DELETE_BATCH_START = _env_int("TRUSTNODE_RETENTION_DELETE_START", 5000, 100, 200000)
@@ -1471,7 +1492,9 @@ class RetentionEngine:
                     self.rollup_once(reason="tick")
             except Exception as exc:                    # never let the thread die
                 log.warning("retention tick failed: %s", exc, exc_info=True)
-            if not self._sleep(ROLLUP_TICK_S):
+            # Honour a short RETENTION_TICK_S (tests, operators): never sleep
+            # past the next full pass.
+            if not self._sleep(min(ROLLUP_TICK_S, max(1.0, next_full - time.time()))):
                 break
         log.info("retention engine stopped")
 
@@ -1490,9 +1513,12 @@ class RetentionEngine:
             policy = self.store.get_active_policy()
             tiers = policy if policy is not None else NO_POLICY_ROLLUP_TIERS
             out: List[Dict[str, Any]] = []
-            deadline = time.time() + max(30, ROLLUP_TICK_S - 5)
+            # A few seconds of work per minute, never the whole minute: the
+            # writer must own the lock most of the time, whatever is behind.
+            deadline = time.time() + ROLLUP_WORK_PER_TICK_S
+            floor_ms = None if policy is not None else _now_ms() - NO_POLICY_BACKFILL_S * 1000
             for tenant in self.store.tenants():
-                out.extend(self._rollup_tenant(tiers, tenant, deadline, False))
+                out.extend(self._rollup_tenant(tiers, tenant, deadline, False, floor_ms=floor_ms))
                 if self._stop.is_set() or time.time() > deadline:
                     break
             return out
@@ -1594,10 +1620,12 @@ class RetentionEngine:
                 # readings stay exactly as they are.
                 tenants = self.store.tenants()
                 summary["tenants"] = tenants
-                deadline = started + 10 * 60
+                deadline = started + ROLLUP_WORK_PER_TICK_S
+                floor_ms = _now_ms() - NO_POLICY_BACKFILL_S * 1000
                 for tenant in tenants:
                     summary["rollups"].extend(
-                        self._rollup_tenant(NO_POLICY_ROLLUP_TIERS, tenant, deadline, dry_run))
+                        self._rollup_tenant(NO_POLICY_ROLLUP_TIERS, tenant, deadline, dry_run,
+                                            floor_ms=floor_ms))
                     if self._stop.is_set() or time.time() > deadline:
                         break
                 # Even with no policy we keep the WAL small and take config backups.
@@ -1730,7 +1758,8 @@ class RetentionEngine:
         return f"r{res_s}"
 
     def _rollup_tenant(self, policy: Dict[str, Any], tenant: str,
-                       deadline: float, dry_run: bool) -> List[Dict[str, Any]]:
+                       deadline: float, dry_run: bool,
+                       floor_ms: Optional[int] = None) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         tiers = policy.get("tiers") or []
         if not tiers:
@@ -1756,6 +1785,8 @@ class RetentionEngine:
                     start_ms = self._oldest_rollup_ms(tenant, src_res)
                 if start_ms is None:
                     continue
+                if floor_ms is not None and src_res is None and start_ms < floor_ms:
+                    start_ms = floor_ms     # a bounded first pass, not the archive
             # A bucket is only closed once it has ended plus the late-arrival grace.
             if src_res is None:
                 available_to = newest
@@ -1841,6 +1872,9 @@ class RetentionEngine:
                     last_status="ok", last_error=None,
                 )
                 conn.commit()
+                # Give the collection writer the lock before the next chunk:
+                # at least ROLLUP_CHUNK_PAUSE_S, and as long as this chunk held it.
+                time.sleep(max(ROLLUP_CHUNK_PAUSE_S, min(5.0, time.time() - t0)))
             except Exception as exc:
                 try:
                     conn.rollback()
@@ -1856,9 +1890,9 @@ class RetentionEngine:
                 conn.close()
             total_rows += rows
             cursor = chunk_end
-            took_ms = (time.time() - t0) * 1000.0
-            if took_ms > 1500:
-                time.sleep(min(2.0, took_ms / 1000.0))
+            # (the pause after each chunk is inside the try above - review
+            # 2026-11-02 found the older `took_ms > 1500` sleep still here,
+            # doubling every pause on a dense store)
         return total_rows, cursor
 
     # -- pruning ----------------------------------------------------------

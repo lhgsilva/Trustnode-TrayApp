@@ -195,10 +195,26 @@ def _retention_tag_stats() -> dict[str, Any]:
     }
 
 
+def _collection_writer_busy() -> bool:
+    """Is a gateway waiting to persist? The rollup steps aside while it is.
+
+    2026-11-02: the engine always had this hook and nothing ever supplied
+    it, so `_writer_busy()` was permanently False."""
+    try:
+        for w in list(getattr(plc_manager, "workers", {}).values()):
+            ex = getattr(w, "_persist_executor", None)
+            if ex is not None and ex._work_queue.qsize() > 0:
+                return True
+    except Exception:
+        return False
+    return False
+
+
 retention_engine = RetentionEngine(
     app_store._db_path,
     backup_dir_fn=app_store._get_backup_dir,
     boot_ready_fn=_retention_boot_ready,
+    writer_busy_fn=_collection_writer_busy,
     cloud_cursor_fn=app_store.cloud_forward_cursor_ms,
     tag_stats_fn=_retention_tag_stats,
 )

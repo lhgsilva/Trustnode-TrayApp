@@ -210,6 +210,49 @@ def main() -> int:
     check("the cloud copy gets the data snapshot beside the PDF",
           "upload_bytes_to_storage" in src and "snapshot_path" in src)
 
+    # ---- a render whose process died: never "Generating..." forever ------
+    # 2026-11-02, from a customer edge: the backend restarted mid-render, the
+    # row stayed pending, and the page - refreshing four endpoints every 3 s
+    # while anything was pending - flooded the browser's sockets until every
+    # call timed out, on a backend that was storing every second.
+    orphan = reports_store.insert_generated({
+        "template_id": tid, "template_name": "orphan", "triggered_by": "manual",
+        "file_path": "", "file_name": "", "file_bytes": 0, "file_sha256": "",
+        "meta": {"render_state": "pending"}})
+    n = reports_store.fail_orphaned_pending()
+    after = reports_store.get_generated(orphan["id"]) or {}
+    check("a report left pending by a dead process is failed at boot",
+          n >= 1 and after.get("render_state") == "failed" and "restarted" in str(after.get("render_error") or ""),
+          "%r" % {k: after.get(k) for k in ("render_state", "render_error")})
+    import sqlite3 as _sq
+    stale = reports_store.insert_generated({
+        "template_id": tid, "template_name": "stale", "triggered_by": "manual",
+        "file_path": "", "file_name": "", "file_bytes": 0, "file_sha256": "",
+        "meta": {"render_state": "pending"}})
+    _c = _sq.connect(os.environ["TRUSTNODE_APP_STORE_PATH"])
+    _c.execute("UPDATE generated_reports SET created_utc = ? WHERE id = ?",
+               (time.strftime("%Y-%m-%d %H:%M:%S.000", time.gmtime(time.time() - 2 * 3600)), stale["id"]))
+    _c.commit(); _c.close()
+    st = reports_store.get_generated(stale["id"]) or {}
+    check("  and a row pending for over an hour reads as failed", st.get("render_state") == "failed"
+          and "hour" in str(st.get("render_error") or ""), repr(st.get("render_state")))
+    fresh = reports_store.insert_generated({
+        "template_id": tid, "template_name": "fresh", "triggered_by": "manual",
+        "file_path": "", "file_name": "", "file_bytes": 0, "file_sha256": "",
+        "meta": {"render_state": "pending"}})
+    check("  while a fresh pending row is still pending",
+          (reports_store.get_generated(fresh["id"]) or {}).get("render_state") == "pending")
+    check("  the boot runs the cleanup",
+          "reports_store.fail_orphaned_pending()" in open(os.path.join(os.path.dirname(__file__), "..", "backend", "app", "main.py"), encoding="utf-8").read())
+    ui = open(os.path.join(os.path.dirname(__file__), "..", "frontend", "src", "components", "Reports",
+                           "ScheduledReportsManager.jsx"), encoding="utf-8").read()
+    check("the page never overlaps a refresh (timers coalesce; actions wait for a fresh one)",
+          "if (refreshInFlightRef.current) return refreshInFlightRef.current;" in ui
+          and "const refreshFresh = async () =>" in ui and ui.count("await refreshFresh();") >= 5)
+    check("  the pending poll is one request, not four, and bounded",
+          "const res = await listGeneratedReports({ limit: 200 });" in ui
+          and "10 * 60 * 1000" in ui and "setInterval(() => { refresh(); }, 3000)" not in ui)
+
     print()
     print("  %d passed, %d failed" % (len(PASS), len(FAIL)))
     for f in FAIL:

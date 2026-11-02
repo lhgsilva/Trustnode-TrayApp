@@ -10003,15 +10003,28 @@ class AppStore:
         # outage. When the rollup already reaches the end of the window there is
         # nothing to do at all.
         newest_agg = max((str(r.get("ts") or "") for r in out), default="")
+        oldest_agg = min((str(r.get("ts") or "") for r in out), default="")
         live_from = from_txt
+        live: list[dict[str, Any]] = []
         if newest_agg:
+            # 2026-11-02 review: the rollup may also start AFTER the window
+            # does - the first materialisation is bounded to the last week -
+            # so the head of the window is read live too, not only the tail.
+            if from_txt and oldest_agg and from_txt < oldest_agg:
+                live.extend(self.bucket_raw_historian_rows(
+                    bucket=bkt, from_utc=from_txt, to_utc=oldest_agg, gateway=gw_txt,
+                    tag=tag_txt, limit=lim, source=source_txt))
             if not to_txt or newest_agg >= to_txt:
-                return out[:lim]
-            live_from = max(from_txt, newest_agg) if from_txt else newest_agg
-        live = self.bucket_raw_historian_rows(
-            bucket=bkt, from_utc=live_from, to_utc=to_txt, gateway=gw_txt,
-            tag=tag_txt, limit=lim, source=source_txt,
-        )
+                if not live:
+                    return out[:lim]
+                live_from = ""
+            else:
+                live_from = max(from_txt, newest_agg) if from_txt else newest_agg
+        if live_from or not newest_agg:
+            live.extend(self.bucket_raw_historian_rows(
+                bucket=bkt, from_utc=live_from, to_utc=to_txt, gateway=gw_txt,
+                tag=tag_txt, limit=lim, source=source_txt,
+            ))
         if live:
             merged: dict[tuple, dict[str, Any]] = {}
             for row in out:

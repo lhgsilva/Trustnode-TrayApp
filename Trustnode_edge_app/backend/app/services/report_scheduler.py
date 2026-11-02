@@ -293,7 +293,9 @@ class ReportRunner:
             "schedule_name": schedule.get("name"),
             "triggered_by": triggered_by,
             "file_path": "",
-            "file_name": file_name or "",
+            # The planned destination may be a full path; the list shows a NAME
+            # (seen as "C:/Users/.../Job Fold..." on a customer's Generated list).
+            "file_name": os.path.basename(str(file_name or "")) or "",
             "file_bytes": 0,
             "file_sha256": "",
             "meta": {

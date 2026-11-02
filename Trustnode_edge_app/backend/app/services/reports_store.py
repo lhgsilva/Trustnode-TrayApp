@@ -962,6 +962,42 @@ class ReportsStore:
             self._mirror_async(rec)
         return full
 
+    #: A report that has been "pending" this long was abandoned by a process
+    #: that is gone; it is reported as failed so nothing waits on it.
+    PENDING_MAX_AGE_S = 3600
+
+    def fail_orphaned_pending(self, reason: str = "") -> int:
+        """Mark every report still "pending" as failed. Called at boot.
+
+        2026-11-02, from a customer edge: the backend was restarted while a
+        report was being generated. The row stayed "Generating..." forever -
+        nothing could finish it - and the page, which refreshes while any
+        row is pending, kept refreshing forever. Every state must have a
+        way out; this is the way out for a render whose process died.
+        """
+        why = reason or ("the edge restarted while this report was being generated - "
+                         "regenerate it")
+        n = 0
+        with self._write_lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT id, meta_json FROM generated_reports "
+                    "WHERE meta_json LIKE '%\"render_state\": \"pending\"%'").fetchall()
+                for r in rows:
+                    try:
+                        meta = json.loads(str(r["meta_json"] or "{}"))
+                    except Exception:
+                        meta = {}
+                    if str(meta.get("render_state") or "") != "pending":
+                        continue
+                    meta["render_state"] = "failed"
+                    meta["render_error"] = why
+                    conn.execute("UPDATE generated_reports SET meta_json = ? WHERE id = ?",
+                                 (json.dumps(meta, ensure_ascii=False), str(r["id"])))
+                    n += 1
+                conn.commit()
+        return n
+
     def get_generated_render_data(self, generated_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
         tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
         try:
@@ -1076,6 +1112,22 @@ class ReportsStore:
         return True
 
     @staticmethod
+    def _effective_state(meta: Any, created_utc: str) -> str:
+        """pending | ready | failed - and a pending row older than an hour is
+        "failed" (reported with its own reason), so no page polls it forever."""
+        st = str((meta or {}).get("render_state") or "ready")
+        if st != "pending":
+            return st
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            made = _dt.strptime(str(created_utc)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=_tz.utc)
+            if (_dt.now(_tz.utc) - made).total_seconds() > ReportsStore.PENDING_MAX_AGE_S:
+                return "failed-stale"
+        except Exception:
+            pass
+        return "pending"
+
+    @staticmethod
     def _row_to_generated(row: sqlite3.Row | None) -> dict[str, Any] | None:
         if not row:
             return None
@@ -1092,6 +1144,7 @@ class ReportsStore:
             storage_path = str(row["storage_path"] or "") or None
         except Exception:
             storage_path = None
+        _state = ReportsStore._effective_state(meta, str(row["created_utc"] or ""))
         return {
             "id": str(row["id"]),
             "tenant_id": str(row["tenant_id"] or "default"),
@@ -1108,8 +1161,10 @@ class ReportsStore:
             "created_utc": str(row["created_utc"] or ""),
             # A record written before 2026-11-02 has no state: it was only
             # ever written after a successful render, so it is "ready".
-            "render_state": str((meta or {}).get("render_state") or "ready"),
-            "render_error": str((meta or {}).get("render_error") or "") or None,
+            "render_state": _state.replace("failed-stale", "failed"),
+            "render_error": (str((meta or {}).get("render_error") or "") or None)
+                            if _state != "failed-stale"
+                            else "did not finish within an hour - regenerate it",
             "email_status": str(row["email_status"] or "") or None,
             "email_message": str(row["email_message"] or "") or None,
             "email_recipients": recipients,

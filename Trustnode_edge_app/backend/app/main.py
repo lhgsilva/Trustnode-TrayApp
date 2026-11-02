@@ -1118,6 +1118,15 @@ async def _deferred_startup() -> None:
             reports_store.migrate_from_bootstrap(bootstrap, tenant_id="default")
     except Exception:
         pass
+    # 2026-11-02: a report left "pending" by a process that is gone can never
+    # finish; say so, before anything starts polling for it.
+    try:
+        _orphans = reports_store.fail_orphaned_pending()
+        if _orphans:
+            print(f"[trustnode][boot] {_orphans} report(s) were still generating when the "
+                  f"edge last stopped - marked failed (regenerate them)", flush=True)
+    except Exception as exc:
+        print(f"[trustnode][boot] pending-report cleanup skipped: {exc!r}", flush=True)
     try:
         report_scheduler.start()
     except Exception:

@@ -511,3 +511,53 @@ state, previews the data without the PDF, and can regenerate the PDF for the
 same window. **The cloud is touched only when `_cloud_sync_possible()`** —
 then every state change is mirrored and the data snapshot rides along as a
 sidecar. `test_report_data_phase_instant.py`, `test_report_record_first.py`.
+
+## 11. A background job must never own the write lock — 2026-11-02, evening
+
+The rollup tick shipped at 17:35 and by the evening a customer edge showed
+"Gateway not collecting — no fresh sample in 90 s", every API call "did not
+answer in time", and a report stuck on "Generating…". The gate had passed
+twice that day. Cause: the engine's FIRST pass over the customer's months of
+1 Hz history ran chunk after chunk under `BEGIN IMMEDIATE`, the engine's
+`writer_busy_fn` hook had never been wired (so `_writer_busy()` was always
+False), and each minute's tick allowed 55 s of that. On the 544k-row dev
+store the whole backfill takes seconds, so nothing here could show it.
+
+Measured on 3 days of 1 Hz data with a live writer: persist p50 0.15 s →
+**1.35 s, max 5.0 s, six of nine writes over a second**. After the fix:
+max 0.25 s, p50 0.011 s. The rules now in `retention_engine.py`:
+`ROLLUP_WORK_PER_TICK_S` (3 s of chunk work per tick), a pause after every
+chunk at least as long as the chunk held the lock, the collection persist
+queue as the writer-busy signal (`state._collection_writer_busy`), and
+without a policy a first pass over the last week only
+(`NO_POLICY_BACKFILL_S`). `test_rollup_yields_to_collection.py`.
+
+The lesson for rule 0: **a change that scales with the size of the store
+has not been tested until it has run against a store the size of a
+customer's, with the writer running.** The gate's 10 minutes on this
+machine prove delivery here; they prove nothing about a backfill that
+takes hours there. Build the big store (`%TEMP%	n_backfill`, `tn_big`,
+`tn_cust` scripts in the session scratchpad) and measure the writer's
+persist time under the change before shipping it.
+
+### Same evening, the second half: the page was flooding itself
+
+The customer's Diagnostics page showed the gateway storing every second and
+the backend at 36% of a core — but the desktop **window** at 72% and the
+Logs full of "did not answer in time" with **no server-side `Slow request`
+line at all**. Requests were expiring in the browser, never reaching the
+edge. `refresh()` on the Reports page fires four requests and had no
+in-flight guard; a new effect called it every 3 s while any row was
+"pending"; and a row left pending by a backend restart mid-render had no
+way out — so the page refreshed four endpoints every 3 s, forever, into six
+sockets with 12 s timeouts.
+
+- A report pending when the process is gone is marked failed at boot
+  (`fail_orphaned_pending`), and a pending row older than an hour reads as
+  failed. Every state needs a way out.
+- The page runs one refresh at a time; the pending poll is ONE request,
+  every 5 s, for ten minutes at most.
+- **Read the Diagnostics page before the theory.** "Stored 1 s ago" and
+  "no slow request logged" ruled out the backend in one look; the UI
+  process CPU pointed at the page. The screenshot of the banner alone had
+  everyone looking at the wrong process for a day.
