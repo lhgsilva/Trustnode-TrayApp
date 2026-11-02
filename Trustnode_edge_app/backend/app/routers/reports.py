@@ -365,6 +365,122 @@ def get_generated(generated_id: str) -> dict[str, Any]:
     return {"ok": True, "generated": record}
 
 
+def _render_into_record(template: dict[str, Any], *, triggered_by: str,
+                        generated_id: str = "",
+                        window: tuple[str, str] | None = None,
+                        segments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Record first, PDF second - the same shape as a scheduled run.
+
+    With `generated_id` the existing record is regenerated in place: it goes
+    back to "pending", the PDF is rebuilt for the SAME window and segments
+    the record was made with, and the row returns to "ready" or "failed"."""
+    import time as _t
+    from app.services.report_renderer import build_render_snapshot, render_template_to_pdf
+    if generated_id:
+        record = reports_store.update_generated_render(
+            generated_id, render_state="pending") or {}
+    else:
+        record = reports_store.insert_generated({
+            "template_id": template.get("id"),
+            "template_name": template.get("name"),
+            "triggered_by": triggered_by,
+            "file_path": "", "file_name": "", "file_bytes": 0, "file_sha256": "",
+            "meta": {"window_from": str((window or ("", ""))[0] or ""),
+                     "window_to": str((window or ("", ""))[1] or ""),
+                     "segments": list(segments or [])[:200],
+                     "segment_count": len(segments or []),
+                     "trigger": triggered_by, "render_state": "pending"},
+        })
+    gid = str(record.get("id") or generated_id or "")
+    t0 = _t.perf_counter()
+    try:
+        path, byte_count, sha = render_template_to_pdf(template, window=window, segments=segments)
+    except Exception as exc:
+        return reports_store.update_generated_render(
+            gid, render_state="failed", render_error=f"Render failed: {exc}") or record
+    try:
+        snapshot = build_render_snapshot(template, window=window, segments=segments)
+    except Exception:
+        snapshot = None
+    return reports_store.update_generated_render(
+        gid, render_state="ready", render_seconds=_t.perf_counter() - t0,
+        file_path=str(path), file_name=path.name, file_bytes=byte_count,
+        file_sha256=sha, render_data=snapshot) or record
+
+
+def _record_window(record: dict[str, Any]) -> tuple[tuple[str, str] | None, list[dict[str, Any]]]:
+    meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+    w_from = str(meta.get("window_from") or "")
+    w_to = str(meta.get("window_to") or "")
+    segs = meta.get("segments") if isinstance(meta.get("segments"), list) else []
+    return ((w_from, w_to) if (w_from and w_to) else None), segs
+
+
+@router.get("/generated/{generated_id}/preview-data")
+def generated_preview_data(generated_id: str) -> dict[str, Any]:
+    """The report's own data - what was in it when it was generated - for
+    the HTML preview. Works with or without the PDF. Falls back to
+    re-reading the record's window from the historian when the record
+    predates snapshots."""
+    record = reports_store.get_generated(generated_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Report not found")
+    data = reports_store.get_generated_render_data(generated_id)
+    source = "snapshot"
+    if data is None:
+        template = reports_store.get_template(str(record.get("template_id") or ""))
+        if not template:
+            raise HTTPException(status_code=410, detail=(
+                "This report has no stored data and its template no longer exists."))
+        window, segs = _record_window(record)
+        try:
+            from app.services.report_renderer import build_render_snapshot
+            data = build_render_snapshot(template, window=window, segments=segs)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Preview build failed: {exc}")
+        source = "historian"
+    return {"ok": True, "generated_id": generated_id, "source": source,
+            "render_state": record.get("render_state"), "data": data}
+
+
+@router.post("/generated/{generated_id}/regenerate")
+def regenerate_generated(generated_id: str) -> dict[str, Any]:
+    """Rebuild this report's PDF for the window it was generated with. Runs
+    in the background; the row shows "pending" until it lands."""
+    record = reports_store.get_generated(generated_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Report not found")
+    template = reports_store.get_template(str(record.get("template_id") or ""))
+    if not template:
+        raise HTTPException(status_code=410, detail="The template this report was made from no longer exists.")
+    window, segs = _record_window(record)
+    tenant = get_current_tenant()
+    job_id = _uuid_rpt.uuid4().hex[:12]
+    job = {"state": "running", "started": _time_rpt.time(),
+           "started_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")}
+
+    def _work():
+        from app.tenant import set_current_tenant
+        set_current_tenant(tenant)
+        try:
+            rec = _render_into_record(template, triggered_by=str(record.get("triggered_by") or "manual"),
+                                      generated_id=generated_id, window=window, segments=segs)
+            if rec.get("render_state") == "ready":
+                job["result"] = {"generated": rec}
+                job["state"] = "done"
+            else:
+                job["error"] = str(rec.get("render_error") or "Render failed")
+                job["state"] = "error"
+        except Exception as exc:                            # noqa: BLE001
+            job["error"] = "%s: %s" % (type(exc).__name__, exc)
+            job["state"] = "error"
+
+    with _JOBS_LOCK:
+        _JOBS[job_id] = job
+    _threading_rpt.Thread(target=_work, name="tn-report-regen-%s" % job_id, daemon=True).start()
+    return {"ok": True, "job_id": job_id, "state": "running", "generated_id": generated_id}
+
+
 @router.get("/generated/{generated_id}/file")
 def download_generated(generated_id: str, inline: bool = Query(default=False)) -> Response:
     record = reports_store.get_generated(generated_id)
@@ -372,6 +488,12 @@ def download_generated(generated_id: str, inline: bool = Query(default=False)) -
         raise HTTPException(status_code=404, detail="Report not found")
     path = Path(record.get("file_path") or "")
     disposition = "inline" if inline else "attachment"
+    state = str(record.get("render_state") or "ready")
+    if state == "pending" and not (record.get("file_path") and path.exists()):
+        raise HTTPException(status_code=409, detail="This report is still being generated - its data can be previewed now; the PDF follows.")
+    if state == "failed" and not (record.get("file_path") and path.exists()):
+        raise HTTPException(status_code=409, detail="Generating this report's PDF failed: %s. Preview its data, or regenerate it."
+                            % (record.get("render_error") or "unknown error"))
     if not path.exists():
         # Same rule as the Lite route: a cloud/web deployment never has the
         # edge's filesystem, so "not on disk" is its normal state. Serve the
@@ -620,20 +742,9 @@ def generate_template(template_id: str) -> dict[str, Any]:
     template = reports_store.get_template(template_id)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
-    try:
-        from app.services.report_renderer import render_template_to_pdf
-        path, byte_count, sha = render_template_to_pdf(template)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Render failed: {exc}")
-    record = reports_store.insert_generated({
-        "template_id": template.get("id"),
-        "template_name": template.get("name"),
-        "triggered_by": "dashboard-manual",
-        "file_path": str(path),
-        "file_name": path.name,
-        "file_bytes": byte_count,
-        "file_sha256": sha,
-    })
+    record = _render_into_record(template, triggered_by="dashboard-manual")
+    if record.get("render_state") == "failed":
+        raise HTTPException(status_code=500, detail=f"Render failed: {record.get('render_error')}")
     return {"ok": True, "generated": record}
 
 
@@ -649,20 +760,9 @@ def render_inline(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="template payload is required")
     if not template.get("id"):
         template["id"] = "preview"
-    try:
-        from app.services.report_renderer import render_template_to_pdf
-        path, byte_count, sha = render_template_to_pdf(template)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Render failed: {exc}")
-    record = reports_store.insert_generated({
-        "template_id": template.get("id"),
-        "template_name": template.get("name"),
-        "triggered_by": "manual",
-        "file_path": str(path),
-        "file_name": path.name,
-        "file_bytes": byte_count,
-        "file_sha256": sha,
-    })
+    record = _render_into_record(template, triggered_by="manual")
+    if record.get("render_state") == "failed":
+        raise HTTPException(status_code=500, detail=f"Render failed: {record.get('render_error')}")
     return {"ok": True, "generated": record}
 
 

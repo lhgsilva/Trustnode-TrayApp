@@ -30,6 +30,8 @@ _DEFAULT_BUCKET = "lite-reports"
 #: link, never the report's existence. The thread keeps running after a
 #: timeout; the storage_path is then attached by the poller's backfill.
 _UPLOAD_JOIN_TIMEOUT_S = 90.0
+#: A data snapshot larger than this stays local only (Lite previews the PDF).
+_SNAPSHOT_MIRROR_MAX_BYTES = 2 * 1024 * 1024
 _UPLOAD_TIMEOUT = 30.0
 _DB_TIMEOUT = 15.0
 
@@ -89,6 +91,38 @@ def upload_pdf_to_storage(
         log.warning("Lite storage upload failed: %s %s", resp.status_code, resp.text[:200])
     except Exception as exc:
         log.warning("Lite storage upload error: %s", exc)
+    return None
+
+
+def upload_bytes_to_storage(
+    data: bytes,
+    *,
+    tenant_id: str,
+    generated_id: str,
+    file_name: str,
+    content_type: str = "application/json",
+) -> str | None:
+    """Same bucket and path rule as the PDF, for a sidecar such as the
+    report's data snapshot. Best-effort, like the PDF upload."""
+    cfg = _supabase_cfg()
+    if not cfg or not data:
+        return None
+    url, key, bucket = cfg
+    object_key = _storage_object_path(tenant_id, generated_id, file_name)
+    endpoint = f"{url}/storage/v1/object/{bucket}/{object_key}"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "apikey": key,
+        "Content-Type": content_type,
+        "x-upsert": "true",
+    }
+    try:
+        resp = requests.post(endpoint, headers=headers, data=data, timeout=_UPLOAD_TIMEOUT)
+        if resp.status_code in (200, 201):
+            return object_key
+        log.warning("Lite storage sidecar upload failed: %s %s", resp.status_code, resp.text[:200])
+    except Exception as exc:
+        log.warning("Lite storage sidecar upload error: %s", exc)
     return None
 
 
@@ -243,6 +277,25 @@ def upload_and_mirror(record: dict[str, Any]) -> str | None:
     result: dict[str, Any] = {"storage_path": None}
 
     def _upload() -> None:
+        # 2026-11-02: the data snapshot goes up as a sidecar so Lite can
+        # preview the report's numbers from the cloud copy alone. Written
+        # into meta.snapshot_path before the final metadata upsert below.
+        snap = record.get("render_data_json")
+        if isinstance(snap, str) and snap and len(snap) <= _SNAPSHOT_MIRROR_MAX_BYTES:
+            try:
+                sp = upload_bytes_to_storage(
+                    snap.encode("utf-8"),
+                    tenant_id=str(record.get("tenant_id") or "default"),
+                    generated_id=str(record.get("id") or ""),
+                    file_name="data.json",
+                )
+                if sp:
+                    meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+                    meta = dict(meta)
+                    meta["snapshot_path"] = sp
+                    record["meta"] = meta
+            except Exception:
+                pass
         if not file_path:
             return
         try:
@@ -253,7 +306,6 @@ def upload_and_mirror(record: dict[str, Any]) -> str | None:
                 file_name=str(record.get("file_name") or "report.pdf"),
             )
         except Exception:
-            # A storage outage must never cost us the metadata below.
             result["storage_path"] = None
 
     worker = threading.Thread(target=_upload, name="tn-report-upload", daemon=True)

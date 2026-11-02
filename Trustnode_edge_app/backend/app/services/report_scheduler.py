@@ -279,25 +279,11 @@ class ReportRunner:
                 "ok": False,
                 "error": f"Template {template_id!r} not found",
             }
-        try:
-            # A cycle report covers the window between its start and stop
-            # conditions, and is named from the identifier captured at the
-            # start. Both are optional: without them this renders exactly as
-            # before.
-            # 2026-10-31. Measured against a copy of a real 349 MB workspace,
-            # the slowest of ten templates renders in 3.49s - so a run that
-            # reports "Timed out after 60s" is not a slow render, and the
-            # time is going somewhere else. Each phase is timed and the slow
-            # one is named, because "the report took a minute" is not a
-            # finding; "the record write took 58s of it" is.
-            _t_render = _time_rs.perf_counter()
-            path, byte_count, sha = self.render(
-                template, window=window, segments=segments,
-                file_name=_cycle_file_name(schedule, template, window, report_id))
-            _render_s = _time_rs.perf_counter() - _t_render
-        except Exception as exc:
-            return {"ok": False, "error": f"PDF render failed: {exc}"}
-
+        # 2026-11-02: the record FIRST. It is on the Generated Reports list
+        # (and in the cloud, when there is one) before a single byte of PDF
+        # exists, with the window it covers; the render then fills in the
+        # file - or the failure, which used to leave no trace at all.
+        file_name = _cycle_file_name(schedule, template, window, report_id)
         _t_store = _time_rs.perf_counter()
         record = self.store.insert_generated({
             "tenant_id": tenant_id,
@@ -306,30 +292,50 @@ class ReportRunner:
             "schedule_id": schedule.get("id"),
             "schedule_name": schedule.get("name"),
             "triggered_by": triggered_by,
-            "file_path": str(path),
-            "file_name": path.name,
-            "file_bytes": byte_count,
-            "file_sha256": sha,
-            # 2026-10-13: the window is what makes a report REGENERABLE.
-            # This was `{}`, so the mirrored cloud row recorded which
-            # template ran but not over what period - regenerating from it
-            # would silently use the template's default range instead of the
-            # run's actual one, producing a different report under the same
-            # name.
+            "file_path": "",
+            "file_name": file_name or "",
+            "file_bytes": 0,
+            "file_sha256": "",
             "meta": {
                 "window_from": str((window or ("", ""))[0] or ""),
                 "window_to": str((window or ("", ""))[1] or ""),
+                "segments": list(segments or [])[:200],
                 "segment_count": len(segments or []),
                 "report_id": str(report_id or ""),
                 "trigger": str(triggered_by or ""),
-                # Operator-defined columns, resolved against THIS run's
-                # window. Stored because the tag they read has moved on by
-                # the time anyone looks at the list.
                 "columns": _resolve_report_columns(schedule, window),
+                "render_state": "pending",
             },
         })
-
         _store_s = _time_rs.perf_counter() - _t_store
+        gid = str(record.get("id") or "")
+
+        try:
+            _t_render = _time_rs.perf_counter()
+            path, byte_count, sha = self.render(
+                template, window=window, segments=segments, file_name=file_name)
+            _render_s = _time_rs.perf_counter() - _t_render
+        except Exception as exc:
+            try:
+                record = self.store.update_generated_render(
+                    gid, tenant_id=tenant_id, render_state="failed",
+                    render_error=f"PDF render failed: {exc}") or record
+            except Exception:
+                pass
+            return {"ok": False, "error": f"PDF render failed: {exc}", "generated": record}
+
+        snapshot = None
+        try:
+            from app.services.report_renderer import build_render_snapshot
+            snapshot = build_render_snapshot(template, window=window, segments=segments)
+        except Exception:
+            snapshot = None
+        _t_store2 = _time_rs.perf_counter()
+        record = self.store.update_generated_render(
+            gid, tenant_id=tenant_id, render_state="ready",
+            render_seconds=_render_s, file_path=str(path), file_name=path.name,
+            file_bytes=byte_count, file_sha256=sha, render_data=snapshot) or record
+        _store_s += _time_rs.perf_counter() - _t_store2
         if (_render_s + _store_s) >= 5.0:
             try:
                 _note = ("Report %r took %.1fs: %.1fs rendering, %.1fs writing "

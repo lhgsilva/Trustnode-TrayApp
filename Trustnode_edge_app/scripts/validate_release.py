@@ -347,6 +347,16 @@ SOURCE_CHECKS = [
     # chart bucketed raw on every refresh, 2.2 s a call, ~10 s with seven
     # widgets, and over a tunnel the edge looked dead.
     ("charts read rollups that exist without a policy", "test_rollups_feed_charts.py"),
+    # 2026-11-02: a 4-6 page customer report took 5-10 minutes. KPIs and
+    # pies aggregated raw rows on the writer handle, an empty cell scanned
+    # the whole historian unscoped, app_settings was re-read 200x per render
+    # under the global lock, chart tags were LIKE-matched, and ReportLab got
+    # one shape per segment. Customer-shaped store: 7.0 s -> 0.8 s.
+    ("the report data phase is instant", "test_report_data_phase_instant.py"),
+    # 2026-11-02, asked for: the report exists the moment its run starts -
+    # pending, then ready or failed with the reason - with its data stored
+    # for preview and regenerate, mirrored only when a cloud is configured.
+    ("a generated report exists before its PDF", "test_report_record_first.py"),
     # 2026-10-30, asked for directly: "every new installer can be installed
     # in existing computer with all fixes and updates". Boots the PACKAGED
     # backend on a copy of a real workspace with NO data-dir override - the

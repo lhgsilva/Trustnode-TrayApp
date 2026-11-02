@@ -82,6 +82,7 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
+from reportlab.graphics.shapes import PolyLine  # noqa: E402  (2026-11-02)
 from reportlab.graphics.shapes import (
     Circle, Drawing, Group, Line, Rect, String)
 from reportlab.pdfbase.pdfmetrics import stringWidth
@@ -1076,6 +1077,29 @@ def _resolve_company_logo_path() -> Path | None:
     return None
 
 
+_LOGO_READERS: dict[tuple[str, float], Any] = {}
+
+
+def _logo_reader(path: Path):
+    """One ImageReader per logo file, reused across pages and renders.
+
+    2026-11-02, profiled: the company logo was opened, decoded and SHA-hashed
+    on EVERY page - 0.76 s of a 7 s render for seven pages. ImageReader
+    caches the decoded pixels on the instance, so reusing it makes the
+    header free. Keyed on mtime so a replaced logo shows up."""
+    from reportlab.lib.utils import ImageReader
+    try:
+        key = (str(path), float(path.stat().st_mtime))
+    except Exception:
+        return ImageReader(str(path))
+    reader = _LOGO_READERS.get(key)
+    if reader is None:
+        reader = ImageReader(str(path))
+        _LOGO_READERS.clear()
+        _LOGO_READERS[key] = reader
+    return reader
+
+
 def _on_page(canvas, doc, *, branding_title: str = "TrustNode") -> None:
     canvas.saveState()
     from reportlab.lib.utils import ImageReader
@@ -1087,10 +1111,28 @@ def _on_page(canvas, doc, *, branding_title: str = "TrustNode") -> None:
     # When set, it sits in the same row as the TrustNode brand logo on the
     # right, mirroring the layout. Operators can replace it without
     # touching the bundled brand asset.
+    # 2026-11-02, profiled: canvas.drawImage re-encodes and hashes the image
+    # on every page (0.66 s of a 2.5 s render for nine pages). Draw each
+    # logo ONCE into a PDF form on this canvas and stamp the form afterwards.
+    def _draw_image_once(reader, name: str, x: float, y: float, w: float, h: float) -> None:
+        forms = getattr(canvas, "_tn_logo_forms", None)
+        if forms is None:
+            forms = canvas._tn_logo_forms = {}
+        key = (name, round(x, 2), round(y, 2), round(w, 2), round(h, 2))
+        form_name = forms.get(key)
+        if form_name is None:
+            form_name = "tn_%s_%d" % (name, len(forms))
+            canvas.beginForm(form_name)
+            canvas.drawImage(reader, x, y, width=w, height=h, mask="auto",
+                             preserveAspectRatio=True)
+            canvas.endForm()
+            forms[key] = form_name
+        canvas.doForm(form_name)
+
     company_logo_path = _resolve_company_logo_path()
     if company_logo_path is not None:
         try:
-            reader = ImageReader(str(company_logo_path))
+            reader = _logo_reader(company_logo_path)
             iw, ih = reader.getSize()
             aspect = float(iw) / float(ih) if ih else 1.0
             logo_h = logo_h_mm * mm
@@ -1099,15 +1141,8 @@ def _on_page(canvas, doc, *, branding_title: str = "TrustNode") -> None:
             if logo_w > max_w:
                 logo_w = max_w
                 logo_h = logo_w / aspect if aspect else logo_h
-            canvas.drawImage(
-                reader,
-                15 * mm,
-                A4[1] - logo_top_mm * mm - logo_h,
-                width=logo_w,
-                height=logo_h,
-                mask="auto",
-                preserveAspectRatio=True,
-            )
+            _draw_image_once(reader, "company", 15 * mm,
+                             A4[1] - logo_top_mm * mm - logo_h, logo_w, logo_h)
         except Exception:
             # Bad image; leave the left side empty so we still publish.
             pass
@@ -1118,7 +1153,7 @@ def _on_page(canvas, doc, *, branding_title: str = "TrustNode") -> None:
     drew_logo = False
     if logo_path is not None:
         try:
-            reader = ImageReader(str(logo_path))
+            reader = _logo_reader(logo_path)
             iw, ih = reader.getSize()
             aspect = float(iw) / float(ih) if ih else 1.0
             logo_h = logo_h_mm * mm
@@ -1128,15 +1163,8 @@ def _on_page(canvas, doc, *, branding_title: str = "TrustNode") -> None:
             if logo_w > max_w:
                 logo_w = max_w
                 logo_h = logo_w / aspect if aspect else logo_h
-            canvas.drawImage(
-                reader,
-                A4[0] - 15 * mm - logo_w,
-                A4[1] - logo_top_mm * mm - logo_h,
-                width=logo_w,
-                height=logo_h,
-                mask="auto",
-                preserveAspectRatio=True,
-            )
+            _draw_image_once(reader, "brand", A4[0] - 15 * mm - logo_w,
+                             A4[1] - logo_top_mm * mm - logo_h, logo_w, logo_h)
             drew_logo = True
         except Exception:
             # Logo failed to decode for some reason; fall through to text.
@@ -1969,6 +1997,9 @@ def _interpolate(coords: list[tuple[float, float]], mode: str) -> list[tuple[flo
     return out
 
 
+_DRAW_POINT_CAP = 1500
+
+
 def _thin_evenly(points: list, cap: Any) -> list:
     """At most `cap` points, spread across the whole list.
 
@@ -2060,6 +2091,11 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
     _fetch_section.pop("readings_count", None)
     series_meta, aligned = _fetch_multi_series(_fetch_section, default_limit=5000)
     aligned = [_thin_evenly(pts, _cap) for pts in aligned]
+    # 2026-11-02: a chart is ~450 pt wide, so beyond ~3 points per printer
+    # point the extra segments cannot be seen - they only cost drawing time.
+    # Thinned evenly, first and last reading kept, after the operator's own
+    # cap so a smaller cap still wins.
+    aligned = [_thin_evenly(pts, _DRAW_POINT_CAP) for pts in aligned]
     if not series_meta or all(not pts for pts in aligned):
         # 2026-10-11, reported: "the chart for some reason was not printed in
         # the pdf for not enough data". One message covered four different
@@ -2463,10 +2499,17 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
                 except Exception:
                     pass
                 drawing.add(Polygon(pgon_pts, fillColor=fill, strokeColor=None))
-            for i in range(1, len(coords)):
-                x0, y0 = coords[i - 1]
-                x1, y1 = coords[i]
-                drawing.add(Line(x0, y0, x1, y1, strokeColor=stroke_color, strokeWidth=lw))
+            # 2026-11-02, profiled: one Line shape PER SEGMENT - 28 000 shapes
+            # and 360 000 attribute validations for a four-chart report, the
+            # largest single cost left once the data phase was fixed. A
+            # PolyLine draws the same straight segments as one path.
+            if len(coords) >= 2:
+                flat: list[float] = []
+                for cx, cy in coords:
+                    flat.append(cx)
+                    flat.append(cy)
+                drawing.add(PolyLine(flat, strokeColor=stroke_color, strokeWidth=lw,
+                                     strokeLineJoin=1, strokeLineCap=1))
 
     # Axes tick labels (left + right). _format_tick and fmt are defined
     # with the geometry above, because the tick gutter is measured from the
@@ -4708,6 +4751,25 @@ def unique_output_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         n += 1
+
+
+def build_render_snapshot(template: dict[str, Any],
+                          window: tuple[str, str] | None = None,
+                          segments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """The section DATA of one generation - KPI values, series points, table
+    rows, pie slices - as the JSON the HTML preview renders.
+
+    2026-11-02: stored with the generated record, so a report can be
+    previewed (here, over the LAN, or in Lite from the cloud copy) whether
+    or not its PDF exists yet, and regenerated later from the same window.
+    Same overrides as render_template_to_pdf, so it is the same report.
+    """
+    if window and window[0] and window[1]:
+        template = apply_window_override(template, window[0], window[1],
+                                         segments=segments)
+    template = apply_section_triggers(template)
+    template = apply_text_tokens(template)
+    return build_template_render_data(template)
 
 
 def render_template_to_pdf(

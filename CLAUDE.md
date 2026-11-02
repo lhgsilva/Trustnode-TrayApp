@@ -472,3 +472,42 @@ over a tunnel "the edge did not answer in time". Rollups now run with or
 without a policy (nothing is deleted) and `get_historian_agg_rows` reads
 `historian_rollup`, bucketing raw only for the tail the rollup has not
 reached. `test_rollups_feed_charts.py`.
+
+## 10. The report engine — why a 6-page report took ten minutes — 2026-11-02
+
+Measured on a customer-shaped store (2.07M rows, 24 tags at 1 Hz, collection
+writing every 500 ms), a 4–6 page template with four 3-series charts, eight
+KPIs, a pie and two telemetry tables: **7.0 s → 0.8 s**. At the real customer
+(8.5M rows/day, more days, slower disk) the same code took 5–10 minutes.
+None of it was "the PDF is big". Each cause scaled with the historian or with
+collection load, which is why it never showed on a bench:
+
+- **KPIs and pies aggregated raw rows for the whole window on the WRITER
+  connection** (10 s timeout, queued behind collection) — 0.28 s per cell
+  here, seconds at the customer. Now `_rollup_window_stats()` takes whole
+  minutes from `historian_rollup` (exact: n/sum/min/max) and reads only the
+  two edges raw, on `_connect_readonly()`.
+- **An empty cell retried UNSCOPED** — no tenant, no usable index, a
+  `SCAN historian_readings` per cell, and a cross-scope read. On an edge
+  with an identity the retry is gone (`_current_tenant_id() == "default"`
+  gates it in the three readers).
+- **`_get_app_settings()` was called 200× per render**, each a SELECT under
+  the global `app_store._lock` on the writer handle. Cached 5 s, dropped on
+  save; `_prefer_cloud_reads` goes through it.
+- **Chart tags were matched with `LIKE '%tag%'`** — the tag index unused,
+  every bucket of the window scanned per series. Exact first; the substring
+  match only when the exact name has no rows.
+- **ReportLab drew one `Line` shape per segment** (28 000 shapes, 360 000
+  attribute validations). One `PolyLine` per series, and a draw cap of 1 500
+  points a reader cannot see.
+- **The logo was re-encoded and hashed on every page.** One PDF form per logo.
+- Rollups now tick every 60 s (`ROLLUP_TICK_S`), so the raw tail is a minute.
+
+**A generated report exists from the moment its run starts.** Asked for
+directly: the row is inserted first (`meta.render_state = "pending"`), the
+section DATA is stored with it (`render_data_json`), and it becomes `ready`
+(file filled in) or `failed` (reason kept) — never absent. The list shows the
+state, previews the data without the PDF, and can regenerate the PDF for the
+same window. **The cloud is touched only when `_cloud_sync_possible()`** —
+then every state change is mirrored and the data snapshot rides along as a
+sidecar. `test_report_data_phase_instant.py`, `test_report_record_first.py`.

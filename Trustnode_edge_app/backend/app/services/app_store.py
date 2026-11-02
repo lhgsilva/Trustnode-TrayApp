@@ -739,7 +739,10 @@ class AppStore:
         if env_value in {"0", "false", "no", "off"}:
             return False
         try:
-            settings = self.get_config_domain("app_settings")
+            # 2026-11-02: this went through get_config_domain - the global
+            # lock and the writer handle - 47 times in one report render.
+            # The cached read is the same document.
+            settings = self._get_app_settings()
             endpoint_mode = str((settings or {}).get("endpoint_mode") or "").strip().lower()
             if endpoint_mode == "cloud":
                 return True
@@ -2667,20 +2670,34 @@ class AppStore:
             "circuit_open_seconds_remaining": max(0.0, self._customer_read_circuit_open_until_mono - time.monotonic()),
         }
 
+    _APP_SETTINGS_CACHE_TTL_S = 5.0
+
     def _get_app_settings(self) -> Dict[str, Any]:
-        with self._lock:
-            with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT payload_json FROM config_documents WHERE domain = ?",
-                    ("app_settings",),
-                ).fetchone()
-        if not row:
-            return {}
-        try:
-            payload = json.loads(str(row["payload_json"] or "{}"))
-            return payload if isinstance(payload, dict) else {}
-        except Exception:
-            return {}
+        # 2026-11-02, measured on a customer-shaped store: ONE report render
+        # called this 200 times - every historian read asks "prefer cloud?",
+        # "customer DB target?", "cloud sync possible?" and each answer was a
+        # fresh SELECT under the GLOBAL lock on the WRITER handle. Under
+        # collection load that lock is what everything waits on, so the cost
+        # scaled with load, not with the report. Cached for 5 s; a save of
+        # app_settings drops the cache at once.
+        cached = getattr(self, "_app_settings_cache", None)
+        now = time.time()
+        if cached is not None and (now - cached[0]) < self._APP_SETTINGS_CACHE_TTL_S:
+            return cached[1]
+        with self._connect_readonly() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM config_documents WHERE domain = ?",
+                ("app_settings",),
+            ).fetchone()
+        payload: Dict[str, Any] = {}
+        if row:
+            try:
+                loaded = json.loads(str(row["payload_json"] or "{}"))
+                payload = loaded if isinstance(loaded, dict) else {}
+            except Exception:
+                payload = {}
+        self._app_settings_cache = (now, payload)
+        return payload
 
     def _is_cloud_auto_sync_enabled(self) -> bool:
         """Does the operator WANT cloud sync? Intent only - see below."""
@@ -7863,6 +7880,7 @@ class AppStore:
                     payload_to_store = self._normalize_database_configurations_payload(payload_to_store, prev_payload)
                 elif domain_name == "app_settings":
                     payload_to_store = self._normalize_app_settings_payload(payload_to_store, prev_payload_obj)
+                    self._app_settings_cache = None      # readers see this save at once
                 elif domain_name in {
                     "metadata",
                     "devices",
@@ -8900,6 +8918,111 @@ class AppStore:
         except Exception:
             return []
 
+    @staticmethod
+    def _utc_text_to_ms(norm: str) -> int | None:
+        """'YYYY-MM-DD HH:MM:SS.fff' (what _normalize_utc_filter emits) -> epoch ms."""
+        if not norm:
+            return None
+        try:
+            return int(datetime.strptime(norm, "%Y-%m-%d %H:%M:%S.%f")
+                       .replace(tzinfo=timezone.utc).timestamp() * 1000)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _ms_to_utc_text(ms: int) -> str:
+        return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    def _rollup_window_stats(
+        self,
+        conn: sqlite3.Connection,
+        tenant_clause: str,
+        tenant_params: dict[str, Any],
+        gateway_id: str,
+        tag: str,
+        from_txt: str,
+        to_txt: str,
+    ) -> dict[str, dict[str, Any]] | None:
+        """{tag: {n, sum, min, max}} over [from, to], exact, mostly from the rollup.
+
+        2026-11-02. A KPI or pie aggregated RAW readings for its whole window
+        - 0.28 s per cell at 2M rows and seconds at a customer collecting
+        8.5M rows a day, per cell, queued behind the collection writer. The
+        retention engine already keeps n/sum/min/max per minute in
+        historian_rollup, exact by construction. So: whole minute buckets
+        inside the window come from the rollup (an index seek), and only the
+        two edges - the partial first minute, and the tail the rollup has not
+        reached yet - are read raw. The partition is exact: a bucket covers
+        [bucket, bucket+60s) and the raw edges are [from, lo) and [hi, to].
+
+        Returns None when the rollup cannot serve it (no watermark yet, a
+        window under three minutes, a gateway given by name rather than id),
+        and the caller runs its original raw query.
+        """
+        from_ms = self._utc_text_to_ms(from_txt)
+        if from_ms is None:
+            return None
+        to_ms = self._utc_text_to_ms(to_txt) if to_txt else int(time.time() * 1000)
+        if to_ms is None or to_ms - from_ms < 180_000:
+            return None
+        gw = str(gateway_id or "").strip()
+        if gw and not gw.lower().startswith("gw-"):
+            return None
+        try:
+            st = conn.execute(
+                "SELECT materialized_to_ms FROM historian_retention_state "
+                "WHERE target_id='local' AND tier_key='r60' AND tenant_id='*'"
+            ).fetchone()
+        except Exception:
+            return None
+        if not st or st[0] is None:
+            return None
+        lo = -(-from_ms // 60000) * 60000                      # first whole minute >= from
+        hi = min((to_ms // 60000) * 60000, int(st[0]))         # buckets end before hi
+        if hi <= lo:
+            return None
+        where = f"WHERE resolution_s = 60 AND {tenant_clause} AND bucket_ms >= :lo AND bucket_ms < :hi"
+        params: dict[str, Any] = {**tenant_params, "lo": lo, "hi": hi}
+        if gw:
+            where += " AND gateway_id = :gw"
+            params["gw"] = gw
+        if tag:
+            where += " AND tag_name = :tag"
+            params["tag"] = tag
+        out: dict[str, dict[str, Any]] = {}
+        for r in conn.execute(
+                f"SELECT tag_name, SUM(n) AS n, SUM(sum_v) AS s, MIN(min_v) AS mn, MAX(max_v) AS mx "
+                f"FROM historian_rollup {where} GROUP BY tag_name", params):
+            out[str(r["tag_name"] or "")] = {"n": int(r["n"] or 0), "sum": float(r["s"] or 0.0),
+                                             "min": r["mn"], "max": r["mx"]}
+        # The two raw edges, same filters, same text compare as the raw path.
+        raw_where = f"WHERE {tenant_clause}"
+        raw_params: dict[str, Any] = dict(tenant_params)
+        if gw:
+            raw_where += " AND gateway_id = :gw"
+            raw_params["gw"] = gw
+        if tag:
+            raw_where += " AND tag_name = :tag"
+            raw_params["tag"] = tag
+        edges = [(" AND ts_utc >= :a AND ts_utc < :b", {"a": from_txt, "b": self._ms_to_utc_text(lo)})]
+        tail_to = " AND ts_utc <= :b" if to_txt else ""
+        edges.append((" AND ts_utc >= :a" + tail_to, {"a": self._ms_to_utc_text(hi), "b": to_txt}))
+        for clause, ep in edges:
+            for r in conn.execute(
+                    f"SELECT tag_name, COUNT(value) AS n, SUM(value) AS s, MIN(value) AS mn, MAX(value) AS mx "
+                    f"FROM historian_readings {raw_where}{clause} GROUP BY tag_name",
+                    {**raw_params, **{k: v for k, v in ep.items() if v}}):
+                t = str(r["tag_name"] or "")
+                n = int(r["n"] or 0)
+                if not n:
+                    continue
+                cur = out.setdefault(t, {"n": 0, "sum": 0.0, "min": None, "max": None})
+                cur["n"] += n
+                cur["sum"] += float(r["s"] or 0.0)
+                cur["min"] = r["mn"] if cur["min"] is None else min(cur["min"], r["mn"])
+                cur["max"] = r["mx"] if cur["max"] is None else max(cur["max"], r["mx"])
+        return out
+
     def _tenant_filter_clause(self, column: str = "tenant_id") -> tuple[str, dict[str, Any]]:
         """Return (sql_fragment, params) for `column IN (primary, ...aliases)`.
 
@@ -9517,8 +9640,10 @@ class AppStore:
         else:
             tag_txt = str(tag or "").strip()
             if tag_txt:
-                where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
-                params["tag_like"] = f"%{tag_txt}%"
+                # 2026-11-02: exact first (index); the substring match only
+                # when the exact name has no rows - see get_historian_agg_rows.
+                where += " AND tag_name = :tag_exact"
+                params["tag_exact"] = tag_txt
         src_txt = str(source or "").strip()
         if src_txt:
             # raw DOES carry `source`, so this filters exactly rather than
@@ -9663,10 +9788,13 @@ class AppStore:
             params["gateway"] = gw_txt
         tag_txt = str(tag or "").strip()
         if tag_txt:
-            # LIKE so the frontend can pass patterns like 'active_power'
-            # or 'insight.' without listing every variant.
-            where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
-            params["tag_like"] = f"%{tag_txt}%"
+            # 2026-11-02: exact match - the primary key covers it. LIKE could
+            # not use the tag index and scanned every bucket of the window
+            # (0.05 s vs 0.00 s on rollups, 1.7 s vs 0.5 s on raw, PER
+            # SERIES). A caller that really passes a pattern gets the LIKE
+            # path only when the exact name matched nothing (see below).
+            where += " AND tag_name = :tag_exact"
+            params["tag_exact"] = tag_txt
         source_txt = str(source or "").strip()
         if source_txt:
             # The rollup carries no `source`, so it cannot answer this
@@ -9716,6 +9844,19 @@ class AppStore:
                     """,
                     params,
                 ).fetchall()
+                if not rows and tag_txt and "tag_exact" in params:
+                    # Pattern caller (e.g. 'insight.'): the old substring match.
+                    rows = conn.execute(
+                        f"""
+                        SELECT strftime('%Y-%m-%d %H:%M:%S', bucket_ms / 1000, 'unixepoch') AS bucket_utc,
+                               gateway_id, tag_name, n, sum_v, min_v, max_v, q_max
+                        FROM historian_rollup
+                        {where.replace("tag_name = :tag_exact", "LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)")}
+                        ORDER BY bucket_ms DESC
+                        LIMIT :lim
+                        """,
+                        {**params, "tag_like": f"%{tag_txt}%"},
+                    ).fetchall()
                 # The rollup keys on gateway_id + tag only. The display names
                 # come from any one raw row of that gateway - an index-prefix
                 # seek, one per gateway in the answer.
@@ -9946,9 +10087,11 @@ class AppStore:
                 rows = conn.execute(
                     _sql.replace(GW_CLAUSE_BY_ID, GW_CLAUSE_BY_NAME, 1), params
                 ).fetchall()
-            if not rows:
-                # Fallback for legacy/unscoped rows: keep dashboard queries resilient
-                # after tenant migrations or historical data imported without tenant tags.
+            # 2026-11-02: the unscoped retry has no usable index (every
+            # historian index leads with tenant_id) - a window with no rows
+            # cost a scan of the whole table, and read other scopes. Only an
+            # edge with no identity, whose rows may still sit unscoped, keeps it.
+            if not rows and self._current_tenant_id() == "default":
                 rows = conn.execute(
                     f"""
                     SELECT id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
@@ -10121,15 +10264,37 @@ class AppStore:
             return latest_map
 
         # Read-only path: parallelize via WAL instead of serializing on self._lock.
-        with self._connect() as conn:
-            rows = _fetch_aggregates(conn, where, params)
+        # 2026-11-02: a pure read, on the read-only handle (the writer's 10 s
+        # timeout queued every pie behind collection); whole minutes from the
+        # rollup; and NO unscoped retry on an edge with an identity - that
+        # retry had no usable index and scanned the entire historian whenever
+        # a tag had no rows in the window, besides reading other scopes.
+        with self._connect_readonly() as conn:
+            rows: list[Any] = []
+            fast = None
+            if from_txt and not device_txt and "%" not in tag_txt and (
+                    not gateway_txt or gateway_txt.lower().startswith("gw-")):
+                try:
+                    fast = self._rollup_window_stats(conn, tenant_clause, tenant_params,
+                                                     gateway_txt, tag_txt, from_txt, to_txt)
+                except Exception:
+                    fast = None
+            if fast is not None:
+                rows = [{"tag_name": t, "row_count": v["n"], "sum_value": v["sum"],
+                         "avg_value": (v["sum"] / v["n"]) if v["n"] else None,
+                         "min_value": v["min"], "max_value": v["max"]}
+                        for t, v in sorted(fast.items()) if v["n"]]
+            else:
+                rows = _fetch_aggregates(conn, where, params)
             if rows:
                 tags_for_latest = [str(r["tag_name"] or "") for r in rows if str(r["tag_name"] or "").strip()]
                 latest_by_tag = _fetch_latest_per_tag(conn, tags_for_latest, where, params)
-            else:
+            elif self._current_tenant_id() == "default":
                 rows = _fetch_aggregates(conn, where_unscoped, params_unscoped)
                 tags_for_latest = [str(r["tag_name"] or "") for r in rows if str(r["tag_name"] or "").strip()]
                 latest_by_tag = _fetch_latest_per_tag(conn, tags_for_latest, where_unscoped, params_unscoped) if rows else {}
+            else:
+                latest_by_tag = {}
         out = [
             {
                 "tag": str(r["tag_name"] or ""),
@@ -10362,7 +10527,10 @@ class AppStore:
         # Read-only path: one connection for the whole batch, no global lock
         # (SQLite WAL handles reader concurrency).
         results_by_id: dict[str, dict[str, Any]] = {}
-        with self._connect() as conn:
+        _tenant_clause, _tenant_params = self._tenant_filter_clause("tenant_id")
+        # 2026-11-02: read-only handle, rollup-backed aggregates, and no
+        # unscoped retry on an edge with an identity. See get_historian_stats.
+        with self._connect_readonly() as conn:
             if True:
                 for (gw, _tag_lower), group_rules in groups.items():
                     base_tag = group_rules[0]["tag_name"]
@@ -10381,20 +10549,40 @@ class AppStore:
                             f"MAX(CASE WHEN {pred_sql} THEN value END) AS {prefix}_max",
                         ])
                     select_sql = ",\n                  ".join(select_exprs)
-                    row = conn.execute(
-                        f"""
-                        SELECT {select_sql}
-                        FROM historian_readings
-                        {scoped_where}
-                        """,
-                        {**scoped_params, **extra_params},
-                    ).fetchone()
+                    row: Any = None
+                    fast = None
+                    if (base_tag and from_txt and all(r["operator"] == "any" for r in group_rules)
+                            and (not gw or str(gw).lower().startswith("gw-"))):
+                        try:
+                            fast = self._rollup_window_stats(conn, _tenant_clause, _tenant_params,
+                                                             gw, base_tag, from_txt, to_txt)
+                        except Exception:
+                            fast = None
+                    if fast is not None:
+                        st = fast.get(base_tag) or {"n": 0, "sum": 0.0, "min": None, "max": None}
+                        row = {}
+                        for r in group_rules:
+                            prefix = f"r{r['idx']}"
+                            row[f"{prefix}_cnt"] = st["n"]
+                            row[f"{prefix}_sum"] = st["sum"]
+                            row[f"{prefix}_avg"] = (st["sum"] / st["n"]) if st["n"] else None
+                            row[f"{prefix}_min"] = st["min"]
+                            row[f"{prefix}_max"] = st["max"]
+                    else:
+                        row = conn.execute(
+                            f"""
+                            SELECT {select_sql}
+                            FROM historian_readings
+                            {scoped_where}
+                            """,
+                            {**scoped_params, **extra_params},
+                        ).fetchone()
                     # If the scoped query returned zero rows for every rule in the
                     # group, retry without the tenant predicate (preserves the
                     # original backward-compat fallback semantics).
-                    if row is None or all(
+                    if self._current_tenant_id() == "default" and (row is None or all(
                         int((row[f"r{r['idx']}_cnt"] if row else 0) or 0) == 0 for r in group_rules
-                    ):
+                    )):
                         unscoped_where, unscoped_params = _build_group_where(gw, base_tag, scoped=False)
                         row = conn.execute(
                             f"""

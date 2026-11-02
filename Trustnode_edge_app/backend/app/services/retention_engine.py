@@ -68,6 +68,12 @@ RETENTION_BOOT_DELAY_S = _env_int("TRUSTNODE_RETENTION_BOOT_DELAY_S", 300, 5, 36
 # whole file. At 60s a 44s compaction left the engine running essentially
 # continuously. Still env-overridable for a site that wants it tighter.
 RETENTION_TICK_S = _env_int("TRUSTNODE_RETENTION_TICK_S", 1800, 10, 86400)
+# 2026-11-02: rollups are what charts, KPIs and pies read, so the window the
+# rollup has not reached yet is read raw - at 8.5M rows/day, 30 minutes of
+# that tail per series is the difference between instant and not. One
+# minute of tail is nothing. Rollups tick on their own, short cadence;
+# pruning, backups and hygiene keep the long one.
+ROLLUP_TICK_S = _env_int("TRUSTNODE_ROLLUP_TICK_S", 60, 10, 3600)
 # Rollup reads one source chunk at a time so a single statement stays short.
 ROLLUP_CHUNK_S = _env_int("TRUSTNODE_RETENTION_ROLLUP_CHUNK_S", 3600, 60, 86400)
 # Adaptive delete batch bounds. Start small; grow while batches stay fast.
@@ -1325,6 +1331,13 @@ class RetentionEngine:
                  cloud_cursor_fn: Optional[Callable[[], Optional[int]]] = None,
                  tag_stats_fn: Optional[Callable[[], Dict[str, Any]]] = None) -> None:
         self.store = RetentionStore(db_path)
+        try:
+            # 2026-11-02: the chart reader queries historian_rollup; until the
+            # first pass the table did not exist and every call logged
+            # "no such table". CREATE IF NOT EXISTS is a no-op afterwards.
+            self.store.ensure_schema()
+        except Exception:
+            pass
         self.backups = BackupManager(self.store, backup_dir_fn)
         self._boot_ready_fn = boot_ready_fn
         self._writer_busy_fn = writer_busy_fn
@@ -1448,14 +1461,43 @@ class RetentionEngine:
                     pass
             break
         log.info("retention engine started")
+        next_full = 0.0
         while not self._stop.is_set():
             try:
-                self.run_once(reason="scheduled")
+                if time.time() >= next_full:
+                    self.run_once(reason="scheduled")
+                    next_full = time.time() + RETENTION_TICK_S
+                else:
+                    self.rollup_once(reason="tick")
             except Exception as exc:                    # never let the thread die
                 log.warning("retention tick failed: %s", exc, exc_info=True)
-            if not self._sleep(RETENTION_TICK_S):
+            if not self._sleep(ROLLUP_TICK_S):
                 break
         log.info("retention engine stopped")
+
+    def rollup_once(self, *, reason: str = "manual") -> List[Dict[str, Any]]:
+        """Materialise the tiers only - no pruning, no backups, no hygiene.
+
+        Runs every ROLLUP_TICK_S so the raw tail a chart or KPI still has to
+        read stays about a minute long. With a policy it uses the policy's
+        tiers (same watermarks as the full pass); without one, the standard
+        minute/hour/day tiers."""
+        if not self._run_lock.acquire(blocking=False):
+            return []
+        try:
+            if time.time() < self._paused_until:
+                return []
+            policy = self.store.get_active_policy()
+            tiers = policy if policy is not None else NO_POLICY_ROLLUP_TIERS
+            out: List[Dict[str, Any]] = []
+            deadline = time.time() + max(30, ROLLUP_TICK_S - 5)
+            for tenant in self.store.tenants():
+                out.extend(self._rollup_tenant(tiers, tenant, deadline, False))
+                if self._stop.is_set() or time.time() > deadline:
+                    break
+            return out
+        finally:
+            self._run_lock.release()
 
     # -- gating helpers ---------------------------------------------------
     def _writer_busy(self) -> bool:

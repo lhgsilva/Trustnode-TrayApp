@@ -9807,3 +9807,7 @@ textarea {
   from { opacity: 0; }
   to   { opacity: 1; }
 }
+
+/* 2026-11-02: the generated report's data, previewed from its record */
+.schedule-data-preview-dialog { width: min(960px, 96vw); }
+.schedule-data-preview-frame { max-height: 70vh; overflow: auto; }

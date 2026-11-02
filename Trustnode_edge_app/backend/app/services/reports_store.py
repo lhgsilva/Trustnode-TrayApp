@@ -836,12 +836,158 @@ class ReportsStore:
             ).fetchone()
         return self._row_to_generated(row) if row else None
 
+    # ------------------------------------------------------------------ #
+    # 2026-11-02: a report exists from the moment its run starts.
+    #
+    # Asked for directly: "it doesn't matter if the file is created or not,
+    # the report metadata should be shown on the generated reports
+    # automatically - to show the customer when the report is created, and
+    # if generating the PDF failed the user can always preview or regenerate
+    # the data of that report, locally or from the web with the cloud's
+    # information." Until now the record was written only AFTER the PDF, so
+    # a slow or failed render meant the report did not exist anywhere.
+    #
+    # The row is inserted with meta.render_state = "pending" before the
+    # render, carries the DATA snapshot (render_data_json) once the data
+    # phase is done, and is updated to "ready" (file fields filled) or
+    # "failed" (render_error). Every state change is mirrored to the cloud
+    # when a cloud is configured, and never touches it otherwise.
+    # ------------------------------------------------------------------ #
+    _render_data_column_ready = False
+
+    def _ensure_render_data_column(self, conn: sqlite3.Connection) -> None:
+        if self._render_data_column_ready:
+            return
+        try:
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(generated_reports)").fetchall()}
+            if "render_data_json" not in cols:
+                conn.execute("ALTER TABLE generated_reports ADD COLUMN render_data_json TEXT NULL")
+                conn.commit()
+        except Exception:
+            pass
+        self._render_data_column_ready = True
+
+    @staticmethod
+    def _cloud_enabled() -> bool:
+        """Is there a cloud to mirror into? "If the cloud is not enabled,
+        ignore the cloud" - no thread, no resolver, no log line."""
+        try:
+            from app.state import app_store as _st
+            return bool(_st._cloud_sync_possible())        # noqa: SLF001
+        except Exception:
+            return False
+
+    def _mirror_async(self, full: dict[str, Any]) -> None:
+        if not full or not self._cloud_enabled():
+            return
+        try:
+            import threading
+            from app.services.reports_cloud_uploader import upload_and_mirror
+
+            def _push(rec: dict[str, Any], store: "ReportsStore") -> None:
+                try:
+                    storage_path = upload_and_mirror(rec)
+                except Exception:
+                    storage_path = None
+                if storage_path:
+                    try:
+                        store._set_storage_path(str(rec.get("id") or ""), storage_path)
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_push, args=(dict(full), self),
+                             name="tn-report-mirror", daemon=True).start()
+        except Exception:
+            pass
+
+    def update_generated_render(
+        self,
+        generated_id: str,
+        *,
+        tenant_id: str | None = None,
+        render_state: str,
+        render_error: str = "",
+        render_seconds: float | None = None,
+        file_path: str | None = None,
+        file_name: str | None = None,
+        file_bytes: int | None = None,
+        file_sha256: str | None = None,
+        render_data: Any = None,
+    ) -> dict[str, Any] | None:
+        """Move a generated record to "ready" or "failed" (or back to
+        "pending" for a regenerate), filling in whatever is known."""
+        tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
+        current = self.get_generated(generated_id, tenant_id=tid)
+        if not current:
+            return None
+        meta = dict(current.get("meta") or {})
+        meta["render_state"] = str(render_state or "ready")
+        if render_error:
+            meta["render_error"] = str(render_error)[:500]
+        else:
+            meta.pop("render_error", None)
+        if render_seconds is not None:
+            meta["render_seconds"] = round(float(render_seconds), 2)
+        sets = ["meta_json = ?"]
+        args: list[Any] = [json.dumps(meta, ensure_ascii=False)]
+        if file_path is not None:
+            sets.append("file_path = ?"); args.append(str(file_path))
+        if file_name is not None:
+            sets.append("file_name = ?"); args.append(str(file_name))
+        if file_bytes is not None:
+            sets.append("file_bytes = ?"); args.append(int(file_bytes))
+        if file_sha256 is not None:
+            sets.append("file_sha256 = ?"); args.append(str(file_sha256) or None)
+        snap_text: str | None = None
+        if render_data is not None:
+            try:
+                snap_text = json.dumps(render_data, ensure_ascii=False, default=str)
+            except Exception:
+                snap_text = None
+        with self._write_lock:
+            with self._connect() as conn:
+                self._ensure_render_data_column(conn)
+                if snap_text is not None:
+                    sets.append("render_data_json = ?"); args.append(snap_text)
+                conn.execute(
+                    f"UPDATE generated_reports SET {', '.join(sets)} WHERE tenant_id = ? AND id = ?",
+                    (*args, tid, str(generated_id)),
+                )
+                conn.commit()
+        full = self.get_generated(generated_id, tenant_id=tid) or {}
+        if full:
+            rec = dict(full)
+            if snap_text is not None:
+                rec["render_data_json"] = snap_text
+            self._mirror_async(rec)
+        return full
+
+    def get_generated_render_data(self, generated_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
+        tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
+        try:
+            with self._connect() as conn:
+                self._ensure_render_data_column(conn)
+                row = conn.execute(
+                    "SELECT render_data_json FROM generated_reports WHERE tenant_id = ? AND id = ?",
+                    (tid, str(generated_id)),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row or not row[0]:
+            return None
+        try:
+            data = json.loads(str(row[0]))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
     def insert_generated(self, record: dict[str, Any]) -> dict[str, Any]:
         tid = (record.get("tenant_id") or get_current_tenant() or "default").strip() or "default"
         gid = str(record.get("id") or "").strip() or _new_id("rpt")
         now = _utc_now()
         with self._write_lock:
             with self._connect() as conn:
+                self._ensure_render_data_column(conn)
                 conn.execute(
                     """
                     INSERT INTO generated_reports (
@@ -871,27 +1017,7 @@ class ReportsStore:
                 )
                 conn.commit()
         full = self.get_generated(gid, tenant_id=tid) or {}
-        # Best-effort: push the PDF to Supabase Storage + mirror the row so
-        # the Lite app can list/preview/download without touching the edge.
-        # Runs in a background thread to keep the API response snappy.
-        try:
-            import threading
-            from app.services.reports_cloud_uploader import upload_and_mirror
-
-            def _push(rec: dict[str, Any], store: "ReportsStore") -> None:
-                try:
-                    storage_path = upload_and_mirror(rec)
-                except Exception:
-                    storage_path = None
-                if storage_path:
-                    try:
-                        store._set_storage_path(str(rec.get("id") or ""), storage_path)
-                    except Exception:
-                        pass
-
-            threading.Thread(target=_push, args=(dict(full), self), daemon=True).start()
-        except Exception:
-            pass
+        self._mirror_async(full)
         return full
 
     def _set_storage_path(self, generated_id: str, storage_path: str) -> None:
@@ -980,6 +1106,10 @@ class ReportsStore:
             "file_sha256": str(row["file_sha256"] or "") or None,
             "storage_path": storage_path,
             "created_utc": str(row["created_utc"] or ""),
+            # A record written before 2026-11-02 has no state: it was only
+            # ever written after a successful render, so it is "ready".
+            "render_state": str((meta or {}).get("render_state") or "ready"),
+            "render_error": str((meta or {}).get("render_error") or "") or None,
             "email_status": str(row["email_status"] or "") or None,
             "email_message": str(row["email_message"] or "") or None,
             "email_recipients": recipients,

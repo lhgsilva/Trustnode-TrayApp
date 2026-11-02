@@ -4138,6 +4138,30 @@ export async function listGeneratedReports({ limit = 200, scheduleId = "", templ
   return res.json();
 }
 
+// 2026-11-02: a generated report exists from the moment its run starts
+// (render_state pending -> ready | failed). Its DATA is stored with the
+// record, so it can be previewed without the PDF, and the PDF can be
+// rebuilt for the same window.
+export async function getGeneratedReportPreviewData(generatedId) {
+  const res = await fetchWithTimeout(
+    withNoCache(`${_reportApiBase()}/api/reports/generated/${encodeURIComponent(generatedId)}/preview-data`),
+    { headers: { "Cache-Control": "no-store, no-cache, max-age=0" } },
+    20000,
+  );
+  await ensureOk(res, "Report data could not be loaded");
+  return res.json();
+}
+
+export async function regenerateGeneratedReport(generatedId) {
+  const res = await fetchWithTimeout(
+    `${_reportApiBase()}/api/reports/generated/${encodeURIComponent(generatedId)}/regenerate`,
+    { method: "POST" },
+    20000,
+  );
+  await ensureOk(res, "Regenerate failed");
+  return res.json();
+}
+
 export async function deleteGeneratedReport(generatedId) {
   const res = await fetchWithTimeout(`${_reportApiBase()}/api/reports/generated/${encodeURIComponent(generatedId)}`, {
     method: "DELETE",

@@ -5,6 +5,8 @@ import {
   downloadGeneratedReportBlob,
   emailGeneratedReport,
   getReportSchedulerStatus,
+  getGeneratedReportPreviewData,
+  regenerateGeneratedReport,
   listGeneratedReports,
   getAppStoreBootstrap,
   saveAppStoreDomain,
@@ -14,6 +16,7 @@ import {
   saveScheduledReport,
   validateDirectoryPath,
 } from "../../api";
+import { ReportHtmlPreview } from "../Dashboard/DashboardWidgets.jsx";
 
 // ---------------------------------------------------------------------------
 // inline SVG icons (kept local so we don't bind to the App.jsx icon set)
@@ -50,6 +53,12 @@ const IconTrash = (p) => (
     <path d="M9 7V4h6v3" {...ICON_STROKE} />
     <path d="M6 7v13h12V7" {...ICON_STROKE} />
     <path d="M10 11v6M14 11v6" {...ICON_STROKE} />
+  </Icon>
+);
+const IconData = (p) => (
+  <Icon {...p}>
+    <rect x="3" y="4" width="18" height="16" rx="2" {...ICON_STROKE} />
+    <path d="M3 10h18M9 4v16" {...ICON_STROKE} />
   </Icon>
 );
 const IconRefresh = (p) => (
@@ -789,6 +798,40 @@ export function ScheduledReportsManager({
   };
 
   // ---- generated-reports actions (icon-button row) -----------------------
+  // 2026-11-02: a report is listed the moment its run starts, as "pending",
+  // and becomes "ready" (PDF on disk) or "failed" (with the reason). Its
+  // data is kept with the record, so it can be previewed whatever the PDF
+  // did, and the PDF can be rebuilt for the same window. While any row is
+  // pending the list refreshes every 3 s so the state lands on its own.
+  const [dataPreview, setDataPreview] = useState(null); // { target, data, source, loading, error }
+  const anyPending = useMemo(
+    () => (generated || []).some((g) => String(g?.render_state || "ready") === "pending"),
+    [generated],
+  );
+  useEffect(() => {
+    if (!anyPending) return undefined;
+    const t = setInterval(() => { refresh(); }, 3000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [anyPending]);
+  const handlePreviewData = async (g) => {
+    setDataPreview({ target: g, data: null, source: "", loading: true, error: "" });
+    try {
+      const res = await getGeneratedReportPreviewData(g.id);
+      setDataPreview({ target: g, data: res?.data || null, source: res?.source || "", loading: false, error: "" });
+    } catch (e) {
+      setDataPreview({ target: g, data: null, source: "", loading: false, error: e?.message || String(e) });
+    }
+  };
+  const handleRegenerateGenerated = async (g) => {
+    try {
+      await regenerateGeneratedReport(g.id);
+      onNotify({ type: "info", message: `Regenerating "${g.file_name || g.template_name || g.id}" - the row updates when the PDF lands.` });
+      await refresh();
+    } catch (e) {
+      onNotify({ type: "error", message: `Regenerate failed: ${e?.message || e}` });
+    }
+  };
   const handlePreviewGenerated = async (gid) => {
     try { await openPdfInTab(gid); }
     catch (e) { onNotify({ type: "error", message: `Preview failed: ${e?.message || e}` }); }
@@ -1589,15 +1632,31 @@ export function ScheduledReportsManager({
                       <td>{g.template_name || g.template_id || "-"}</td>
                       <td>{g.schedule_name || "-"}</td>
                       <td>{g.triggered_by || "-"}</td>
-                      <td>{Math.round((g.file_bytes || 0) / 1024)} KB</td>
+                      <td title={g.render_error || ""}>
+                        {String(g.render_state || "ready") === "pending"
+                          ? <span className="muted">Generating…</span>
+                          : String(g.render_state || "ready") === "failed"
+                            ? <span className="warn">Failed</span>
+                            : `${Math.round((g.file_bytes || 0) / 1024)} KB`}
+                      </td>
                       <td>{g.email_status || "-"}</td>
                       <td className="generated-reports-action-col">
                         <div className="generated-reports-actions-row">
                           <button
                             type="button"
                             className="icon-btn"
-                            title="Preview in new tab"
+                            title="Preview the report's data (works without the PDF)"
+                            aria-label="Preview data"
+                            onClick={() => handlePreviewData(g)}
+                          >
+                            <IconData />
+                          </button>
+                          <button
+                            type="button"
+                            className="icon-btn"
+                            title={String(g.render_state || "ready") === "ready" ? "Preview in new tab" : "The PDF is not available yet"}
                             aria-label="Preview"
+                            disabled={String(g.render_state || "ready") !== "ready"}
                             onClick={() => handlePreviewGenerated(g.id)}
                           >
                             <IconEye />
@@ -1605,8 +1664,9 @@ export function ScheduledReportsManager({
                           <button
                             type="button"
                             className="icon-btn"
-                            title="Download PDF"
+                            title={String(g.render_state || "ready") === "ready" ? "Download PDF" : "The PDF is not available yet"}
                             aria-label="Download"
+                            disabled={String(g.render_state || "ready") !== "ready"}
                             onClick={() => handleDownloadGenerated(g)}
                           >
                             <IconDownload />
@@ -1614,8 +1674,19 @@ export function ScheduledReportsManager({
                           <button
                             type="button"
                             className="icon-btn"
-                            title="Email this report"
+                            title="Rebuild the PDF for the same window"
+                            aria-label="Regenerate"
+                            disabled={String(g.render_state || "ready") === "pending"}
+                            onClick={() => handleRegenerateGenerated(g)}
+                          >
+                            <IconRefresh />
+                          </button>
+                          <button
+                            type="button"
+                            className="icon-btn"
+                            title={String(g.render_state || "ready") === "ready" ? "Email this report" : "The PDF is not available yet"}
                             aria-label="Email"
+                            disabled={String(g.render_state || "ready") !== "ready"}
                             onClick={() => handleEmailGenerated(g)}
                           >
                             <IconMail />
@@ -1641,6 +1712,36 @@ export function ScheduledReportsManager({
       </section>
       )}
 
+      {dataPreview ? (
+        <div className="modal-backdrop" onClick={() => setDataPreview(null)}>
+          <div
+            className="modal-card schedule-data-preview-dialog"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3>Report data</h3>
+            <p className="muted small">
+              <strong>{dataPreview.target.template_name || dataPreview.target.file_name}</strong>
+              {" "}· generated {dataPreview.target.created_utc || "-"}
+              {dataPreview.target?.meta?.window_from
+                ? ` · window ${dataPreview.target.meta.window_from} → ${dataPreview.target.meta.window_to || "-"}`
+                : ""}
+              {dataPreview.source === "historian"
+                ? " · read again from the historian (this report predates stored data)"
+                : ""}
+            </p>
+            {dataPreview.loading ? <div className="muted">Loading…</div> : null}
+            {dataPreview.error ? <div className="warn">{dataPreview.error}</div> : null}
+            {dataPreview.data ? (
+              <div className="dashboard-report-html-frame schedule-data-preview-frame">
+                <ReportHtmlPreview data={dataPreview.data} />
+              </div>
+            ) : null}
+            <div className="row modal-actions">
+              <button type="button" className="btn btn-sm" onClick={() => setDataPreview(null)}>Close</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {emailDialog ? (
         <div
           className="modal-backdrop"

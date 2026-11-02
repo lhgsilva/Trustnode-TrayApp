@@ -5600,7 +5600,7 @@ function ReportCardWidget({ widget }) {
 // mirrors the PDF (header banner, KPI grid, chart-as-line, table, pie)
 // so the operator gets the same visual story in the dashboard as they
 // would in the printed report.
-function ReportHtmlPreview({ data }) {
+export function ReportHtmlPreview({ data }) {
   if (!data) return null;
   const sections = Array.isArray(data.sections) ? data.sections : [];
   return (
