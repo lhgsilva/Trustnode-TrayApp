@@ -1303,12 +1303,24 @@ def get_historian_agg(
     tag: str = "",
     source: str = "",
     limit: int = 50000,
+    bucket_seconds: int = 0,
 ) -> dict:
     """Operator 2026-06-17: serve pre-bucketed historian rows from the
     `historian_agg_<bucket>` tables (populated by the retention worker).
     Lets dashboards skip pulling 1 Hz raw rows when the window is wide
     (e.g. 24 h × Minute → 1 440 rows instead of ~17 000)."""
     safe_limit = max(50, min(int(limit or 50000), 100000))
+    n_s = max(0, min(int(bucket_seconds or 0), 86400))
+    if n_s > 0:
+        # 2026-11-02: any N-second bucket - "average every 2 s over 3 h".
+        return {
+            "ok": True,
+            "tenant_id": get_current_tenant(),
+            "bucket": "%ds" % n_s,
+            "rows": app_store.bucket_series_rows(
+                from_utc=from_utc, to_utc=to_utc, gateway=gateway, tag=tag,
+                bucket_seconds=n_s, limit=max(safe_limit, 200000)),
+        }
     return {
         "ok": True,
         "tenant_id": get_current_tenant(),

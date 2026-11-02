@@ -800,6 +800,20 @@ export const SAME_TAG_STOP = "__start_condition_ends__";
 //
 //   * a trigger window is open -> the window decides, full stop;
 //   * otherwise -> the rolling last-N behaviour, unchanged since 2026-06-12.
+// 2026-11-02: a chart widget may aggregate every N seconds (avg/min/max/last)
+// so hours of 1 Hz data stay readable without dropping to minute buckets.
+export const BUCKET_INTERVAL_SECONDS = {
+  none: 0, "1s": 1, "2s": 2, "5s": 5, "10s": 10, "30s": 30,
+  "1m": 60, "5m": 300, "15m": 900, "1h": 3600,
+};
+export function bucketSecondsFor(cfg) {
+  return Number(BUCKET_INTERVAL_SECONDS[String(cfg?.bucket_interval || "none")] || 0);
+}
+export function bucketAggFor(cfg) {
+  const a = String(cfg?.bucket_aggregation || "avg");
+  return ["avg", "min", "max", "last"].includes(a) ? a : "avg";
+}
+
 export function boundRowsToWindow(sorted, trigWin, { capacity, windowMs, nowMs }) {
   if (trigWin && trigWin.start > 0) {
     // A run is in force: the window decides, not the clock and not
@@ -1147,6 +1161,7 @@ function LiveTagChart({
           tag: s.tagName,
           timeoutMs: 8000,
           maxAttempts: 2,
+          bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg),
         });
         if (cancelled) return;
         const buf = buffersRef.current?.get(s.id);
@@ -1315,6 +1330,7 @@ function LiveTagChart({
             tag: s.tagName,
             timeoutMs: 6000,
             maxAttempts: 1,
+            bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg),
           });
           const buf = buffersRef.current?.get(s.id);
           if (!buf) return;
@@ -2422,6 +2438,7 @@ function DashboardWidgetCardImpl({
             tag: rowTagFilter,
             timeoutMs: 12000,
             maxAttempts: 2,
+            bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg),
           });
           const safeFirst = Array.isArray(rows) ? rows : [];
           // Backward-compat fallback: some saved widgets may carry stale gateway ids.
@@ -2436,6 +2453,7 @@ function DashboardWidgetCardImpl({
               tag: rowTagFilter,
               timeoutMs: 12000,
               maxAttempts: 2,
+              bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg),
             });
           }
         } else {
@@ -2977,6 +2995,7 @@ function DashboardWidgetCardImpl({
             tag: def.tag_name,
             timeoutMs: 12000,
             maxAttempts: 1,
+            bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg),
           });
           if (!Array.isArray(rows) || rows.length === 0) {
             // Fallback: drop gateway scope (handles tags emitted under a
@@ -2990,6 +3009,7 @@ function DashboardWidgetCardImpl({
               tag: def.tag_name,
               timeoutMs: 12000,
               maxAttempts: 1,
+              bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg),
             });
           }
           if (cancelled) return;
@@ -3768,7 +3788,8 @@ function DashboardWidgetCardImpl({
       const liveModeEligible =
         !historicalMode
         && (hasTriggerWindow || (!hasTimePreset && !hasTimeRange))
-        && (resolvedLimitLines || []).length === 0;
+        && (resolvedLimitLines || []).length === 0
+        && bucketSecondsFor(cfg) <= 0;     // aggregated charts are served bucketed
       if (liveModeEligible) {
         return (
           <LiveTagChart

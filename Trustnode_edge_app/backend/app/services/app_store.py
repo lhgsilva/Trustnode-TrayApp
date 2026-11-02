@@ -9544,6 +9544,97 @@ class AppStore:
         out = self._filter_rows_by_edge(out, edge_filter)
         return out[:lim]
 
+    def bucket_series_rows(
+        self,
+        from_utc: str = "",
+        to_utc: str = "",
+        gateway: str = "",
+        tag: str = "",
+        bucket_seconds: int = 60,
+        limit: int = 100000,
+    ) -> list[dict[str, Any]]:
+        """One row per N-second bucket per tag: avg, min, max, last, sum, count.
+
+        2026-11-02, asked: "a chart that prints temp, pressure and flow for
+        2-3 hours could be aggregated every 2 seconds with the average". The
+        fixed grains (minute/hour/day) could not express that, and a report
+        section's own bucket was applied AFTER a fetch that had already been
+        capped at 5 000 raw rows or switched to minutes. This groups in SQL on
+        the epoch, so any N works and the cost is one index-bound range read
+        per tag: 3 hours at 1 Hz is ~10 800 rows in, 5 400 rows out, tens of
+        milliseconds.
+
+        `ts` is the bucket start, 'YYYY-MM-DD HH:MM:SS' - the same text the
+        other bucketed readers emit.
+        """
+        n = max(1, int(bucket_seconds or 60))
+        lim = max(1, min(int(limit or 100000), 200000))
+        tenant_clause, tenant_params = self._tenant_filter_clause("tenant_id")
+        norm = "replace(substr(ts_utc, 1, 19), 'T', ' ')"
+        epoch = f"CAST(strftime('%s', {norm}) AS INTEGER)"
+        where = f"WHERE {tenant_clause}"
+        params: dict[str, Any] = {**tenant_params, "lim": lim, "n": n}
+        from_txt = self._normalize_utc_filter(from_utc)
+        to_txt = self._normalize_utc_filter(to_utc)
+        if from_txt:
+            where += f" AND {norm} >= :from_norm AND ts_utc >= :from_coarse"
+            params["from_norm"] = from_txt[:19]
+            params["from_coarse"] = from_txt[:19]
+        if to_txt:
+            where += f" AND {norm} <= :to_norm AND ts_utc < :to_coarse"
+            params["to_norm"] = to_txt[:19]
+            try:
+                from datetime import date as _date, timedelta as _td
+                params["to_coarse"] = (_date.fromisoformat(to_txt[:10]) + _td(days=1)).isoformat()
+            except Exception:
+                params["to_coarse"] = "9999-12-31"
+        gw_txt = str(gateway or "").strip()
+        if gw_txt:
+            where += " AND gateway_id = :gateway"
+            params["gateway"] = gw_txt
+        tag_txt = str(tag or "").strip()
+        if tag_txt:
+            where += " AND tag_name = :tag_exact"
+            params["tag_exact"] = tag_txt
+        # `last` = the value with the greatest timestamp in the bucket, via the
+        # printf/char(31) ordering trick the rollup engine uses.
+        sql = f"""
+            SELECT strftime('%Y-%m-%d %H:%M:%S', ({epoch} / :n) * :n, 'unixepoch') AS bucket_utc,
+                   gateway_id, tag_name,
+                   AVG(value) AS avg_value, MIN(value) AS min_value, MAX(value) AS max_value,
+                   SUM(value) AS sum_value, COUNT(value) AS n_value,
+                   CAST(NULLIF(substr(MAX(printf('%020d', {epoch})||char(31)||IFNULL(CAST(value AS TEXT),'')), 22), '') AS REAL) AS last_value
+            FROM historian_readings
+            {where}
+            GROUP BY ({epoch} / :n), gateway_id, tag_name
+            ORDER BY bucket_utc ASC
+            LIMIT :lim
+        """
+        with self._connect_readonly() as conn:
+            try:
+                rows = conn.execute(sql, params).fetchall()
+                if not rows and tag_txt:
+                    rows = conn.execute(
+                        sql.replace("tag_name = :tag_exact", "tag_name = :tag_exact COLLATE NOCASE", 1),
+                        params).fetchall()
+            except Exception as exc:
+                import logging
+                logging.getLogger("trustnode.historian").warning("bucket_series_rows failed: %s", exc)
+                return []
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            cnt = int(r["n_value"] or 0)
+            if not cnt:
+                continue
+            out.append({
+                "ts": r["bucket_utc"], "gateway_id": r["gateway_id"] or "", "tag": r["tag_name"] or "",
+                "tag_name": r["tag_name"] or "", "source": "bucket_%ds" % n,
+                "value": r["avg_value"], "value_min": r["min_value"], "value_max": r["max_value"],
+                "value_last": r["last_value"], "value_sum": r["sum_value"], "sample_count": cnt,
+                "quality": 192, "quality_label": "GOOD",
+            })
+        return out
+
     def bucket_raw_historian_rows(
         self,
         bucket: str = "minute",

@@ -197,6 +197,12 @@ export function normalizeWidgets(rawWidgets) {
         // at 500 and silently shrank bigger configured windows on every
         // reflow.
         readings_count: clamp(raw?.config?.readings_count ?? raw?.readings_count ?? 120, 5, 5000),
+        // 2026-11-02: the allowlist trap - a key missing here is stripped on
+        // every reflow. See dashboard_widget_conventions.
+        bucket_interval: ["none", "1s", "2s", "5s", "10s", "30s", "1m", "5m", "15m", "1h"].includes(String(raw?.config?.bucket_interval || ""))
+          ? String(raw?.config?.bucket_interval) : "none",
+        bucket_aggregation: ["avg", "min", "max", "last"].includes(String(raw?.config?.bucket_aggregation || ""))
+          ? String(raw?.config?.bucket_aggregation) : "avg",
         interpolation: CHART_INTERPOLATION_VALUES.has(String(raw?.config?.interpolation || ""))
           ? String(raw?.config?.interpolation)
           : "stepAfter",

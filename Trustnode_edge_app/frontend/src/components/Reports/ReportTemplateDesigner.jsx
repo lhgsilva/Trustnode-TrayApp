@@ -211,6 +211,10 @@ const SERIES_CHART_KINDS = [
 // epoch-aligned buckets and applies each series' aggregation.
 const BUCKET_SIZES = [
   { value: "raw", label: "Raw samples" },
+  { value: "2s",  label: "2 seconds" },
+  { value: "5s",  label: "5 seconds" },
+  { value: "10s", label: "10 seconds" },
+  { value: "30s", label: "30 seconds" },
   { value: "1m",  label: "1 minute" },
   { value: "5m",  label: "5 minutes" },
   { value: "15m", label: "15 minutes" },

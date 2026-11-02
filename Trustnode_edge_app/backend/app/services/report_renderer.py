@@ -336,6 +336,8 @@ def _normalize_one_series(s: dict[str, Any], section: dict[str, Any]) -> dict[st
 _BUCKET_SECONDS: dict[str, int] = {
     "raw": 0,
     "1s": 1,
+    "2s": 2,
+    "5s": 5,
     "10s": 10,
     "30s": 30,
     "1m": 60,
@@ -528,70 +530,60 @@ def _span_seconds(from_utc: str, to_utc: str) -> float:
     return max(0.0, (b - a).total_seconds())
 
 
+#: When a raw window holds more readings than a series may carry, the finest
+#: of these buckets that brings it under the cap is used - 2 s for a 3-hour
+#: test at 1 Hz - and the chart says so. It used to jump straight to minutes.
+_AUTO_BUCKET_STEPS = (1, 2, 5, 10, 30, 60, 300, 900, 1800, 3600, 86400)
+_AUTO_BUCKET_CAP = 6000
+
+
 def _bucketed_or_raw_rows(from_utc: str, to_utc: str, gateway: str, tag: str,
-                          limit: int) -> list[dict[str, Any]]:
-    """Rows for a chart series, bucketed when the window is wide.
+                          limit: int, note: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Rows for a chart series: raw when the window fits, else the finest
+    bucket that does - and `note["_auto_bucket_note"]` says which.
 
-    get_historian_rows_range caps at 5 000 rows. At a 1 s cadence that is under
-    two hours, so a report section asking for 24 h got the newest ~1.4 h and
-    drew it across a 24 h axis — wrong, and wrong in a way that looks fine.
-
-    Past two hours we read the aggregate path instead (which buckets raw data
-    live when the rollup tables have not covered the window). Anything shorter
-    keeps the raw path exactly as it was.
+    2026-11-02. get_historian_rows_range caps at 5 000 rows, under two hours
+    at 1 Hz. Past that this used to switch to MINUTE buckets regardless, so
+    a 3-hour test drew 180 points however the section was configured. Now
+    the step is the finest in _AUTO_BUCKET_STEPS that fits _AUTO_BUCKET_CAP
+    points (2 s for 3 h), and the caption names it.
     """
     span = _span_seconds(from_utc, to_utc)
-    if span > 2 * 3600:
-        bucket = "day" if span > 45 * 86400 else ("hour" if span > 3 * 86400 else "minute")
-        bucket_s = 86400 if bucket == "day" else (3600 if bucket == "hour" else 60)
-        # Size the read from the WINDOW, not from `limit` — that is a raw-row
-        # budget for the raw path, and using it here capped a 24 h minute-bucket
-        # section at 960 of the 1 440 buckets it needed, i.e. 16 h of a 24 h
-        # axis. One bucket per interval, plus headroom for partial edges.
-        need = int(span / bucket_s) + 2
+    raw: list[dict[str, Any]] = []
+    if span <= 2 * 3600:
+        raw = _app_store().get_historian_rows_range(
+            from_utc=from_utc, to_utc=to_utc, limit=limit, offset=0,
+            gateway=gateway, tag=tag, prefer_cloud_reads=False)
+        if len(raw) < limit or span <= 120:
+            return raw
+    # Dense: pick the finest step that fits.
+    step = next((n for n in _AUTO_BUCKET_STEPS if span / float(n) <= _AUTO_BUCKET_CAP),
+                _AUTO_BUCKET_STEPS[-1])
+    if step in (60, 3600, 86400):
+        bucket = {60: "minute", 3600: "hour", 86400: "day"}[step]
         try:
             rows = _app_store().get_historian_agg_rows(
                 bucket=bucket, from_utc=from_utc, to_utc=to_utc,
-                gateway=gateway, tag=tag, limit=max(500, min(need * 2, 20000)),
-            )
+                gateway=gateway, tag=tag, limit=max(500, min(int(span / step) + 2, 20000)))
         except Exception:
             rows = []
-        if rows:
-            return rows
-    raw = _app_store().get_historian_rows_range(
-        from_utc=from_utc,
-        to_utc=to_utc,
-        limit=limit,
-        offset=0,
-        gateway=gateway,
-        tag=tag,
-        prefer_cloud_reads=False,
-    )
-    # 2026-10-11, asked: do reports show the gateway's period, or whatever is
-    # in the historian?
-    #
-    # The raw read is `ORDER BY ts_utc DESC LIMIT n`, so when a window holds
-    # more readings than the budget it returns the NEWEST n - and the chart
-    # drew them across the whole axis. At a 1 s cadence a 1 h section showed
-    # the last four minutes labelled as an hour. That is the same defect the
-    # docstring above describes for windows over two hours, which only the
-    # wide case was fixed for.
-    #
-    # Truncated means the window is denser than the budget, so bucket it: one
-    # point per minute covers the whole span at a density a PDF can draw. The
-    # report never shows finer than the gateway actually collected, because
-    # bucketing can only aggregate rows that exist.
-    if len(raw) >= limit and span > 120:
+    else:
         try:
-            bucketed = _app_store().get_historian_agg_rows(
-                bucket="minute", from_utc=from_utc, to_utc=to_utc,
-                gateway=gateway, tag=tag,
-                limit=max(500, min(int(span / 60) + 2, 20000)))
+            rows = _app_store().bucket_series_rows(
+                from_utc=from_utc, to_utc=to_utc, gateway=gateway, tag=tag,
+                bucket_seconds=step)
+            rows = list(reversed(rows))        # callers expect newest-first
         except Exception:
-            bucketed = []
-        if bucketed:
-            return bucketed
-    return raw
+            rows = []
+    if not rows:
+        return raw
+    if isinstance(note, dict):
+        total = sum(int(r.get("sample_count") or 0) for r in rows)
+        label = ("%ds" % step) if step < 60 else (("%dm" % (step // 60)) if step < 3600
+                                                  else (("%dh" % (step // 3600)) if step < 86400 else "1d"))
+        note["_auto_bucket_note"] = ("averaged every %s - %s readings in this window"
+                                     % (label, format(total, ",").replace(",", " ")))
+    return rows
 
 
 def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tuple[list[dict[str, Any]], list[list[tuple[str, float | None, str | None]]]]:
@@ -620,11 +612,32 @@ def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tu
         # the window and called it a day. Past a couple of hours, read
         # PRE-BUCKETED rows instead: the whole window, at a density a PDF chart
         # can actually draw. Short ranges keep the raw path unchanged.
-        rows = _bucketed_or_raw_rows(from_utc, to_utc, gw, tag, limit)
-        rows = list(reversed(rows or []))
+        agg = str(s.get("aggregation") or "").strip().lower()
         mult = float(s.get("multiplier") or 1.0)
         off = float(s.get("offset") or 0.0)
         points: list[tuple[str, float | None, str | None]] = []
+        if bucket_secs > 0 and agg in ("", "avg", "min", "max", "last", "sum", "count"):
+            # 2026-11-02: the section's bucket is now the FETCH resolution,
+            # not a reduction applied after a capped fetch. "Average every
+            # 2 s over 3 hours" reads 5 400 buckets, computed in SQL; it is
+            # no longer quietly turned into minutes past two hours.
+            field = {"": "value", "avg": "value", "min": "value_min", "max": "value_max",
+                     "last": "value_last", "sum": "value_sum", "count": "sample_count"}[agg]
+            for r in _app_store().bucket_series_rows(
+                    from_utc=from_utc, to_utc=to_utc, gateway=gw, tag=tag,
+                    bucket_seconds=bucket_secs):
+                raw = r.get(field)
+                try:
+                    val = (float(raw) * mult + off) if raw is not None else None
+                except Exception:
+                    val = None
+                points.append((str(r.get("ts") or ""), val, None))
+            # the value filter still applies; the reduction already happened
+            points = _apply_series_analytics(points, {**s, "aggregation": ""}, 0)
+            aligned.append(points)
+            continue
+        rows = _bucketed_or_raw_rows(from_utc, to_utc, gw, tag, limit, note=section)
+        rows = list(reversed(rows or []))
         for r in rows:
             try:
                 raw = r.get("value")
@@ -634,8 +647,6 @@ def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tu
             text_raw = r.get("value_text")
             text_val = str(text_raw) if (text_raw is not None and text_raw != "") else None
             points.append((str(r.get("ts") or ""), val, text_val))
-        # Apply per-series value filter + section bucket + aggregation.
-        # When the series has no analytics tweaks this is a no-op.
         points = _apply_series_analytics(points, s, bucket_secs)
         aligned.append(points)
     return series_meta, aligned
@@ -2632,6 +2643,8 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
         warnings.append("too few readings for a meaningful trend")
     if section.get("_trigger_fell_back"):
         warnings.append("section trigger did not fire; showing the report window")
+    if _fetch_section.get("_auto_bucket_note"):
+        warnings.append(str(_fetch_section.get("_auto_bucket_note")))
 
     if section.get("show_sample_caption") is True:
         if per and min(per) == max(per):

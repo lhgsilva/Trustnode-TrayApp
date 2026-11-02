@@ -361,6 +361,11 @@ SOURCE_CHECKS = [
     # under y_min were mapped, never clipped) and every section said its
     # trigger did not fire because the tag was typed in another case.
     ("charts stay in their box and tag case cannot hide data", "test_chart_clip_and_tag_case.py"),
+    # 2026-11-02, asked: "aggregate every 2 seconds with the average" for a
+    # 2-3 hour test. The section bucket used to be applied AFTER a fetch
+    # capped at 5 000 rows that switched to minutes past two hours; the
+    # dashboard had no aggregation at all.
+    ("a chart aggregates every N seconds, end to end", "test_chart_bucket_seconds.py"),
     # 2026-10-30, asked for directly: "every new installer can be installed
     # in existing computer with all fixes and updates". Boots the PACKAGED
     # backend on a copy of a real workspace with NO data-dir override - the

@@ -1631,12 +1631,16 @@ export async function getAppStoreHistorianAgg({
   tag = "",
   source = "",
   limit = 50000,
+  bucketSeconds = 0,
   cloudEdge = null,
   timeoutMs = 15000,
   maxAttempts = 2,
 } = {}) {
   const params = new URLSearchParams();
   params.set("bucket", String(bucket || "minute"));
+  // 2026-11-02: any N-second bucket (avg/min/max/last per row) for a chart
+  // that aggregates every few seconds over hours.
+  if (Number(bucketSeconds) > 0) params.set("bucket_seconds", String(Math.round(Number(bucketSeconds))));
   if (fromUtc) params.set("from_utc", String(fromUtc));
   if (toUtc) params.set("to_utc", String(toUtc));
   if (gateway) params.set("gateway", String(gateway));

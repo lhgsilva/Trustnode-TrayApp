@@ -23465,9 +23465,22 @@ const getGatewayHealth = (gateway) => {
                   return raw;   // bucketing failed: a truncated view beats none
                 }
               }}
-              fetchWidgetRows={async ({ fromUtc, toUtc, limit = 2000, offset = 0, gateway = "", tag = "", timeoutMs, maxAttempts }) => {
+              fetchWidgetRows={async ({ fromUtc, toUtc, limit = 2000, offset = 0, gateway = "", tag = "", timeoutMs, maxAttempts, bucketSeconds = 0, bucketAgg = "avg" }) => {
                 const preferCloudReads = Boolean(isHostedWebClient && endpointMode === "cloud");
                 const edgeFilter = preferCloudReads ? cloudEdgeApiFilter : null;
+                if (Number(bucketSeconds) > 0) {
+                  // 2026-11-02: the widget asked for "aggregate every N s".
+                  // One bucketed row per N seconds, in the raw row shape.
+                  const field = { avg: "value", min: "value_min", max: "value_max", last: "value_last" }[String(bucketAgg || "avg")] || "value";
+                  const agg = await getAppStoreHistorianAgg({
+                    bucketSeconds, fromUtc, toUtc, gateway, tag,
+                    limit: Math.max(500, Math.min(200000, Number(limit || 2000) * 4)),
+                    cloudEdge: edgeFilter, timeoutMs: Math.max(15000, Number(timeoutMs || 0)), maxAttempts,
+                  });
+                  const rows = Array.isArray(agg?.rows) ? agg.rows : [];
+                  // newest first, like the raw endpoint
+                  return rows.map((r) => ({ ...r, tag_name: r.tag_name || r.tag, value: r[field] })).reverse();
+                }
                 const res = await getAppStoreHistorianRange({
                   fromUtc,
                   toUtc,

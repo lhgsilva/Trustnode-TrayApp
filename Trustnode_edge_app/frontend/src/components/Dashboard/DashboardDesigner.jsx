@@ -312,6 +312,26 @@ const QUERY_GROUP_OPTIONS = [
   { value: "1h", label: "1 hour" },
   { value: "1d", label: "1 day" },
 ];
+// 2026-11-02: "aggregate every" for chart widgets - hours of 1 Hz data at a
+// readable density without dropping to minute buckets.
+const CHART_BUCKET_OPTIONS = [
+  { value: "none", label: "Every reading" },
+  { value: "1s", label: "1 second" },
+  { value: "2s", label: "2 seconds" },
+  { value: "5s", label: "5 seconds" },
+  { value: "10s", label: "10 seconds" },
+  { value: "30s", label: "30 seconds" },
+  { value: "1m", label: "1 minute" },
+  { value: "5m", label: "5 minutes" },
+  { value: "15m", label: "15 minutes" },
+  { value: "1h", label: "1 hour" },
+];
+const CHART_BUCKET_AGG_OPTIONS = [
+  { value: "avg", label: "Average" },
+  { value: "min", label: "Minimum" },
+  { value: "max", label: "Maximum" },
+  { value: "last", label: "Last reading" },
+];
 const QUERY_SELECTION_OPTIONS = [
   { value: "all", label: "All rows in range" },
   { value: "last_n", label: "Last N rows" },
@@ -852,6 +872,8 @@ function buildDefaultForm(type = "line_chart") {
       gateway_id: "",
       tag_name: "",
       readings_count: 120,
+      bucket_interval: "none",
+      bucket_aggregation: "avg",
       interpolation: "stepAfter",
       data_source_type: "tag_direct",
       color_mode: "default",
@@ -1721,6 +1743,10 @@ export function DashboardDesigner({
         gateway_id: unifiedCfg?.gateway_id || "",
         tag_name: unifiedCfg?.tag_name || "",
         readings_count: clamp(widget?.config?.readings_count ?? 120, 5, 5000),
+        bucket_interval: CHART_BUCKET_OPTIONS.some((opt) => opt.value === widget?.config?.bucket_interval)
+          ? widget?.config?.bucket_interval : "none",
+        bucket_aggregation: CHART_BUCKET_AGG_OPTIONS.some((opt) => opt.value === widget?.config?.bucket_aggregation)
+          ? widget?.config?.bucket_aggregation : "avg",
         interpolation: CHART_INTERPOLATION_OPTIONS.some((opt) => opt.value === widget?.config?.interpolation)
           ? widget?.config?.interpolation
           : "stepAfter",
@@ -2095,6 +2121,10 @@ export function DashboardDesigner({
         gateway_id: String(form?.config?.gateway_id || ""),
         tag_name: String(form?.config?.tag_name || ""),
         readings_count: clamp(form?.config?.readings_count ?? 120, 5, 5000),
+        bucket_interval: CHART_BUCKET_OPTIONS.some((opt) => opt.value === form?.config?.bucket_interval)
+          ? form?.config?.bucket_interval : "none",
+        bucket_aggregation: CHART_BUCKET_AGG_OPTIONS.some((opt) => opt.value === form?.config?.bucket_aggregation)
+          ? form?.config?.bucket_aggregation : "avg",
         interpolation: CHART_INTERPOLATION_OPTIONS.some((opt) => opt.value === form?.config?.interpolation)
           ? form?.config?.interpolation
           : "stepAfter",
@@ -3655,6 +3685,31 @@ export function DashboardDesigner({
                       }
                     />
                   </label>
+                ) : null}
+
+                {["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(form.type) ? (
+                  <div className="row">
+                    <label>
+                      Aggregate every
+                      <select
+                        value={form.config.bucket_interval || "none"}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, bucket_interval: e.target.value } }))}
+                        title="Group the readings into fixed buckets before drawing - hours of 1 Hz data at a readable density"
+                      >
+                        {CHART_BUCKET_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                      </select>
+                    </label>
+                    <label>
+                      Using
+                      <select
+                        value={form.config.bucket_aggregation || "avg"}
+                        disabled={String(form.config.bucket_interval || "none") === "none"}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, bucket_aggregation: e.target.value } }))}
+                      >
+                        {CHART_BUCKET_AGG_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                      </select>
+                    </label>
+                  </div>
                 ) : null}
 
                 {/* Series reading points was a separate field on older
