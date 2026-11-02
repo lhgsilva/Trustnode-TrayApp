@@ -83,6 +83,7 @@ from reportlab.platypus import (
     TableStyle,
 )
 from reportlab.graphics.shapes import PolyLine  # noqa: E402  (2026-11-02)
+from reportlab.graphics.shapes import Path as _RLPath  # noqa: E402  pathlib.Path is `Path` here
 from reportlab.graphics.shapes import (
     Circle, Drawing, Group, Line, Rect, String)
 from reportlab.pdfbase.pdfmetrics import stringWidth
@@ -2433,6 +2434,25 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
         return 1.4
 
     # Draw series
+    # 2026-11-02, from a screenshot: a Heating chart with y_min 30 drew the
+    # room-temperature samples before the test BELOW the plot, and a flat run
+    # out to the left of it. _y() maps linearly and nothing clipped the result;
+    # monotone interpolation can also overshoot a little. Each series now
+    # draws inside a group clipped to the plot rectangle, so whatever the
+    # values are, ink stays in the box - the axes still say what the range is.
+    def _plot_clip() -> Group:
+        # fillColor/strokeColor None: a clip only. Left at the defaults the
+        # path is FILLED black before it clips (seen on the first render).
+        clip = _RLPath(isClipPath=1, fillColor=None, strokeColor=None)
+        clip.moveTo(chart_left, chart_bottom)
+        clip.lineTo(chart_left + chart_w, chart_bottom)
+        clip.lineTo(chart_left + chart_w, chart_bottom + chart_h)
+        clip.lineTo(chart_left, chart_bottom + chart_h)
+        clip.closePath()
+        return Group(clip)
+
+    series_group = _plot_clip()
+    drawing.add(series_group)
     for idx, (meta, pts) in enumerate(zip(series_meta, aligned)):
         color_hex = meta.get("color") or palette[idx % len(palette)]
         try:
@@ -2463,9 +2483,9 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
         # a reading - mark it.
         if len(coords) == 1 and kind != "bar":
             cx, cy = coords[0]
-            drawing.add(Circle(cx, cy, max(1.5, lw * 1.6),
-                               fillColor=stroke_color, strokeColor=stroke_color,
-                               strokeWidth=0))
+            series_group.add(Circle(cx, cy, max(1.5, lw * 1.6),
+                                    fillColor=stroke_color, strokeColor=stroke_color,
+                                    strokeWidth=0))
             continue
         if kind == "bar":
             # Bars are INSET from the axis: drawn flush at chart_left the first
@@ -2477,8 +2497,8 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
                 # right edge.
                 x0 = min(max(cx - bar_w / 2, chart_left + 1),
                          chart_right - bar_w - 1)
-                drawing.add(Rect(x0, chart_bottom, bar_w, max(0, cy - chart_bottom),
-                                 fillColor=stroke_color, strokeColor=stroke_color, strokeWidth=0))
+                series_group.add(Rect(x0, chart_bottom, bar_w, max(0, cy - chart_bottom),
+                                      fillColor=stroke_color, strokeColor=stroke_color, strokeWidth=0))
         else:
             # Interpolate ONCE, so the line and the area fill below cannot
             # disagree about where the curve runs.
@@ -2498,7 +2518,7 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
                     fill = colors.Color(fill.red * 0.35 + 0.65, fill.green * 0.35 + 0.65, fill.blue * 0.35 + 0.65, 1.0)
                 except Exception:
                     pass
-                drawing.add(Polygon(pgon_pts, fillColor=fill, strokeColor=None))
+                series_group.add(Polygon(pgon_pts, fillColor=fill, strokeColor=None))
             # 2026-11-02, profiled: one Line shape PER SEGMENT - 28 000 shapes
             # and 360 000 attribute validations for a four-chart report, the
             # largest single cost left once the data phase was fixed. A
@@ -2508,8 +2528,8 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
                 for cx, cy in coords:
                     flat.append(cx)
                     flat.append(cy)
-                drawing.add(PolyLine(flat, strokeColor=stroke_color, strokeWidth=lw,
-                                     strokeLineJoin=1, strokeLineCap=1))
+                series_group.add(PolyLine(flat, strokeColor=stroke_color, strokeWidth=lw,
+                                          strokeLineJoin=1, strokeLineCap=1))
 
     # Axes tick labels (left + right). _format_tick and fmt are defined
     # with the geometry above, because the tick gutter is measured from the

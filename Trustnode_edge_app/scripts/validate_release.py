@@ -357,6 +357,10 @@ SOURCE_CHECKS = [
     # pending, then ready or failed with the reason - with its data stored
     # for preview and regenerate, mirrored only when a cloud is configured.
     ("a generated report exists before its PDF", "test_report_record_first.py"),
+    # 2026-11-02, from a customer's PDF: a chart drew below its plot (values
+    # under y_min were mapped, never clipped) and every section said its
+    # trigger did not fire because the tag was typed in another case.
+    ("charts stay in their box and tag case cannot hide data", "test_chart_clip_and_tag_case.py"),
     # 2026-10-30, asked for directly: "every new installer can be installed
     # in existing computer with all fixes and updates". Boots the PACKAGED
     # backend on a copy of a real workspace with NO data-dir override - the

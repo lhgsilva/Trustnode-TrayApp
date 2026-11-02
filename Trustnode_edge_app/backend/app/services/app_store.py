@@ -10087,6 +10087,19 @@ class AppStore:
                 rows = conn.execute(
                     _sql.replace(GW_CLAUSE_BY_ID, GW_CLAUSE_BY_NAME, 1), params
                 ).fetchall()
+            if not rows and "tag_name = :tag_exact" in where:
+                # 2026-11-02, from a customer template: a trigger spelled
+                # R1_TRUSTNODE_RESULTS.TEST_CYCLE_STARTED[4] against a gateway
+                # whose tag list says R1_Trustnode_Results.… - the PLC does
+                # not care about case, the operator typed it from memory, and
+                # the exact match found nothing, so "section trigger did not
+                # fire" was printed under every chart. Same name in any case,
+                # only after an exact miss, inside the same window: the
+                # gateway+time index bounds it.
+                rows = conn.execute(
+                    _sql.replace("tag_name = :tag_exact", "tag_name = :tag_exact COLLATE NOCASE", 1),
+                    params,
+                ).fetchall()
             # 2026-11-02: the unscoped retry has no usable index (every
             # historian index leads with tenant_id) - a window with no rows
             # cost a scan of the whole table, and read other scopes. Only an
