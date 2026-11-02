@@ -172,9 +172,19 @@ class LinkService:
         # ends. A code belongs to the PLANT. What an engineer needs to see
         # is its OWN unit id and WHICH plant it reached.
         peer = ""
+        peer_unit = ""
         try:
             if self.role != "server":
-                peer = str((getattr(app, "info", None) or {}).get("host") or "")
+                info = getattr(app, "info", None) or {}
+                peer = str(info.get("host") or "")
+                peer_unit = str(info.get("unit") or "").upper()
+            else:
+                # 2026-11-02: the plant sees WHO is connected, not just that
+                # someone is. An older engineer build sends no name.
+                pr = getattr(app, "peer", None) or {}
+                if getattr(app, "sec", None) is not None:
+                    peer = str(pr.get("host") or "") or "an engineer"
+                    peer_unit = str(pr.get("unit") or "").upper()
         except Exception:
             peer = ""
         return {
@@ -182,6 +192,7 @@ class LinkService:
             "devices": devices,
             "reachable": reachable,
             "peer": peer,
+            "peer_unit": peer_unit,
             # One exchange with the plant, measured. A PLC download is
             # tens of thousands of them, and this number multiplied by
             # that count IS the download time - so it belongs on screen
@@ -297,7 +308,22 @@ class LinkService:
                             time.sleep(1.0)
                 except Exception as exc:                 # noqa: BLE001
                     self.error = "%s: %s" % (type(exc).__name__, exc)
-                    self._notify("TN-Link stopped", self.error)
+                    unit = str(getattr(self, "_saved_unit", "") or "")
+                    if unit and self.role != "server" and isinstance(exc, tnlink.AuthError):
+                        # 2026-11-02: a saved connection whose stored code the
+                        # plant refused - it made a new code, or was
+                        # reinstalled. Say so, and stop offering a code that
+                        # cannot work; the card then asks for a fresh one.
+                        try:
+                            tnlink.clear_next_code(unit)
+                        except Exception:
+                            pass
+                        self.error = ("The plant refused the stored code - it has a "
+                                      "new one. Ask for the current code and connect "
+                                      "with it once; after that it reconnects on its own.")
+                        self._notify("TN-Link", self.error)
+                    else:
+                        self._notify("TN-Link stopped", self.error)
 
             self._thread = threading.Thread(target=_run, name="tnlink-service",
                                             daemon=True)
@@ -318,17 +344,30 @@ class LinkService:
                     pass
         try:
             app.alive = False
-            if getattr(app, "sec", None):
+            if callable(getattr(app, "stop", None)):
+                app.stop()                  # closes the listener / relay dial too
+            elif getattr(app, "sec", None):
                 app.sec.close()
         except Exception:
             pass
 
     def restart(self) -> None:
+        self._reconnect()
+        self._notify("TN-Link", "Service restarted.")
+
+    def _reconnect(self, label: str = "") -> None:
+        """Swap the running app for a fresh one, quietly.
+
+        2026-11-02, reported: "every time a new connection is started the
+        app throws a message that the service restarted". Connecting is not
+        a restart and must not say so; the only words the operator sees are
+        about the connection itself."""
         self.stop()
-        time.sleep(1.0)
+        time.sleep(0.5)
         self.app = None
         self.start()
-        self._notify("TN-Link", "Service restarted.")
+        if label:
+            self._notify("TN-Link", "Connecting to %s ..." % label)
 
     def _notify(self, title: str, msg: str) -> None:
         if self._tray is not None:
@@ -372,7 +411,7 @@ class LinkService:
             # an operator revokes access they handed out by phone.
             try:
                 self.args.code = tnlink.new_code()
-                self.restart()
+                self._reconnect()
                 self._notify("TN-Link", "New code: %s" % self.args.code)
             except Exception as exc:                     # noqa: BLE001
                 self._notify("TN-Link", "Could not make a new code: %s" % exc)
@@ -388,10 +427,11 @@ class LinkService:
         def enter_code():
             open_interface()
 
-        def connect_to(code):
+        def connect_to(code, label="", unit=""):
             self.args.code = code
             self.remember(code)
-            self.restart()
+            self._saved_unit = str(unit or "")
+            self._reconnect(label or "the plant")
 
         def connect_saved(unit=""):
             """Reconnect to a machine we have paired with before.
@@ -414,7 +454,14 @@ class LinkService:
                              "with a code it gives you, and reconnecting is "
                              "automatic after that.")
                 return {"ok": False, "reason": "no stored code"}
-            connect_to(code)
+            label = ""
+            try:
+                for row in _saved_connections():
+                    if str(row.get("unit") or "").upper() == str(unit or "").upper():
+                        label = str(row.get("label") or row.get("unit") or "")
+            except Exception:
+                label = ""
+            connect_to(code, label=label or str(unit or ""), unit=str(unit or ""))
             return {"ok": True}
 
         def open_interface():

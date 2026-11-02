@@ -460,10 +460,15 @@ def split_hostport(text: str, default_port: int) -> tuple:
 
 
 def relay_dial(relay: str, code: str, is_agent: bool,
-               connect_timeout: float = 25.0) -> socket.socket:
+               connect_timeout: float = 25.0, on_socket=None) -> socket.socket:
     """Dial the rendezvous and wait to be paired. Outbound only."""
     host, port = split_hostport(relay, 7443)
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if on_socket is not None:
+        try:
+            on_socket(s)                # so a Stop can close a waiting dial
+        except Exception:               # noqa: BLE001
+            pass
     s.settimeout(connect_timeout)
     try:
         s.connect((host, port))
@@ -994,6 +999,16 @@ class Server:
         self._plant_ip = ""
         self._plant_guard = None
         self.lock = threading.Lock()
+        # 2026-11-02: sessions run in their own threads so the plant keeps
+        # ACCEPTING while an engineer is connected. A new successful pairing
+        # replaces the session that is there ("newest wins") - which is how
+        # an engineer whose previous process died reconnects without waiting
+        # for the plant to notice. See _adopt_session.
+        self._sess_lock = threading.Lock()
+        self.next_code = ""
+        self.peer = {}                 # who is connected: {"unit", "host", "since"}
+        self.alive = True
+        self._listener = None
 
     def _compute_allow(self) -> list:
         """The networks the engineer may reach, from what is here NOW."""
@@ -1246,9 +1261,12 @@ class Server:
                 log("session expired - closing")
                 return 0
             try:
-                sock = relay_dial(self.relay, self.code, is_agent=True)
+                sock = relay_dial(self.relay, self.code, is_agent=True,
+                                  on_socket=lambda sk: setattr(self, "_dial", sk))
                 backoff = 2.0
             except AuthError as exc:
+                if not self.alive:
+                    return 0
                 log("relay refused: %s" % exc)
                 return 2
             except OSError as exc:
@@ -1257,6 +1275,12 @@ class Server:
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
                 continue
+            if not self.alive:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return 0
             log("an engineer connected through the relay")
             try:
                 # 2026-10-31. Who is calling? The unit id arrives before the
@@ -1285,59 +1309,12 @@ class Server:
             except (ConnectionError, OSError) as exc:
                 log("pairing failed (%s)" % type(exc).__name__)
                 continue
-            log("PAIRED")
-            self.sec = sec
-            try:
-                self._session(sec)
-            except (ConnectionError, OSError) as exc:
-                log("engineer disconnected (%s)" % type(exc).__name__)
-            except AuthError as exc:
-                log("LINK DROPPED - %s" % exc)
-            except Exception as exc:                        # noqa: BLE001
-                log("LINK DROPPED - %s: %s (frame rejected)"
-                    % (type(exc).__name__, exc))
-            finally:
-                self.sec = None
-                self._drop_all()
-                sec.close()
-                # 2026-10-22: BURN THE CODE. It used to loop straight back
-                # and wait again on the SAME code, so one code served any
-                # number of sessions for as long as the window lasted - and
-                # a server forgotten on an old machine kept answering it.
-                # An engineer paired with yesterday's computer and worked
-                # there for forty minutes without knowing.
-                #
-                # A connection code is now good for exactly one session. The
-                # next engineer needs a code the operator hands over
-                # deliberately, which is the whole point of handing it over.
-                # 2026-10-31, requested: "a way to reconnect to the same
-                # computer after disconnect without re-entering the
-                # connection id code".
-                #
-                # The code is still burned after one session - that property
-                # is the whole point above and it stays. What changes is WHO
-                # learns the next one. At pairing, over the already-encrypted
-                # channel, this server tells the engineer it just let in what
-                # its next code will be. So:
-                #
-                #   * the engineer who was already paired reconnects silently;
-                #   * somebody who merely overheard the old code cannot - it
-                #     is spent;
-                #   * a server forgotten on an old machine still stops
-                #     answering the code it gave out;
-                #   * "New code" in the menu still revokes everything, because
-                #     it replaces the chain.
-                #
-                # No wire change: an older client simply ignores the extra
-                # field and keeps asking its operator for a code.
-                old_code = self.code
-                self.code = getattr(self, "next_code", "") or new_code()
-                self.next_code = ""
-                log("session closed - the code %s is now dead" % old_code)
-                log("")
-                log("  GIVE THIS NEW CODE TO THE NEXT ENGINEER:")
-                log("      %s" % self.code)
-                log("")
+            # 2026-11-02: the session runs in its own thread and this loop
+            # dials the relay AGAIN at once - under the NEXT code, which is
+            # a different room - so the engineer who holds that code can
+            # come back while the old session is still open, and the relay
+            # never answers "busy" to the plant's own engineer.
+            self._paired(sec, "the relay")
 
     # -- lifecycle --------------------------------------------------------
     def serve(self) -> int:
@@ -1381,8 +1358,9 @@ class Server:
             self._ensure_firewall()
         self._banner()
 
+        self._listener = srv
         try:
-            while True:
+            while self.alive:
                 if self.deadline and time.time() > self.deadline:
                     log("session expired - closing")
                     return 0
@@ -1390,9 +1368,15 @@ class Server:
                     conn, addr = srv.accept()
                 except socket.timeout:
                     continue
+                except OSError:
+                    if not self.alive:
+                        return 0
+                    raise
                 log("connection from %s:%d" % addr)
                 try:
+                    conn.settimeout(20.0)
                     sec = handshake(conn, self.code, is_server=True)
+                    conn.settimeout(None)
                 except AuthError as exc:
                     log("REFUSED %s:%d - %s" % (addr[0], addr[1], exc))
                     conn.close()
@@ -1402,33 +1386,105 @@ class Server:
                         % (addr[0], addr[1], exc))
                     conn.close()
                     continue
-                log("PAIRED with %s:%d" % addr)
-                self.sec = sec
-                try:
-                    self._session(sec)
-                except (ConnectionError, OSError) as exc:
-                    log("client disconnected (%s)" % type(exc).__name__)
-                except AuthError as exc:
-                    log("LINK DROPPED - %s" % exc)
-                except Exception as exc:
-                    # A forged or corrupted frame raises InvalidTag out of
-                    # the AEAD. Found by the self-test: it propagated out of
-                    # serve() and killed the whole server, so one bad frame
-                    # ended the session for everyone. Drop the client, keep
-                    # serving.
-                    log("LINK DROPPED - %s: %s (frame rejected)"
-                        % (type(exc).__name__, exc))
-                finally:
-                    self.sec = None
-                    self._drop_all()
-                    sec.close()
-                    log("session closed")
+                # The session runs in its own thread; this loop goes straight
+                # back to accept(), so a reconnecting engineer is never stuck
+                # behind a session the plant has not noticed is over.
+                self._paired(sec, "%s:%d" % addr)
+            return 0
         except KeyboardInterrupt:
             print()
             log("stopped")
             return 0
         finally:
             srv.close()
+
+    def _burn_code(self) -> str:
+        """The code that just paired is dead from this moment.
+
+        2026-11-02. It used to stay valid until the session ENDED, which
+        had two effects: a session the plant had not noticed was over kept
+        the old code alive, and the reconnecting engineer - presenting the
+        NEXT code it was handed in `hello` - was refused. Rotating at
+        pairing fixes both: the only code that opens a new session now is
+        the one handed over the encrypted channel to the engineer who is
+        connected, so "the same client again" is precise, and anyone who
+        merely overheard the first code is refused. Returns the spent code.
+        """
+        with self._sess_lock:
+            spent = self.code
+            self.next_code = new_code()
+            self.code = self.next_code
+        return spent
+
+    def _adopt_session(self, sec: Secure, who: str) -> None:
+        """Make `sec` the live session; drop whatever was there."""
+        with self._sess_lock:
+            prev, self.sec = self.sec, sec
+            self.peer = {"unit": "", "host": "", "since": time.time(), "addr": who}
+        if prev is not None and prev is not sec:
+            log("a newer pairing replaced the session that was open - "
+                "dropping the old one")
+            self._drop_all()
+            try:
+                prev.close()
+            except Exception:                               # noqa: BLE001
+                pass
+
+    def _release_session(self, sec: Secure) -> None:
+        """Tear down only if `sec` is still the live session."""
+        with self._sess_lock:
+            mine = self.sec is sec
+            if mine:
+                self.sec = None
+                self.peer = {}
+        if mine:
+            self._drop_all()
+        try:
+            sec.close()
+        except Exception:                                   # noqa: BLE001
+            pass
+
+    def _run_session(self, sec: Secure, who: str) -> None:
+        self._adopt_session(sec, who)
+        try:
+            self._session(sec)
+        except (ConnectionError, OSError) as exc:
+            log("engineer disconnected (%s)" % type(exc).__name__)
+        except AuthError as exc:
+            log("LINK DROPPED - %s" % exc)
+        except Exception as exc:                            # noqa: BLE001
+            # A forged or corrupted frame raises InvalidTag out of the AEAD;
+            # it ends THIS session and nothing else (the accept loop is a
+            # different thread now, so it could not kill the server anyway).
+            log("LINK DROPPED - %s: %s (frame rejected)"
+                % (type(exc).__name__, exc))
+        finally:
+            self._release_session(sec)
+            log("session closed")
+
+    def _paired(self, sec: Secure, who: str) -> None:
+        spent = self._burn_code()
+        log("PAIRED with %s - the code %s is now spent; this engineer "
+            "holds the next one" % (who, spent))
+        threading.Thread(target=self._run_session, args=(sec, who),
+                         name="tnlink-session", daemon=True).start()
+
+    def stop(self) -> None:
+        """Stop accepting and close the live session (the tray's Stop)."""
+        self.alive = False
+        for attr in ("_listener", "_dial"):
+            sock = getattr(self, attr, None)
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:                           # noqa: BLE001
+                    pass
+        sec = self.sec
+        if sec is not None:
+            try:
+                sec.close()
+            except Exception:                               # noqa: BLE001
+                pass
 
     def _drop_all(self) -> None:
         # A dropped session must not leave an adapter, a NAT rule or a
@@ -1492,6 +1548,17 @@ class Server:
             # changing what the far end has stored.
             if not getattr(self, "next_code", ""):
                 self.next_code = new_code()
+            # 2026-11-02: the engineer says who it is (an older client sends
+            # nothing extra and shows as "engineer"). Shown on the plant's
+            # own screen - the operator should see WHO is on their network.
+            try:
+                if isinstance(self.peer, dict) and (msg.get("unit") or msg.get("host")):
+                    self.peer.update({"unit": str(msg.get("unit") or "").upper(),
+                                      "host": str(msg.get("host") or "")})
+                    log("connected engineer: %s (%s)"
+                        % (self.peer.get("host") or "?", self.peer.get("unit") or "?"))
+            except Exception:                               # noqa: BLE001
+                pass
             sec.send(pack_ctrl({"op": "hello", "version": VERSION,
                                 # What this engineer should use next time.
                                 # An older client ignores it.
@@ -1941,7 +2008,9 @@ class Client:
             s.settimeout(None)
         self.sec = handshake(s, self.code, is_server=False)
         threading.Thread(target=self._reader, daemon=True).start()
-        self.sec.send(pack_ctrl({"op": "hello"}))
+        # Who is calling - extra keys an older server ignores.
+        self.sec.send(pack_ctrl({"op": "hello", "unit": unit_id(),
+                                 "host": socket.gethostname()}))
         self.info = self._await("hello", 15) or {}
         # 2026-10-31: file this machine in the address book the moment we know
         # who it is. Keyed by its permanent unit id, so the entry survives the
@@ -3920,6 +3989,23 @@ def remember_next_code(unit: str, code: str) -> bool:
                  "uses": 0, "next_code": code})
     data["connections"] = rows
     return _save_settings(data)
+
+
+def clear_next_code(unit: str) -> bool:
+    """Forget the stored code for a server that refused it (it made a new
+    one); the card then asks for a fresh code instead of failing silently."""
+    unit = str(unit or "").strip().upper()
+    data = _load_settings()
+    rows = [r for r in (data.get("connections") or []) if isinstance(r, dict)]
+    hit = False
+    for r in rows:
+        if str(r.get("unit") or "").upper() == unit and r.get("next_code"):
+            r["next_code"] = ""
+            hit = True
+    if hit:
+        data["connections"] = rows
+        return _save_settings(data)
+    return False
 
 
 def next_code_for(unit: str) -> str:

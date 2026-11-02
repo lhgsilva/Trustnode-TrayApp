@@ -230,8 +230,8 @@ check("  200 KB survives the framing intact",
 # --------------------------------------------------------------------------
 print()
 print("[8. a tampered frame drops the link instead of being accepted]")
-# The server holds ONE client at a time (documented prototype limit), so the
-# first session has to end before this connection can even be accepted.
+# 2026-11-02: a code is spent the moment it pairs, so this hand-built session
+# pairs with the plant's CURRENT code (the harness owns the server object).
 cli.alive = False
 if cli.sec:
     cli.sec.close()
@@ -242,7 +242,7 @@ s2.settimeout(10)
 verdict = ""
 try:
     s2.connect(("127.0.0.1", PORT))
-    sec2 = T.handshake(s2, code, is_server=False)
+    sec2 = T.handshake(s2, srv.code, is_server=False)
     pt = T.pack_ctrl({"op": "hello"})
     ct = sec2._tx.encrypt(sec2._nonce(sec2._tx_n), pt, None)
     bad = bytearray(ct)
@@ -268,7 +268,10 @@ check("a forged frame is not answered",
 time.sleep(1.5)
 survived = ""
 try:
-    c3 = T.Client("127.0.0.1", PORT, code)
+    # 2026-11-02: a code is spent the moment it pairs; the engineer who
+    # paired holds the NEXT one (handed over in hello). Same engineer, so
+    # it reconnects with that - a stranger with the first code is refused.
+    c3 = T.Client("127.0.0.1", PORT, srv.code)
     c3.connect()
     survived = "paired again: %s" % (c3.info.get("host") or "?")
     c3.alive = False

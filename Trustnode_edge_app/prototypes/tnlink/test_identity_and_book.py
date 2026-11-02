@@ -259,10 +259,12 @@ def main() -> int:
     check("  minted once per session, not on every hello",
           'if not getattr(self, "next_code", "")' in src,
           "a fresh code on each hello would leave the client holding a stale one")
+    # 2026-11-02: the code is spent the moment it PAIRS (not when the session
+    # ends), and the engineer who paired holds the next one - see _burn_code.
     check("  and the burned code is REPLACED by it, not by a random one",
-          'self.code = getattr(self, "next_code", "") or new_code()' in src)
+          "self.code = self.next_code" in src and "def _burn_code" in src)
     check("  the one-shot rule is untouched",
-          "BURN THE CODE" in src and "old_code = self.code" in src,
+          "spent = self.code" in src and "self._burn_code()" in src,
           "a forgotten server must still stop answering the code it gave out")
     check("the client stores what the server sent",
           "remember_next_code(str(self.info.get(" in src)

@@ -147,13 +147,16 @@
         </div>
       </div>
 
-      <!-- Engineer only: where this unit is connected TO. -->
+      <!-- Both roles: the computer at the other end of the link. The plant
+           sees WHICH engineer is on its network; the engineer sees WHICH
+           plant it reached (2026-11-02). -->
       <div class="card" id="card-peer" hidden>
-        <h2>Connected to</h2>
+        <h2 id="peer-title">Connected to</h2>
         <div class="kv">
-          <b>Plant</b><span class="mono" id="peer">-</span>
-          <b>Networks</b><span class="mono" id="peer-nets">-</span>
-          <b>Link</b><span id="link">-</span>
+          <b id="peer-label">Plant</b><span class="mono" id="peer">-</span>
+          <b>Unit</b><span class="mono" id="peer-unit">-</span>
+          <b id="peer-nets-label">Networks</b><span class="mono" id="peer-nets">-</span>
+          <b id="link-label">Link</b><span id="link">-</span>
         </div>
         <div class="sub" id="link-note" style="margin-top:6px" hidden></div>
       </div>
@@ -299,12 +302,13 @@ function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&
 let coreLines = [];
 let logSig = "";
 let connSig = "";
+let connectedUnit = "";
 function drawConns(rows) {
   rows = Array.isArray(rows) ? rows : [];
   // Redraw only on a real change: this runs on every poll, and rebuilding
   // the table under the operator's cursor loses a click and any text they
   // are part-way through typing in a rename box.
-  const sig = JSON.stringify(rows);
+  const sig = JSON.stringify(rows) + "|" + connectedUnit;
   if (sig === connSig) return;
   connSig = sig;
 
@@ -331,8 +335,10 @@ function drawConns(rows) {
     star.appendChild(sb);
 
     const name = document.createElement("td");
-    name.textContent = r.label || r.unit;
-    name.title = r.host ? ("Computer name: " + r.host) : "";
+    const live = connectedUnit && String(r.unit || "").toUpperCase() === connectedUnit.toUpperCase();
+    name.textContent = (live ? "\u25CF " : "") + (r.label || r.unit);
+    name.title = (live ? "Connected now. " : "") + (r.host ? ("Computer name: " + r.host) : "");
+    if (live) name.style.color = "var(--ok, #16a34a)";
 
     const unit = document.createElement("td");
     unit.className = "mono";
@@ -349,7 +355,7 @@ function drawConns(rows) {
     // Reconnecting needs no code: the one this machine expects from us next
     // was handed over at the previous pairing, over the encrypted channel.
     const go = document.createElement("button");
-    go.textContent = "Connect";
+    go.textContent = live ? "Reconnect" : "Connect";
     go.className = "primary";
     go.disabled = !r.can_connect;
     go.title = r.can_connect
@@ -492,6 +498,7 @@ async function refresh() {
   }
   let s;
   try { s = await link.state(); } catch (_) { return; }
+  connectedUnit = Number(s.peers || 0) ? String(s.peer_unit || "") : "";
   drawConns(s.connections);
 
   const running = !!s.running, peers = Number(s.peers || 0);
@@ -511,12 +518,17 @@ async function refresh() {
 
   $("card-code").hidden    = !plant;
   $("card-join").hidden    = plant || !s.role;
-  $("card-peer").hidden    = plant || !peers;
+  $("card-peer").hidden    = !peers;
   $("card-actions").hidden = plant || !peers;
   $("card-reach").hidden   = plant || !s.role;
   $("code").textContent = s.code || "-";
-  $("peer").textContent = s.peer || "the plant";
+  $("peer-title").textContent = plant ? "Connected engineer" : "Connected to";
+  $("peer-label").textContent = plant ? "Computer" : "Plant";
+  $("peer").textContent = s.peer || (plant ? "an engineer" : "the plant");
+  $("peer-unit").textContent = s.peer_unit || "-";
+  $("peer-nets-label").textContent = plant ? "Sharing" : "Networks";
   $("peer-nets").textContent = (s.shared || []).join(", ") || "-";
+  $("link-label").hidden = plant; $("link").hidden = plant;
   renderLink(s);
 
   renderReach(s.reachable || []);
