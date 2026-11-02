@@ -3727,7 +3727,18 @@ def _fmt_number(v: Any, preset: str | None, unit: str | None) -> str:
     except Exception:
         return str(v)
     p = (preset or "3dp").lower()
-    if p == "int":
+    if p == "name":
+        # 2026-10-30, requested: "when saving a workorder or other tag used
+        # to save files should not include the decimals at all". A work
+        # order is an identifier, not a measurement - "76668.000" is both
+        # ugly in a folder tree and the dot that used to turn a folder into
+        # a file. A number that really has decimals keeps them, trimmed of
+        # trailing zeros, so a reading used in a name is not rounded away.
+        if n == int(n):
+            out = "%d" % int(n)
+        else:
+            out = ("%.6f" % n).rstrip("0").rstrip(".")
+    elif p == "int":
         out = "%d" % int(round(n))
     elif p == "2dp":
         out = "%.2f" % n
@@ -3854,7 +3865,19 @@ _TOKEN_RE = re.compile(r"\{(tag|last|avg|max|min|first):([^}]+)\}")
 # the prefixed form is what the resolver matched, and anything else passed
 # through untouched. Writing the tag name on its own is the obvious thing to
 # try, so it now works.
-_BARE_TOKEN_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_./-]*(?:\|[^}]*)?)\}")
+# 2026-10-30, reported as "I am not sure the path and file names are being
+# created correctly". They were not. The character class below had no [ or ],
+# so a tag called SimREAL[3] - the ordinary shape for an array element, and
+# what this customer's tags are called - could not match. Measured with the
+# operator's own pattern:
+#
+#   folder {date}-{time}-{n}\{SimREAL[3]}   ->  .../20261031-080405-{n}/{SimREAL[3]}
+#   name   {SimDINT[3]}-{id}-{time}         ->  SimDINT_3_-rep-1-080405.pdf
+#
+# A folder literally named "{SimREAL[3]}", and a file named after the TAG
+# instead of its value - and the two were inconsistent because the file name
+# goes through a sanitiser that mangles the braces while the folder does not.
+_BARE_TOKEN_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_.\[\]/-]*(?:\|[^}]*)?)\}")
 # ...except these, which are filled in later by _fill_name_placeholders from
 # the run itself. Consuming them here as "a tag called template" would break
 # every existing pattern.
@@ -3873,6 +3896,9 @@ _RESERVED_TOKENS = frozenset({
 #: ("job___tnseq"). Letters only, so it arrives exactly as written.
 _SEQ_SLOT = "TNSEQSLOT"
 _SEQ_TOKEN_RE = re.compile(r"\{n\}", re.I)
+#: {n} together with the separator it is glued to, for folder patterns where
+#: a run number cannot be resolved. Pattern-only - never applied to a value.
+_SEQ_WITH_SEP_RE = re.compile(r"[-_ .]*\{n\}", re.I)
 
 
 class _BareMatch:
@@ -3888,7 +3914,8 @@ class _BareMatch:
 
 
 def resolve_text_tokens(text: str, from_utc: str, to_utc: str,
-                        gateway: str = "", fetch=None) -> str:
+                        gateway: str = "", fetch=None,
+                        num_fmt: str | None = None) -> str:
     """Replace {tag:Name} style tokens with values from the window.
 
     2026-10-01, requested: "even when we want to add some text on the report
@@ -3946,7 +3973,7 @@ def resolve_text_tokens(text: str, from_utc: str, to_utc: str,
                 if hit is not None:
                     return hit
             if num is not None:
-                return _fmt_number(num, "3dp", None)
+                return _fmt_number(num, num_fmt or "3dp", None)
             return txt if txt not in (None, "") else "-"
 
         if kind in ("tag", "last"):
@@ -4255,7 +4282,14 @@ def norm_axis4(value: Any) -> str:
 def _fill_name_placeholders(text: str, template_name: str, report_id: str,
                             started: str, ended: str) -> str:
     """Replace {template} {id} {start} {end} {date} {time} in a name or path."""
-    stamp = (started or ended or "").replace("T", " ")
+    # 2026-10-31: with neither a start nor an end this produced EMPTY strings,
+    # so a folder pattern of "{date}-{time}-{n}" became literally "--{n}" -
+    # found as an empty directory of that name in the operator's Reports
+    # folder. A report always happens at some moment; falling back to now is
+    # always closer to the truth than a nameless folder, and it can never
+    # collapse two different runs into one directory.
+    _now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    stamp = (started or ended or _now).replace("T", " ")
     for key, value in (("{template}", template_name), ("{id}", report_id),
                        ("{start}", (started or "").replace(":", "").replace(" ", "_")),
                        ("{end}", (ended or "").replace(":", "").replace(" ", "_")),
@@ -4300,7 +4334,8 @@ def resolve_output_path(pattern: str, *, template_name: str = "",
     text = str(pattern or "").strip()
     if not text:
         return ""
-    text = resolve_text_tokens(text, started, ended, gateway, fetch)
+    text = resolve_text_tokens(text, started, ended, gateway, fetch,
+                               num_fmt="name")
     text = _fill_name_placeholders(text, template_name, report_id, started, ended)
     text = text.replace("\\", "/")
     head, _, tail = text.rpartition("/")
@@ -4338,7 +4373,8 @@ def build_report_file_name(pattern: str, *, template_name: str = "",
     text = str(pattern or "").strip()
     if not text:
         return ""
-    text = resolve_text_tokens(text, started, ended, gateway, fetch)
+    text = resolve_text_tokens(text, started, ended, gateway, fetch,
+                               num_fmt="name")
     text = _fill_name_placeholders(text, template_name, report_id, started, ended)
     # The run number cannot be resolved here - it depends on what is already
     # in the destination folder, which only the writer knows.
@@ -4376,14 +4412,72 @@ def resolve_output_target(output_path: str, file_pattern: str, *,
     if not folder:
         return name                       # "" keeps the uuid name
 
-    text = resolve_text_tokens(folder, started, ended, gateway, fetch)
+    # {n} cannot mean anything in a FOLDER: it is the run number, and the run
+    # number is only knowable once the destination folder can be listed, which
+    # is circular. Remove it - and the separator it is glued to - from the
+    # PATTERN, before anything is resolved.
+    #
+    # 2026-10-31: the first version did this on the RESOLVED text with
+    # re.sub(r"[-_ .]+$", "", text). That also ate a trailing separator that
+    # belonged to a real value, and a tag with no reading resolves to "-", so
+    # a folder whose whole name was "-" disappeared and its text merged into
+    # the file name. Measured through the live manual-run API:
+    #
+    #   .../Reports/{Work_Order} + {Work_Order}-{date}-{n}
+    #     wanted  .../Reports/-/--20261031-1.pdf
+    #     got     .../Reports/--20261031-1.pdf      <- the folder was gone
+    #
+    # Operating on the pattern touches only what the operator typed.
+    folder = _SEQ_WITH_SEP_RE.sub("", str(folder or ""))
+    text = resolve_text_tokens(folder, started, ended, gateway, fetch,
+                               num_fmt="name")
+    # 2026-10-31: a token whose tag has no reading in the window becomes "-",
+    # by design, so a missing value is visible rather than vanishing. In a
+    # FILE it reads as a placeholder; in a FOLDER it reads as "the tag is not
+    # resolving", which is exactly how it was reported. Name the tag in the
+    # log so the answer is "Work_Order had no reading", not a guess.
+    try:
+        _unresolved = [m for m in re.findall(r"\{([^}]+)\}", str(folder or ""))
+                       if ("-" in text.split("/")[-1] or "-" in text)
+                       and m.lower() not in _RESERVED_TOKENS]
+        if _unresolved and "/-" in text.replace("\\", "/"):
+            print("[trustnode][reports] destination folder %r resolved to %r - "
+                  "tag(s) %s had no reading in the report window"
+                  % (folder, text, ", ".join(sorted(set(_unresolved)))), flush=True)
+    except Exception:
+        pass
     text = _fill_name_placeholders(text, template_name, report_id, started, ended)
+    # {n} cannot mean anything in a FOLDER. It is the run number, and the run
+    # number is only knowable once the destination folder can be listed -
+    # putting it in the folder name is circular. It used to be left alone,
+    # which created a directory literally called "20261031-080405-{n}".
+    # Dropped here, with the separator it was glued to, so nothing with a
+    # brace in it ever reaches the disk. The editor says where {n} belongs.
     text = text.replace("\\", "/").rstrip()
 
+    # Folder or file is decided by what the OPERATOR TYPED, never by what a
+    # tag happened to hold.
+    #
+    # 2026-10-30, reported: "the folder was not created or found when I use
+    # tag {} format". The test used to run on the RESOLVED text, so
+    #
+    #     C:/Reports/{Work_Order}
+    #
+    # became a folder when the work order was "BAY6578" and a FILE when it
+    # was "76668.000" - because that value contains a dot. One pattern, two
+    # behaviours, decided by data the operator cannot see when typing. The
+    # customer's own Generated Reports list shows the damage: "76668.000.pdf"
+    # sitting where a folder named 76668.000 should have been.
+    #
+    # Tokens are removed before looking for an extension, so a dot can only
+    # count when it was typed literally - "{Work_Order}.pdf" is still a file,
+    # "{Work_Order}" is still a folder, whatever the tag returns.
+    pattern_text = str(folder).replace("\\", "/").rstrip()
+    pattern_last = pattern_text.rsplit("/", 1)[-1]
+    literal_last = re.sub(r"\{[^}]*\}", "", pattern_last)
+    names_a_file = (bool(pattern_last) and "." in literal_last
+                    and not pattern_text.endswith("/"))
     last = text.rsplit("/", 1)[-1]
-    # A trailing separator, or a last segment with no extension, means the
-    # operator pointed at a folder. "report.pdf" means they named the file.
-    names_a_file = bool(last) and "." in last and not text.endswith("/")
     if names_a_file:
         return resolve_output_path(
             folder, template_name=template_name, report_id=report_id,

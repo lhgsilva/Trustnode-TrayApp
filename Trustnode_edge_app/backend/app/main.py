@@ -125,6 +125,9 @@ _bootstrap_env_from_dotenv()
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+import os as _os_slow
+import time as _time_slow
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
@@ -164,7 +167,30 @@ from app.state import (
 )
 from app.services.cp_users_puller import build_from_env as build_cp_users_puller
 import app.state as _state
-from app.tenant import resolve_request_tenant, resolve_websocket_tenant, set_current_tenant
+from app.tenant import (effective_tenant, resolve_request_tenant,
+                        resolve_websocket_tenant, set_current_tenant)
+
+_CONFIGURED_TENANT_CACHE = {"value": "", "ts": 0.0}
+
+
+def _configured_tenant() -> str:
+    """The tenant this edge was activated into, cached 15 s.
+
+    Read on every request, so it is one SELECT every 15 s rather than one
+    per call. Activation writes the value and then signs the operator in
+    with a token that carries the tenant itself, so the cache never
+    delays anyone.
+    """
+    now = _time_mod.time()
+    if now - _CONFIGURED_TENANT_CACHE["ts"] < 15.0:
+        return _CONFIGURED_TENANT_CACHE["value"]
+    try:
+        value = str(app_store._configured_tenant_id() or "")   # noqa: SLF001
+    except Exception:
+        value = ""
+    _CONFIGURED_TENANT_CACHE["value"] = value
+    _CONFIGURED_TENANT_CACHE["ts"] = now
+    return value
 
 # Boot perf (2026-06-18): pre-warm the asyncua (and amqtt) import in a
 # background thread the moment this module is loaded by uvicorn.  By the
@@ -332,8 +358,11 @@ class CloudLiveAuthMiddleware:
                 await send({"type": "http.response.start", "status": 403, "headers": [(b"content-type", b"application/json")]})
                 await send({"type": "http.response.body", "body": b'{"detail":"Token tenant mismatch"}'})
                 return
-        elif host_tenant:
-            set_current_tenant(host_tenant)
+        else:
+            # 2026-11-02: no token tenant and a loopback host used to mean
+            # `default` - the developer tenant. On an activated edge it means
+            # THIS edge's tenant. See tenant.effective_tenant.
+            set_current_tenant(effective_tenant("", host_tenant, _configured_tenant()))
         # Stash payload onto scope so the endpoint can read it if needed.
         scope.setdefault("state", {})["user_payload"] = payload
         return await self.app(scope, receive, send)
@@ -359,6 +388,79 @@ class _FakeRequest:
         return urlparse(path)
 
 
+# 2026-10-31. "templates, scheduled reports, generated reports could not be
+# loaded: The edge did not answer in time" - on ONE customer's computer,
+# never here. There was no request timing anywhere in this process, so the
+# edge could not say whether it had answered in 6 ms or not at all, and the
+# message in the browser asserted "It is busy" without anybody having
+# measured it. That is the same trap as a stale cached shell and a blocked
+# network looking identical in a screenshot.
+#
+# Pure ASGI, not BaseHTTPMiddleware: that one wraps every response in an
+# extra task and has its own history of breaking streaming. This adds one
+# perf_counter call per request and logs ONLY the slow ones, so a healthy
+# edge stays silent.
+class _SlowRequestLog:
+    THRESHOLD_S = float(_os_slow.environ.get("TRUSTNODE_SLOW_REQUEST_S", "3.0"))
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        started = _time_slow.perf_counter()
+        status_holder = {"code": 0}
+
+        async def _send(message):
+            if message.get("type") == "http.response.start":
+                status_holder["code"] = int(message.get("status") or 0)
+            await send(message)
+
+        try:
+            await self.app(scope, receive, _send)
+        finally:
+            took = _time_slow.perf_counter() - started
+            if took >= self.THRESHOLD_S:
+                _path = str(scope.get("path") or "?")
+                _method = str(scope.get("method") or "?")
+                try:
+                    print("[trustnode][slow] %s %s took %.2fs (status %s)"
+                          % (_method, _path, took, status_holder["code"]),
+                          flush=True)
+                except Exception:
+                    pass
+                # 2026-10-31: printing it put the evidence in backend.log,
+                # which is not the page anybody opens. The operator reads
+                # Logs; a measurement they cannot see is a measurement that
+                # does not exist. Never log the log endpoints themselves -
+                # that is how a slow read becomes a write becomes a slow
+                # read.
+                try:
+                    if not _path.startswith("/api/app-store/append/") \
+                            and "/logs" not in _path:
+                        from app.state import app_store as _st
+                        _st.append_log_rows([{
+                            "level": "warning", "category": "system",
+                            # 2026-11-02: the time includes SENDING the
+                            # reply. A 2 MB chart payload over a slow tunnel
+                            # lands here too, and that one is the link, not
+                            # the edge - so say what was measured, not whose
+                            # fault it is.
+                            "message": ("Slow request: %s %s took %.1fs "
+                                        "(status %s), measured from the "
+                                        "request arriving to the reply being "
+                                        "sent - a large reply on a slow link "
+                                        "counts too."
+                                        % (_method, _path, took,
+                                           status_holder["code"])),
+                        }])
+                except Exception:
+                    pass
+
+
+app.add_middleware(_SlowRequestLog)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
@@ -970,10 +1072,32 @@ async def _deferred_startup() -> None:
                     db_path = getattr(app_store, "_db_path", None)
                     if db_path:
                         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0)
+                        # 2026-10-30, CLAUDE.md rule 1b: this selected EVERY
+                        # scoped users_access document in the file and fed
+                        # them all into this edge's login store. One file
+                        # routinely holds several edges - the operator's held
+                        # three - so another customer's user rows were being
+                        # written in here, and whichever document was consumed
+                        # last decided the password for a username they share.
+                        # This edge's scope only.
+                        _scope = ""
                         try:
-                            for row in con.execute(
-                                "SELECT payload_json FROM config_documents_scoped WHERE domain='users_access'"
-                            ).fetchall():
+                            from app.routers.app_store import shared_edge_scope_key
+                            _scope = str(shared_edge_scope_key() or "")
+                        except Exception:
+                            _scope = ""
+                        if _scope:
+                            _q = ("SELECT payload_json FROM config_documents_scoped "
+                                  "WHERE domain='users_access' AND scope_key = ?")
+                            _args = (_scope,)
+                        else:
+                            # No identity yet: unscoped is this edge's own home,
+                            # and there is no scope to be confused with.
+                            _q = ("SELECT payload_json FROM config_documents_scoped "
+                                  "WHERE domain='users_access' AND 1=0")
+                            _args = ()
+                        try:
+                            for row in con.execute(_q, _args).fetchall():
                                 try:
                                     scoped_payloads.append(_json.loads(row[0]) if isinstance(row[0], str) else row[0])
                                 except Exception:
@@ -982,7 +1106,9 @@ async def _deferred_startup() -> None:
                             con.close()
                 except Exception:
                     pass
-                return _auth_store.migrate_from_app_store_payload(unscoped, scoped_payloads)
+                return _auth_store.migrate_from_app_store_payload(
+                    unscoped, scoped_payloads,
+                    default_tenant=app_store._configured_tenant_id())   # noqa: SLF001
             counts = await asyncio.to_thread(_migrate)
             print(f"[trustnode][boot] AuthStore migration: {counts}", flush=True)
     except Exception as exc:
@@ -996,10 +1122,30 @@ async def _deferred_startup() -> None:
         report_scheduler.start()
     except Exception:
         pass
+    # 2026-10-31: an edge that is not licensed for Power Management but HAS
+    # meters configured must still collect from them - the licence gate is
+    # there to avoid running threads nobody asked for, not to switch off a
+    # meter somebody already set up. Read after boot, never in __init__.
+    try:
+        _pcfg = app_store.get_domain_scoped_fast("power_management_config")
+        _devs = (_pcfg or {}).get("devices") if isinstance(_pcfg, dict) else None
+        if any(bool(d.get("enabled", True)) for d in (_devs or []) if isinstance(d, dict)):
+            from app.state import power_manager as _pm_boot
+            _pm_boot.ensure_started()
+            print("[trustnode][boot] power meters are configured - "
+                  "power manager started", flush=True)
+    except Exception:
+        pass
     try:
         from app.services import lan_socket as _lan_socket
-        s = bootstrap.get("app_settings") if isinstance(bootstrap, dict) and isinstance(bootstrap.get("app_settings"), dict) else {}
-        if bool(s.get("lan_sharing_enabled")):
+        # 2026-10-30: boot read the LAN settings out of the unscoped bootstrap
+        # while the Remote Access page wrote them scoped to this edge, so a
+        # machine could come up with the listeners of whichever edge last
+        # shared this file. One loader for both paths.
+        from app.routers.lan_sharing import _load_app_settings as _lan_settings
+        s = _lan_settings()
+        from app.services import lan_socket as _lsock
+        if _lsock.sharing_enabled(s):
             _lan_socket.sync_with_settings(True, int(settings.trustnode_port), s)
     except Exception:
         pass
@@ -1040,8 +1186,20 @@ async def _deferred_startup() -> None:
         pass
     # Drains the Supabase `lite_report_requests` queue (Lite "Generate" button).
     # Idle and silent when no cloud DB target is configured.
+    # 2026-10-30: only when the edge is licensed for Lite. The poller is
+    # already idle without a cloud target, but an idle thread still has to be
+    # explained to whoever reads a thread dump at 2am.
     try:
-        lite_report_poller.start()
+        from app.services.access_policy import has_module as _has_mod
+        _lite_ok = bool(_has_mod("cloud_lite_access"))
+    except Exception:
+        _lite_ok = True
+    try:
+        if _lite_ok:
+            lite_report_poller.start()
+        else:
+            print("[trustnode][boot] cloud Lite not licensed - "
+                  "report poller not started", flush=True)
     except Exception:
         pass
     # Pull portal-side cp_users changes into the local edge SQLite so an
@@ -1479,7 +1637,18 @@ async def auth_middleware(request: Request, call_next):
             pass
         return response
 
-    tenant_id = resolve_request_tenant(request)
+    host_tenant = resolve_request_tenant(request)
+    # 2026-11-02: the desktop app always arrives from 127.0.0.1, which the
+    # host rule maps to `default` - TrustNode's own developer tenant. So a
+    # login, a user created on the Users page, a gateway start: anything
+    # that ran before a token existed, or with a token that carried no
+    # tenant, was filed under `default`. Measured on the live store:
+    # historian rows and a cp_users `admin` under `default` on an edge
+    # activated into tenant-cust-11e164d2. On an activated edge a request
+    # with no tenant of its own is THIS edge's. The strict token-vs-host
+    # check below still keys on the host alone: a user whose row still
+    # says `default` must keep signing in.
+    tenant_id = effective_tenant("", host_tenant, _configured_tenant())
     set_current_tenant(tenant_id)
     path = request.url.path or ""
     method = (request.method or "GET").upper()
@@ -1575,8 +1744,9 @@ async def auth_middleware(request: Request, call_next):
         token_tenant = str(payload.get("tenant_id") or "").strip()
         if token_tenant:
             normalized_token_tenant = set_current_tenant(token_tenant)
-            # Strict mismatch only when request explicitly targets a non-default tenant.
-            if tenant_id != "default" and normalized_token_tenant != tenant_id:
+            # Strict mismatch only when the HOST names a tenant (a hosted
+            # portal domain) - never against the activated-tenant fallback.
+            if host_tenant != "default" and normalized_token_tenant != host_tenant:
                 return _apply_no_cache_headers(JSONResponse(status_code=403, content={"detail": "Token tenant mismatch"}))
             tenant_id = normalized_token_tenant
         elif tenant_id:
@@ -1657,7 +1827,8 @@ def _ws_json(payload: object) -> str:
 
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket) -> None:
-    tenant_id = resolve_websocket_tenant(websocket)
+    host_tenant = resolve_websocket_tenant(websocket)
+    tenant_id = effective_tenant("", host_tenant, _configured_tenant())   # 2026-11-02, as the http middleware
     set_current_tenant(tenant_id)
     token = (websocket.query_params.get("token") or "").strip()
     if not token:
@@ -1668,7 +1839,7 @@ async def websocket_stream(websocket: WebSocket) -> None:
         token_tenant = str(payload.get("tenant_id") or "").strip()
         if token_tenant:
             normalized_token_tenant = set_current_tenant(token_tenant)
-            if tenant_id != "default" and normalized_token_tenant != tenant_id:
+            if host_tenant != "default" and normalized_token_tenant != host_tenant:
                 await websocket.close(code=1008)
                 return
             tenant_id = normalized_token_tenant
@@ -1810,7 +1981,8 @@ async def _websocket_cloud_live_loop(websocket: WebSocket, tenant_id: str) -> No
 @app.websocket("/ws/cloud-stream")
 @app.websocket("/ws/cloud-live")
 async def websocket_cloud_stream(websocket: WebSocket) -> None:
-    tenant_id = resolve_websocket_tenant(websocket)
+    host_tenant = resolve_websocket_tenant(websocket)
+    tenant_id = effective_tenant("", host_tenant, _configured_tenant())   # 2026-11-02, as the http middleware
     set_current_tenant(tenant_id)
     token = (websocket.query_params.get("token") or "").strip()
     if not token:
@@ -1821,7 +1993,7 @@ async def websocket_cloud_stream(websocket: WebSocket) -> None:
         token_tenant = str(payload.get("tenant_id") or "").strip()
         if token_tenant:
             normalized_token_tenant = set_current_tenant(token_tenant)
-            if tenant_id != "default" and normalized_token_tenant != tenant_id:
+            if host_tenant != "default" and normalized_token_tenant != host_tenant:
                 await websocket.close(code=1008)
                 return
             tenant_id = normalized_token_tenant

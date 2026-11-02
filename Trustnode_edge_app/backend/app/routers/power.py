@@ -4,14 +4,31 @@ from typing import Any, Dict
 import logging
 import traceback
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
 from app.state import app_store, power_manager
 
-router = APIRouter(prefix="/api/power", tags=["power"])
+# 2026-10-30: the power manager's two threads no longer start at import on an
+# edge that is not licensed for Power Management - they were measured running
+# on an install with no meters and no licence. Anything that touches this
+# router starts them, so the moment the feature IS used it behaves exactly as
+# before, licence or not.
+#
+# A plain function, not a lambda: a dependency declared as
+# `Depends(lambda request: ...)` turns every route in the router into a 422
+# (learned the hard way, see fastapi_dependency_lambda_trap).
+def _ensure_power_running() -> None:
+    try:
+        power_manager.ensure_started()
+    except Exception:
+        pass
+
+
+router = APIRouter(prefix="/api/power", tags=["power"],
+                   dependencies=[Depends(_ensure_power_running)])
 
 
 class PowerConfigPayload(BaseModel):

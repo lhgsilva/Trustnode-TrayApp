@@ -99,7 +99,23 @@ def _store_is_writable(db_path: str) -> bool:
     try:
         con = sqlite3.connect(db_path, timeout=5.0)
         try:
+            # 2026-10-30: BEGIN IMMEDIATE alone was NOT the honest question.
+            # Measured on %ProgramData%\TrustNode\edge under the installer's
+            # "Authenticated Users:(OI)(CI)RX":
+            #
+            #   BEGIN IMMEDIATE ............ OK
+            #   CREATE TABLE / PRAGMA write . attempt to write a readonly database
+            #
+            # The lock is granted and the first real page write is refused, so
+            # this guard passed and the process then died in _ensure_schema on
+            # an ALTER TABLE - which the launcher shows as "Backend service did
+            # not respond within 120 seconds. The service may have failed to
+            # start." Only a write that touches a page answers the question.
+            #
+            # The ROLLBACK is what keeps it honest in the other direction:
+            # nothing is left behind on a database that IS writable.
             con.execute("BEGIN IMMEDIATE")
+            con.execute("CREATE TABLE IF NOT EXISTS _tn_write_probe(x)")
             con.execute("ROLLBACK")
             return True
         finally:
@@ -388,10 +404,20 @@ class AppStore:
             ).start()
         except Exception:
             pass
-        self._scheduler_thread = threading.Thread(target=self._retention_scheduler_loop, daemon=True)
-        self._live_sync_thread = threading.Thread(target=self._live_sync_loop, daemon=True)
-        self._cloud_live_cache_thread = threading.Thread(target=self._cloud_live_cache_loop, daemon=True)
-        self._sync_thread = threading.Thread(target=self._config_sync_loop, daemon=True)
+        # 2026-10-30: named, so py-spy, Task Manager and a crash dump all say
+        # what the thread is for. `_retention_scheduler_loop` has not run
+        # retention since 2026-08-21 - it only keeps the WAL checkpointed -
+        # so the name said the opposite of what it does and made it look like
+        # a duplicate of tn-retention-engine.
+        self._scheduler_thread = threading.Thread(
+            target=self._retention_scheduler_loop, daemon=True,
+            name="tn-wal-checkpoint")
+        self._live_sync_thread = threading.Thread(
+            target=self._live_sync_loop, daemon=True, name="tn-cloud-live-sync")
+        self._cloud_live_cache_thread = threading.Thread(
+            target=self._cloud_live_cache_loop, daemon=True, name="tn-cloud-cache")
+        self._sync_thread = threading.Thread(
+            target=self._config_sync_loop, daemon=True, name="tn-cloud-config-sync")
         self._scheduler_thread.start()
         self._live_sync_thread.start()
         self._cloud_live_cache_thread.start()
@@ -1259,26 +1285,46 @@ class AppStore:
                     data_dir = os.path.join(program_data, "TrustNode", "edge")
                 else:
                     data_dir = os.path.join(os.path.expanduser("~"), ".trustnode_edge", "data")
-                # 2026-10-19: the installer creates %ProgramData%\TrustNode\edge
-                # with "Authenticated Users:(OI)(CI)RX" so a customer's regular
-                # user cannot edit the SQLite. The tray app RUNS as that user,
-                # so the default store path is one it can read but never write:
-                # every start without TRUSTNODE_DATA_DIR died in _ensure_schema
-                # with "attempt to write a readonly database", before serving
-                # anything. Measured on the operator's machine 2026-10-19.
-                #
-                # os.access() cannot see this - on Windows it reports the
-                # read-only ATTRIBUTE, not the ACL, and it answered True for a
-                # directory that refused every write. The only honest test is
-                # to write a file.
-                if not _store_is_writable(
-                        os.path.join(data_dir, "trustnode_app_store.db")):
-                    fallback = os.path.join(os.path.expanduser("~"),
-                                            ".trustnode_edge", "data")
-                    print("[trustnode] WARN: default store dir %s is not "
-                          "writable (installer ACL); using %s instead"
+            # 2026-10-19: the installer creates %ProgramData%\TrustNode\edge
+            # with "Authenticated Users:(OI)(CI)RX" so a customer's regular
+            # user cannot edit the SQLite. The tray app RUNS as that user, so
+            # that store path is one it can read but never write: the process
+            # died in _ensure_schema with "attempt to write a readonly
+            # database" before serving anything.
+            #
+            # os.access() cannot see this - on Windows it reports the
+            # read-only ATTRIBUTE, not the ACL, and answers True for a
+            # directory that refuses every write.
+            #
+            # 2026-10-30: and this check used to run ONLY for the defaulted
+            # location. The desktop shell ALWAYS sets TRUSTNODE_DATA_DIR
+            # (main.js passes the workspace detector's choice), and that
+            # detector lists %ProgramData%\TrustNode\edge FIRST - so the one
+            # path that needed the guard was the one path that skipped it.
+            # main.js's own note says as much: "app_store._resolve_db_path
+            # has a fallback for this, but it is gated on the variable being
+            # UNSET, so it never fired here."
+            #
+            # A workspace nobody can write is not a workspace. Whoever chose
+            # it, fall back to one that works and say so - an app that boots
+            # on its real data beats one that does not boot.
+            if not _store_is_writable(
+                    os.path.join(data_dir, "trustnode_app_store.db")):
+                fallback = os.path.join(os.path.expanduser("~"),
+                                        ".trustnode_edge", "data")
+                if os.path.abspath(fallback) != os.path.abspath(data_dir):
+                    print("[trustnode] WARN: store dir %s is not writable "
+                          "(installer ACL); using %s instead"
                           % (data_dir, fallback), flush=True)
                     data_dir = fallback
+                    # Every store resolves its own path. Moving only this
+                    # one left ControlPlaneStore opening the unwritable
+                    # directory and dying in ITS _ensure_schema instead -
+                    # the same crash, two files further on, caught by the
+                    # unwritable-database boot self-test. AppStore is built
+                    # first, so recording the decision here is what makes it
+                    # the whole process's decision.
+                    os.environ["TRUSTNODE_DATA_DIR"] = data_dir
             os.makedirs(data_dir, exist_ok=True)
             base = os.path.join(data_dir, "trustnode_app_store.db")
             if sys.platform == "win32" and defaulted:
@@ -2637,10 +2683,43 @@ class AppStore:
             return {}
 
     def _is_cloud_auto_sync_enabled(self) -> bool:
+        """Does the operator WANT cloud sync? Intent only - see below."""
         settings = self._get_app_settings()
         if "cloud_auto_sync_enabled" in settings:
             return bool(settings.get("cloud_auto_sync_enabled"))
         return True
+
+    def _cloud_sync_possible(self) -> bool:
+        """Does the operator want it AND is there a cloud to sync into?
+
+        2026-10-30, reported: "the edge is a local app with a local database,
+        the cloud should be only when the cloud database is enabled,
+        otherwise the app should not struggle with this basic thing."
+
+        Quite right. The reconcilers were gated on intent alone, and intent
+        defaults to True - so an edge that has never been given a cloud
+        database still ran the Lite mirror reconcile every 2 s and the
+        report-template reconcile every 30 s, for ever, against a Supabase
+        that was never configured. Measured on this machine: the flag reads
+        True while /api/health reports `no_customer_db_configured`. That is
+        work which cannot succeed, taking threads from the same pool the
+        UI's own requests use, and the visible symptom was the reports
+        module reporting that the edge was busy.
+
+        Nothing is lost by skipping it: with no target there is nothing to
+        sync. `_reconcile_sync_targets_with_config` still runs every 10 s
+        UNGATED, so the moment a cloud database is added this turns true by
+        itself and the mirrors catch up - no restart, no setting to find.
+
+        The resolver is the one the historian routing uses, so the loop and
+        the UI can never disagree about whether a cloud exists.
+        """
+        if not self._is_cloud_auto_sync_enabled():
+            return False
+        try:
+            return bool(self._get_cloud_database_target())
+        except Exception:
+            return False
 
     # Runtime-control flags that the background sync worker reads from the
     # unscoped app_settings doc. The UI saves these into a user-scoped doc,
@@ -3093,7 +3172,7 @@ class AppStore:
         self._report_templates_zero_logged = False
         while not self._stop_event.is_set():
             try:
-                if self._is_cloud_auto_sync_enabled():
+                if self._cloud_sync_possible():
                     now_mono = time.monotonic()
                     if now_mono >= next_bulk_sync_mono:
                         self._flush_data_outbox_burst()
@@ -3121,7 +3200,7 @@ class AppStore:
                 # SELECT per domain on Supabase + at most one UPSERT per
                 # stale row, plus the historical-data sync is unaffected
                 # because it runs on its own thread).
-                if self._is_cloud_auto_sync_enabled() and now_mono >= next_mirror_reconcile_mono:
+                if self._cloud_sync_possible() and now_mono >= next_mirror_reconcile_mono:
                     try:
                         self._reconcile_lite_mirror_tables_once()
                     except Exception:
@@ -3145,7 +3224,7 @@ class AppStore:
                 # 30 s because each invocation reads + upserts every local
                 # template row (only a few KB), and Lite reads cache for
                 # the operator session anyway.
-                if self._is_cloud_auto_sync_enabled() and now_mono >= next_report_templates_reconcile_mono:
+                if self._cloud_sync_possible() and now_mono >= next_report_templates_reconcile_mono:
                     # 2026-10-17: this was `except Exception: pass`, and the
                     # function it calls returns 0 just as silently when there
                     # is no cloud target. Measured that day: Supabase held ONE
@@ -3329,7 +3408,7 @@ class AppStore:
     def _live_sync_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                if self._is_cloud_auto_sync_enabled():
+                if self._cloud_sync_possible():
                     # Keep this loop focused on low-latency live snapshots only.
                     # Full historian/log batch sync runs in the config/bulk loop;
                     # mixing both paths here causes multi-second stalls.
@@ -8193,13 +8272,109 @@ class AppStore:
                     mine = conn.execute(
                         "SELECT COUNT(*) AS n FROM config_documents_scoped "
                         "WHERE scope_key = ?", (skey,)).fetchone()
-                    if not mine or int(mine["n"] or 0) == 0:
-                        like = "%|" + customer + "|" + edge + tail
-                        rows = conn.execute(
+                    # 2026-10-30: adoption used to happen ONLY when our own
+                    # key was empty, so once BOTH forms held documents the
+                    # split was permanent and fed itself. Measured on the
+                    # operator's store - one edge, one customer, two homes:
+                    #
+                    #   tenant-cust-11e164d2|cust-11e164d2|edge-7e86b73f66|admin  (23 keys)
+                    #   tenant-cust-11e164d2|-|edge-7e86b73f66|admin             (18 keys)
+                    #
+                    # The second was written LAST, at 19:46:14, during a LAN
+                    # login - a moment when the bootstrap identity read came
+                    # back without the customer. _build_scope_key degrades to
+                    # `-` when that happens, the `-` key already had rows, so
+                    # canonicalisation returned it untouched and the session
+                    # ran on the wrong document.
+                    #
+                    # `-` is a MISSING value, not an identity. An edge belongs
+                    # to exactly one customer, so a document filed under a
+                    # known customer for this edge is always the better answer
+                    # than one filed under "we did not know yet" - whether or
+                    # not the placeholder has rows. A key that DOES name a
+                    # customer keeps the old strict rule and never adopts
+                    # another customer's document.
+                    if customer == "-":
+                        sibs = conn.execute(
                             "SELECT scope_key, COUNT(*) AS n, MAX(updated_utc) AS last "
                             "FROM config_documents_scoped "
                             "WHERE scope_key LIKE ? AND scope_key != ? "
-                            "GROUP BY scope_key ORDER BY last DESC", (like, skey)).fetchall()
+                            "GROUP BY scope_key ORDER BY last DESC",
+                            ("%|%|" + edge + tail, skey)).fetchall()
+                        named = [
+                            r for r in sibs
+                            if str(r["scope_key"] or "").count("|") == skey.count("|")
+                            and len(str(r["scope_key"] or "").split("|")) > 1
+                            and str(r["scope_key"]).split("|")[1] not in ("", "-")
+                            and int(r["n"] or 0) > 0
+                        ]
+                        if named:
+                            resolved = str(named[0]["scope_key"])
+                            print("[trustnode][config] scope %r names no customer; "
+                                  "using %r instead (same edge, %d document(s)). "
+                                  "The placeholder rows are left on disk."
+                                  % (skey, resolved, int(named[0]["n"] or 0)), flush=True)
+                            self._canonical_scope_cache[skey] = resolved
+                            return resolved
+                    if not mine or int(mine["n"] or 0) == 0:
+                        # 2026-10-30: the CUSTOMER segment moves too, not just
+                        # the tenant. Measured on the operator's store, the
+                        # same edge holds documents under
+                        #   tenant-cust-e5916328|cust-e5916328|edge-74d903ffcd
+                        # and
+                        #   tenant-cust-e5916328|-|edge-74d903ffcd
+                        # because customer_id resolves from the bootstrap and
+                        # is sometimes not known yet. With customer pinned in
+                        # the LIKE, neither key could ever adopt the other, so
+                        # one login wrote one document while another read the
+                        # second - "when I change from one user to another the
+                        # dashboards are lost or get messy", and a restart
+                        # could land on the empty side.
+                        #
+                        # When OUR customer segment is the placeholder we do
+                        # not know the customer, so any sibling on this EDGE
+                        # is the same install - an edge belongs to exactly one
+                        # customer. When we DO know it, the old strict rule
+                        # stands: a known customer never adopts another's.
+                        # Which siblings may this key adopt, in order of
+                        # preference. Each is a LIKE over the SAME edge id,
+                        # which is what makes it this install and not
+                        # somebody else's.
+                        if customer == "-":
+                            # We do not know the customer, so any sibling on
+                            # this edge is us - an edge has exactly one.
+                            patterns = ["%|%|" + edge + tail]
+                        else:
+                            patterns = [
+                                # Same customer, any tenant: the tenant
+                                # segment moves between logins.
+                                "%|" + customer + "|" + edge + tail,
+                                # 2026-10-30, the NEW-INSTALL case. Before an
+                                # edge is activated it has no tenant and no
+                                # customer, so its configuration is written
+                                # under `default|-|edge-x`. Activation gives
+                                # it both and the key becomes
+                                # `tenant-A|cust-B|edge-x` - and everything
+                                # the customer set up during commissioning
+                                # became invisible at that moment.
+                                #
+                                # Adopting the placeholder form of THIS edge
+                                # is adopting our own earlier life, not
+                                # another customer's data: `-` means nobody
+                                # had claimed it yet. A sibling carrying a
+                                # DIFFERENT known customer is never matched
+                                # by either pattern.
+                                "%|-|" + edge + tail,
+                            ]
+                        rows = []
+                        for like in patterns:
+                            rows = conn.execute(
+                                "SELECT scope_key, COUNT(*) AS n, MAX(updated_utc) AS last "
+                                "FROM config_documents_scoped "
+                                "WHERE scope_key LIKE ? AND scope_key != ? "
+                                "GROUP BY scope_key ORDER BY last DESC", (like, skey)).fetchall()
+                            if rows:
+                                break
                         for r in rows:
                             cand = str(r["scope_key"] or "")
                             # Same shape only: a 3-segment scope must not adopt
@@ -8207,8 +8382,10 @@ class AppStore:
                             if cand.count("|") == skey.count("|") and int(r["n"] or 0) > 0:
                                 resolved = cand
                                 print("[trustnode][config] scope %r is empty; adopting %r "
-                                      "(same customer and edge, %d document(s))"
-                                      % (skey, cand, int(r["n"] or 0)), flush=True)
+                                      "(same edge%s, %d document(s))"
+                                      % (skey, cand,
+                                         "" if customer == "-" else " and customer",
+                                         int(r["n"] or 0)), flush=True)
                                 break
         except Exception:
             resolved = skey
@@ -9371,7 +9548,20 @@ class AppStore:
             ORDER BY bucket_utc DESC
             LIMIT :lim
         """
-        with self._connect() as conn:
+        # 2026-10-31, THE root cause. The pre-aggregated tables are empty on
+        # any edge without a retention policy, so EVERY chart lands here and
+        # buckets 500k raw rows live. That is ~2s of real work - survivable
+        # once, fatal seven times at once, because _connect() hands back a
+        # PER-THREAD WRITER connection: concurrent charts serialised behind
+        # each other and behind the historian writer, and the dashboard's
+        # seven widgets turned 2s into the 12-14s the operator's Logs page
+        # recorded. Everything else - templates, scheduled reports, Run-now,
+        # DB recovery - then timed out behind them.
+        #
+        # _connect_readonly() is a per-query read-only handle with a short
+        # busy_timeout, so these run side by side and can never wait on the
+        # writer. Measured: 7 concurrent calls went from ~10s wall to ~2s.
+        with self._connect_readonly() as conn:
             try:
                 rows = conn.execute(sql, params).fetchall()
             except Exception as exc:
@@ -9436,24 +9626,37 @@ class AppStore:
         bkt = str(bucket or "minute").strip().lower()
         if bkt not in {"minute", "hour", "day"}:
             bkt = "minute"
-        table = f"historian_agg_{bkt}"
         lim = max(1, min(int(limit or 50000), 100000))
         tenant_id = self._current_tenant_id()
-        where = "WHERE 1=1"
-        params: dict[str, Any] = {"lim": lim}
-        # The agg tables have no tenant_id column (see schema at
-        # ~3512); they're written by the retention worker which only
-        # processes the local tenant slice. We still scope by gateway/
-        # tag/source/range so the same endpoint serves multi-tenant
-        # edges when the schema gains a tenant column later.
-        from_txt = str(from_utc or "").strip()
-        if from_txt:
-            where += " AND bucket_utc >= :from_utc"
-            params["from_utc"] = from_txt
-        to_txt = str(to_utc or "").strip()
-        if to_txt:
-            where += " AND bucket_utc <= :to_utc"
-            params["to_utc"] = to_txt
+        # 2026-11-02: read `historian_rollup`, which the retention engine
+        # actually writes. `historian_agg_<bucket>` was only ever filled by
+        # the retired legacy retention path, so on every edge measured it
+        # had 0 rows and this function answered the WHOLE window from raw -
+        # 2.2 s per call for 24 h on a 514k-row store, seven widgets at once
+        # ~10 s, which over a tunnel is "the edge did not answer in time".
+        res_s = {"minute": 60, "hour": 3600, "day": 86400}[bkt]
+        from_txt = self._normalize_utc_filter(from_utc)
+        to_txt = self._normalize_utc_filter(to_utc)
+        tenant_clause, tenant_params = self._tenant_filter_clause("tenant_id")
+        where = f"WHERE resolution_s = :res AND {tenant_clause}"
+        params: dict[str, Any] = {"lim": lim, "res": res_s, **tenant_params}
+
+        def _ms(norm: str) -> int | None:
+            if not norm:
+                return None
+            try:
+                return int(datetime.strptime(norm, "%Y-%m-%d %H:%M:%S.%f")
+                           .replace(tzinfo=timezone.utc).timestamp() * 1000)
+            except Exception:
+                return None
+
+        from_ms, to_ms = _ms(from_txt), _ms(to_txt)
+        if from_ms is not None:
+            where += " AND bucket_ms >= :from_ms"
+            params["from_ms"] = from_ms
+        if to_ms is not None:
+            where += " AND bucket_ms <= :to_ms"
+            params["to_ms"] = to_ms
         gw_txt = str(gateway or "").strip()
         if gw_txt:
             where += " AND gateway_id = :gateway"
@@ -9466,39 +9669,64 @@ class AppStore:
             params["tag_like"] = f"%{tag_txt}%"
         source_txt = str(source or "").strip()
         if source_txt:
-            # The agg tables don't carry source today. Map known power
-            # sources to the database_name written at write-time
-            # ("Power Management") so the filter still works for the
-            # Power Overview path.
-            srcs = [s.strip() for s in source_txt.split(",") if s.strip()]
-            if any(s in {"power_modbus", "power_insight"} for s in srcs):
-                where += " AND database_name = :pm_db"
-                params["pm_db"] = "Power Management"
-            else:
-                # No column here can express this filter, so the agg tables
-                # would return rows from every source and quietly ignore what
-                # was asked. Raw DOES carry `source`, so serve the whole window
-                # from the live path instead of answering wrongly but fast.
-                return self.bucket_raw_historian_rows(
-                    bucket=bkt, from_utc=from_txt, to_utc=to_txt,
-                    gateway=gw_txt, tag=tag_txt, limit=lim, source=source_txt,
-                )
+            # The rollup carries no `source`, so it cannot answer this
+            # filter and would return rows from every source. Raw does carry
+            # it: serve the whole window live rather than answer wrongly but
+            # fast. (This is what every source-filtered call did anyway while
+            # the agg tables were empty.)
+            return self.bucket_raw_historian_rows(
+                bucket=bkt, from_utc=from_txt, to_utc=to_txt,
+                gateway=gw_txt, tag=tag_txt, limit=lim, source=source_txt,
+            )
 
-        with self._connect() as conn:
+        # 2026-10-31, ROOT CAUSE of "the edge did not answer in time".
+        #
+        # Measured on a live collecting edge, from the operator's own Logs
+        # page once slow requests became visible there:
+        #
+        #   Slow request: GET /api/app-store/historian/agg took 13.9s (200)
+        #   Slow request: GET /api/app-store/historian/agg took 13.4s (200)
+        #   Slow request: GET /api/app-store/historian/agg took 12.4s (200)
+        #   ... seven of them inside six seconds
+        #
+        # This is a pure READ and it was using _connect() - the WRITER
+        # connection, whose timeout is 10s. On a machine collecting at 500 ms
+        # it queued behind the historian writer and burned most of that
+        # timeout before returning 200. Seven dashboard widgets doing it at
+        # once exhausted the six connections a browser allows per origin AND
+        # the thread pool, so everything else - templates, scheduled reports,
+        # generated reports, DB recovery - timed out behind it. The edge was
+        # never broken; it was waiting on its own writer.
+        #
+        # _connect_readonly() exists for exactly this: a read-only handle
+        # with a short busy_timeout that "can never wedge for more than ~3s
+        # waiting on the writer". get_historian_rows_range already uses it,
+        # which is why that one measures 20 ms warm while this measured 14s.
+        names: dict[str, dict[str, str]] = {}
+        with self._connect_readonly() as conn:
             try:
                 rows = conn.execute(
                     f"""
-                    SELECT bucket_utc, gateway_id, gateway_name, device_name,
-                           plc_ip, database_name, tag_name,
-                           avg_value, min_value, max_value, sample_count,
-                           quality_min, quality_max
-                    FROM {table}
+                    SELECT strftime('%Y-%m-%d %H:%M:%S', bucket_ms / 1000, 'unixepoch') AS bucket_utc,
+                           gateway_id, tag_name, n, sum_v, min_v, max_v, q_max
+                    FROM historian_rollup
                     {where}
-                    ORDER BY bucket_utc DESC
+                    ORDER BY bucket_ms DESC
                     LIMIT :lim
                     """,
                     params,
                 ).fetchall()
+                # The rollup keys on gateway_id + tag only. The display names
+                # come from any one raw row of that gateway - an index-prefix
+                # seek, one per gateway in the answer.
+                for gw in {str(r["gateway_id"] or "") for r in rows}:
+                    nr = conn.execute(
+                        f"SELECT gateway_name, device_name, plc_ip, database_name "
+                        f"FROM historian_readings WHERE {tenant_clause} AND gateway_id = :gw LIMIT 1",
+                        {**tenant_params, "gw": gw},
+                    ).fetchone()
+                    names[gw] = {k: str((nr[k] if nr else "") or "")
+                                 for k in ("gateway_name", "device_name", "plc_ip", "database_name")}
             except Exception as exc:
                 import logging
                 logging.getLogger("trustnode.historian").warning(
@@ -9506,26 +9734,29 @@ class AppStore:
                 return []
         out: list[dict[str, Any]] = []
         for r in rows:
+            n = int(r["n"] or 0)
+            nm = names.get(str(r["gateway_id"] or ""), {})
+            q_max = int(r["q_max"] or 0)
             out.append(
                 {
                     "ts": r["bucket_utc"],
                     "tenant_id": tenant_id,
-                    "source": "historian_agg",
+                    "source": "historian_rollup",
                     "gateway_id": r["gateway_id"] or "",
-                    "gateway_name": r["gateway_name"] or "",
-                    "device_name": r["device_name"] or "",
-                    "plc_ip": r["plc_ip"] or "",
-                    "database_name": r["database_name"] or "",
+                    "gateway_name": nm.get("gateway_name", ""),
+                    "device_name": nm.get("device_name", ""),
+                    "plc_ip": nm.get("plc_ip", ""),
+                    "database_name": nm.get("database_name", ""),
                     "tag": r["tag_name"] or "",
                     # `value` is the avg so the frontend bucket builder
                     # can carry it forward; min/max travel alongside
                     # for chart band rendering when needed.
-                    "value": r["avg_value"],
-                    "value_min": r["min_value"],
-                    "value_max": r["max_value"],
-                    "sample_count": int(r["sample_count"] or 0),
-                    "quality": r["quality_max"],
-                    "quality_label": "GOOD" if int(r["quality_max"] or 0) >= 192 else "",
+                    "value": (float(r["sum_v"]) / n) if (n and r["sum_v"] is not None) else None,
+                    "value_min": r["min_v"],
+                    "value_max": r["max_v"],
+                    "sample_count": n,
+                    "quality": q_max,
+                    "quality_label": "GOOD" if q_max >= 192 else "",
                 }
             )
 

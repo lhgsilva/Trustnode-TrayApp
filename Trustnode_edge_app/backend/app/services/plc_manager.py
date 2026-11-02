@@ -3293,8 +3293,21 @@ class GatewayWorker:
         """
         if not readings:
             return
+        # 2026-10-30: do not enter the outbound path at all unless a service
+        # is actually up. The operator's edge does not even license OPC UA,
+        # yet its publish call is what wedged collection: a lock held by a
+        # self-deadlocked status poll parked BOTH persist workers, and every
+        # cycle then paid the full 8s persist timeout (measured: 1s
+        # configured, 8.02s actual, last_error=None).
+        #
+        # The lock bug is fixed at its source, but a separate service must
+        # not be able to reach into the collection loop in the first place.
+        # is_running() is a cheap flag read and the only thing standing
+        # between a dead side-service and the thing that matters.
         try:
             from app.services import connections_publish as cp
+            if not cp.any_outbound_active():
+                return
         except Exception:
             return
         gw_name = ""
@@ -4372,6 +4385,22 @@ class GatewayWorker:
             return False
 
 
+def _safe_put(q: "asyncio.Queue", message: Dict[str, Any]) -> None:
+    """Drop the oldest rather than block when a slow viewer falls behind.
+
+    Runs ON the subscriber's own loop, so the queue is touched by its owner.
+    """
+    try:
+        if q.full():
+            try:
+                q.get_nowait()
+            except Exception:
+                pass
+        q.put_nowait(message)
+    except Exception:
+        pass
+
+
 class PLCManager:
     def __init__(self) -> None:
         self.max_gateways = 5
@@ -4784,8 +4813,43 @@ class PLCManager:
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=200)
+        # 2026-10-27: remember WHICH event loop this subscriber lives on.
+        #
+        # The LAN surfaces are the same app served by extra uvicorn servers
+        # running in their own event loops (lan_socket). A WebSocket accepted
+        # there owns a Queue belonging to THAT loop, while both push paths
+        # below run on the main loop. asyncio.Queue is not thread-safe:
+        # put_nowait appends the item but then wakes a getter future that
+        # belongs to the other loop, from the wrong thread - so a LAN client
+        # could sit on a stale chart while the desktop updated live.
+        #
+        # The LAN is meant to be a VIEW of this edge, not a second
+        # behaviour, so delivery has to land on the subscriber's own loop.
+        try:
+            q._tn_loop = asyncio.get_running_loop()   # type: ignore[attr-defined]
+        except RuntimeError:
+            q._tn_loop = None                         # type: ignore[attr-defined]
         self._subscribers.add(q)
         return q
+
+    @staticmethod
+    def _deliver(q: asyncio.Queue, message: Dict[str, Any]) -> None:
+        """Put `message` on `q`, on the loop that owns it.
+
+        Same-loop subscribers take the direct path they always did.
+        """
+        own = getattr(q, "_tn_loop", None)
+        here = None
+        try:
+            here = asyncio.get_running_loop()
+        except RuntimeError:
+            here = None
+        if own is None or own is here:
+            q.put_nowait(message)
+            return
+        if own.is_closed():
+            raise RuntimeError("subscriber loop closed")
+        own.call_soon_threadsafe(_safe_put, q, message)
 
     def unsubscribe(self, queue: asyncio.Queue) -> None:
         self._subscribers.discard(queue)
@@ -4805,7 +4869,7 @@ class PLCManager:
             dead = []
             for q in list(self._subscribers):
                 try:
-                    q.put_nowait(message)
+                    self._deliver(q, message)
                 except asyncio.QueueFull:
                     continue
                 except Exception:
@@ -4914,11 +4978,16 @@ class PLCManager:
                 pass
 
         dead: List[asyncio.Queue] = []
-        for q in self._subscribers:
+        for q in list(self._subscribers):
             try:
-                if q.full():
-                    _ = q.get_nowait()
-                q.put_nowait(message)
+                own = getattr(q, "_tn_loop", None)
+                if own is None or own is asyncio.get_running_loop():
+                    if q.full():
+                        _ = q.get_nowait()
+                    q.put_nowait(message)
+                else:
+                    # A LAN viewer: its queue belongs to that listener's loop.
+                    self._deliver(q, message)
             except Exception:
                 dead.append(q)
         for q in dead:

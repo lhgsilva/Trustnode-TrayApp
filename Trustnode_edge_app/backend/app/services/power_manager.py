@@ -275,6 +275,33 @@ class PowerManager:
         self._metrics_by_device: dict[str, dict[str, Any]] = {}
         self._dropped_rows = 0
         self._writer_batches = 0
+        # 2026-10-30, measured on a live edge: tn-power-manager and
+        # tn-power-writer were running on an install whose licence does not
+        # include power_management and which has no meters configured. Two
+        # threads polling for devices that cannot exist.
+        #
+        # They start when the module is licensed, OR as soon as anything
+        # actually asks the power manager to do something (ensure_started()
+        # below), so a licence that cannot be read, or one that arrives
+        # later, never leaves the feature dead.
+        self._started = False
+        if self._should_autostart():
+            self.ensure_started()
+
+    @staticmethod
+    def _should_autostart() -> bool:
+        try:
+            from app.services.access_policy import has_module
+            return bool(has_module("power_management"))
+        except Exception:
+            return True       # cannot tell -> behave exactly as before
+
+    def ensure_started(self) -> None:
+        """Idempotent. Safe from any thread; called lazily by the power API."""
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
         self._thread.start()
         self._writer_thread.start()
 

@@ -3858,7 +3858,8 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
                 # First-boot capture: any feature toggled on or running RIGHT NOW
                 # gets grandfathered. Persist so next boots are stable.
                 derived: list[str] = []
-                if bool(s.get("lan_sharing_enabled")):
+                from app.services import lan_socket as _lsock
+                if _lsock.sharing_enabled(s):
                     derived.append("lan_access")
                 conn = s.get("connections") if isinstance(s.get("connections"), dict) else {}
                 if isinstance(conn.get("opcua"), dict) and bool(conn["opcua"].get("enabled")):

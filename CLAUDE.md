@@ -3,6 +3,48 @@
 These apply to every request in this repository. They exist because each one
 comes from a real incident, not from style preference.
 
+## 0. Read this before planning any change — 2026-10-28
+
+This section is first on purpose. It is the safeguard to apply BEFORE
+planning a fix, an improvement or a feature, and it comes from a day where
+each of these was violated in turn.
+
+**The main edge app is the source of everything and has to be at 100%.**
+Collecting the data, storing it, and printing it into reports, dashboards,
+screens and charts is the product. A LAN surface, a cloud mirror, a portal
+or a new feature is worth nothing if the edge itself is not completely
+reliable. When a change could trade edge reliability for anything else, it
+does not ship.
+
+**Do not break what is working while fixing something else.** Before
+changing a shared path, say plainly what else runs through it. A fix that
+repairs one surface and costs the main app three points of delivery is a
+regression, not a fix — that exact trade happened on 2026-10-27, when the
+LAN listeners were given the collection loop's thread budget and WebSocket
+delivery fell from 97.0% to 93.5%.
+
+**Find the real problem. Do not guess.** Measure before theorising, and
+when a theory is wrong, say so and discard it. On 2026-10-27 the slow boot
+was blamed on the WAL (boot was unchanged with the WAL at zero) and then
+on a `journal_size_limit` that its own test disproved; the actual cause was
+`PRAGMA quick_check` reading 7.3 GB to decide whether to delete files that
+did not exist. The measurement found it in one run after a day of plausible
+guesses.
+
+**Prefer the easy solution.** No new abstraction, layer, option or
+mechanism unless the simple version has been tried and failed. Check
+whether the mechanism already exists before writing one — a second
+firewall helper was written on 2026-10-27 before noticing that
+`windows_firewall.py` already did the job, and a duplicate would have
+drifted from the installer's rule.
+
+**Never let a validation run against an app somebody is using.** The
+release gate is a 10-minute full-system load test. Run against the
+operator's live install it produces exactly the symptoms it is meant to
+detect — "Devices could not be saved", "Timed out after 60s" — and wastes
+everyone's time chasing a fault that is the measurement itself. Ask before
+starting it, or run it when the machine is free.
+
 ## 1. Never point at old, legacy or wrong data
 
 Before reporting what the app "is doing", confirm you are reading the store the
@@ -375,3 +417,58 @@ bundle created". Exit code 0 the whole way.
 - A placeholder default (`https://api.example.com`) plus a WARNING at the end
   of a fifteen-minute build is not a safeguard. Default to the documented
   address.
+
+## 9. `default` is the developer tenant — no customer edge may use it — 2026-11-02
+
+From the owner: "`default` is where we have our development users to
+control the licences in the portal. None of customer or new installations
+should have a default-tenant user. Every new installation is always linked
+to a tenant customer id from the portal — customer, edge, licence,
+activation." Different customers may reuse the same usernames (`admin`
+above all); the tenant is what keeps them apart, so a shared name must
+never block a login and never grant anyone another tenant's rights.
+
+What was actually happening, measured on a live activated edge:
+
+```
+historian_readings.tenant_id : default, tenant-cust-11e164d2, ...
+cp_users                     : (default, admin), (tenant-cust-11e164d2, admin)
+```
+
+- **Loopback meant `default`.** The desktop app always arrives from
+  127.0.0.1, and `_resolve_from_host` maps that to `default`. Every request
+  that ran before a token existed — the login itself, the Users page's save
+  — ran as the developer tenant. Now `tenant.effective_tenant()` resolves a
+  request with no tenant of its own to the tenant the edge was ACTIVATED
+  into (`app_store._configured_tenant_id()`, cached 15 s in `main.py`).
+  The strict token-vs-host 403 keys on the HOST alone: a user whose row
+  still says `default` keeps signing in. A lock-out is not a fix.
+- **`ControlPlaneStore._seed_defaults` inserted `cp_users (default, admin,
+  hash("admin"))` into every store** — every customer edge included — and
+  the login's any-tenant fallback accepted it. `admin/admin` opened any
+  customer's edge as an admin of the developer tenant. A store never seeds
+  a credential; the row is removed at boot while it still has the default
+  password, and `_cp_row_usable_here` refuses a `default`-tenant
+  control-plane row on an activated edge (the portal, which is not
+  activated, keeps using it).
+- **The users_access mirror homed new users under `default`** because the
+  Users page never sends a tenant. `migrate_from_app_store_payload` takes
+  `default_tenant` from the caller; an existing account keeps its tenant.
+- **Break-glass sat before the real account.** A real account always wins;
+  `admin/admin` answers only on an edge with no usable account of that name.
+
+`test_edge_tenant_is_never_default.py` and
+`test_master_never_shadows_customer.py` assert all of it, over HTTP on
+loopback.
+
+### And the chart path, same day
+
+Charts read `historian_agg_*`, which only the retired legacy retention path
+ever wrote (0 rows on every edge measured). The engine writes
+`historian_rollup` — but only inside a pass with an active DELETION policy,
+which no customer has. So every wide chart bucketed raw on each refresh:
+2.2 s a call for 24 h on a 514k-row store, ~10 s with seven widgets, and
+over a tunnel "the edge did not answer in time". Rollups now run with or
+without a policy (nothing is deleted) and `get_historian_agg_rows` reads
+`historian_rollup`, bucketing raw only for the tail the rollup has not
+reached. `test_rollups_feed_charts.py`.

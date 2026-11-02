@@ -1,0 +1,22 @@
+TrustNode Link - does the bridge reach the plant network?
+  asking:  who-has 192.168.10.240   tell 192.168.10.77
+
+  running elevated                                  : PASS
+  bridge  : Network Bridge
+  members : TN-Link, Ethernet 3
+  TN-Link is a bridge member                        : PASS - the bridge must contain TN-Link and the plant adapter
+    the plant adapter is in it too                  : PASS - ['TN-Link', 'Ethernet 3']
+  plant address: 192.168.10.110/24
+  the plant PC still holds an address on that network: PASS - without it the plant PC itself is blind
+
+[open TN-Link and listen]
+  found the TN-Link adapter                         : PASS - {6C163406-B8EC-47CA-BE4B-F0BA136C1EDE}
+  opened it, media up                               : PASS
+
+[send the ARP request into the bridge]
+  the controller answered our ARP through the bridge: FAIL - 13 request(s) sent, no reply - the bridge is configured but is not carrying frames
+
+  the plant address is still intact                 : PASS - 192.168.10.110/24
+    and the plant PC still reaches the PLC          : PASS - ok
+
+RESULT: FAIL - the controller answered our ARP through the bridge

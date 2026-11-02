@@ -1,0 +1,16 @@
+TrustNode Link - does the bridge forward while the port is held open?
+
+  running elevated                                  : PASS
+  found TN-Link                                     : PASS - {6C163406-B8EC-47CA-BE4B-F0BA136C1EDE}
+  opened it                                         : PASS
+    Windows reports it Up WHILE held open           : PASS - Up - a bridge will not forward to a down port
+
+[listening for anything the bridge sends us]
+      0 frame(s) arrived in 6s
+  the bridge is sending us the segment's traffic    : FAIL - nothing at all - the bridge is not forwarding to this port
+
+[asking who has 192.168.10.240]
+  the controller answered through the bridge        : FAIL - 12 request(s) sent
+  the plant PC still reaches the PLC                : PASS - ok
+
+RESULT: FAIL - the bridge is sending us the segment's traffic, the controller answered through the bridge

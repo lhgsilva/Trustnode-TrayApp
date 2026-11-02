@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'unsafe-inline';
+               style-src 'self' 'unsafe-inline'; img-src 'self' data:;
+               connect-src 'self' http://127.0.0.1:*">
+<title>TN-Link</title>
+<style>
+  /* The page itself never scrolls - neither column. Anything that can
+     grow without limit (the device list, the log) owns a share of its
+     column and scrolls inside itself. */
+  :root {
+    --bg:#0f1115; --panel:#161a21; --line:#242a34; --text:#e8ecf2;
+    --muted:#9aa4b2; --accent:#14a89a; --warn:#d98324; --bad:#c84a4a;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  /* 2026-10-29. The hidden ATTRIBUTE comes from the browser's own
+     stylesheet, and `.card{display:flex}` in this file beat it: every
+     card that was meant to be hidden stayed on screen. That is why the
+     engineer saw the plant's Start and Connection code cards, with the
+     same code showing twice. An author rule has to win it back. */
+  [hidden] { display: none !important; }
+  html, body { height:100%; }
+  body {
+    margin:0; background:var(--bg); color:var(--text);
+    font:13px/1.45 "Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
+    height:100vh; display:flex; flex-direction:column; overflow:hidden;
+  }
+  header {
+    display:flex; align-items:center; gap:14px; flex:0 0 auto;
+    padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel);
+  }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); flex:0 0 auto; }
+  .dot.on { background:var(--accent); box-shadow:0 0 0 4px rgba(20,168,154,.15); }
+  .dot.wait { background:var(--warn); }
+  h1 { font-size:14px; margin:0; font-weight:600; letter-spacing:.2px; }
+  .sub { color:var(--muted); font-size:11.5px; }
+  .grow { flex:1 1 auto; }
+
+  main { flex:1 1 auto; display:grid; grid-template-columns:304px 1fr;
+         gap:12px; padding:12px; min-height:0; }
+  .col { display:flex; flex-direction:column; gap:12px; min-height:0; }
+  /* The left column is sized to fit without scrolling - the cards are
+     compact and only the ones that apply to this role are shown. This is
+     the safety net for a very short window: a scrollbar nobody normally
+     sees beats content silently cut off the bottom. */
+  .col:first-child { overflow:auto; }
+
+  .card {
+    background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    padding:10px 12px; flex:0 0 auto; min-height:0;
+    display:flex; flex-direction:column;
+  }
+  .card.flex { flex:1 1 0; }
+  .card h2 { font-size:10.5px; text-transform:uppercase; letter-spacing:.06em;
+             color:var(--muted); margin:0 0 7px; font-weight:600;
+             display:flex; align-items:center; gap:7px; flex:0 0 auto; }
+  .card h2 .count { color:var(--text); font-weight:500; text-transform:none;
+                    letter-spacing:0; }
+  .scroll { overflow:auto; min-height:0; flex:1 1 auto; }
+
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; font-size:12.5px; }
+  .kv b { color:var(--muted); font-weight:500; }
+  .mono { font-family:"Cascadia Mono",Consolas,monospace; }
+  .code { font-size:15px; letter-spacing:.5px; }
+  button {
+    font:inherit; color:var(--text); background:#1d232c; border:1px solid var(--line);
+    border-radius:7px; padding:6px 10px; cursor:pointer;
+  }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#06231f; font-weight:600; }
+  /* The chosen role has to LOOK chosen - it never changed before. */
+  button.on { background:var(--accent); border-color:var(--accent);
+              color:#06231f; font-weight:600; }
+  button.danger  { border-color:#4a2626; color:#ff9b9b; }
+  button:disabled { opacity:.45; cursor:default; border-color:var(--line); }
+  button.sm { padding:3px 8px; font-size:11.5px; }
+  .row { display:flex; gap:7px; flex-wrap:wrap; }
+  .acts { display:grid; grid-template-columns:1fr 1fr; gap:7px; }
+  .acts button { text-align:left; font-size:12px; padding:6px 8px; }
+
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  thead th { position:sticky; top:0; background:var(--panel); z-index:1; }
+  th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line);
+           vertical-align:top; }
+  th { color:var(--muted); font-weight:500; font-size:11.5px; }
+  tr.sel td { background:#16262a; }
+  td .what { color:var(--muted); font-size:11.5px; }
+
+  #logs { font-family:"Cascadia Mono",Consolas,monospace; font-size:11.5px;
+          white-space:pre-wrap; }
+  .lg-ok{color:var(--accent)} .lg-error{color:#ff9b9b} .lg-warn{color:var(--warn)}
+  .ts { color:#5d6673; }
+  .empty { color:var(--muted); font-size:12.5px; padding:6px 0; }
+  .banner { padding:8px 12px; border-radius:8px; background:#2a1f12;
+            border:1px solid #4a3519; color:#f0c58a; margin-bottom:10px; font-size:12.5px; }
+  input.text { width:100%; padding:6px; border-radius:7px; border:1px solid var(--line);
+               background:#0b0d11; color:var(--text); font-size:12.5px; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="dot" id="dot"></span>
+    <div>
+      <h1 id="title">TN-Link</h1>
+      <div class="sub" id="subtitle">starting…</div>
+    </div>
+    <span class="grow"></span>
+    <div class="row">
+      <button id="btn-scan">Find devices</button>
+      <button id="btn-stop" class="danger">Stop everything</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="col">
+      <div id="offline" class="banner" hidden>
+        TN-Link is not running. Start it from the tray, then reopen this window.
+      </div>
+
+      <!-- One card for identity. "Start" and "This unit" said the same
+           thing in two places; the role buttons live with the role. -->
+      <div class="card">
+        <h2>This unit</h2>
+        <div class="kv">
+          <b>ID</b><span class="mono" id="unit">-</span>
+          <b>Role</b><span id="role">-</span>
+          <b>Relay</b><span id="relay">-</span>
+          <b>Session</b><span id="expires">-</span>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button id="btn-plant" class="sm">At the plant</button>
+          <button id="btn-engineer" class="sm">Engineer</button>
+        </div>
+      </div>
+
+      <!-- Plant only: the code IS the plant's. -->
+      <div class="card" id="card-code" hidden>
+        <h2>Connection code</h2>
+        <div class="mono code" id="code">-</div>
+        <div class="row" style="margin-top:8px">
+          <button class="sm" id="btn-copy">Copy</button>
+          <button class="sm" id="btn-newcode">New code</button>
+        </div>
+      </div>
+
+      <!-- Engineer only: where this unit is connected TO. -->
+      <div class="card" id="card-peer" hidden>
+        <h2>Connected to</h2>
+        <div class="kv">
+          <b>Plant</b><span class="mono" id="peer">-</span>
+          <b>Networks</b><span class="mono" id="peer-nets">-</span>
+          <b>Link</b><span id="link">-</span>
+        </div>
+        <div class="sub" id="link-note" style="margin-top:6px" hidden></div>
+      </div>
+
+      <div class="card" id="card-join" hidden>
+        <h2>Connect to a plant</h2>
+        <input id="join-code" class="text mono" placeholder="TN-XXXXX-XXXXX-XXXXX">
+        <div class="row" style="margin-top:8px">
+          <button class="primary sm" id="btn-join">Connect</button>
+        </div>
+      </div>
+
+      <div class="card" id="card-actions" hidden>
+        <h2>What do you want to do?</h2>
+        <div class="acts">
+          <button data-act="find_devices">2 Find devices</button>
+          <button data-act="remote_desktop">3 Remote Desktop</button>
+          <button data-act="what_is_set_up">5 What is set up</button>
+          <button data-act="share_network">6 Share the network</button>
+          <button data-act="share_bridge">8 Layer 2 (browsing)</button>
+          <button data-act="stop_everything" class="danger">7 Stop everything</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="col">
+      <div class="card" id="card-reach" hidden>
+        <h2>Connected <span class="count" id="reach-count"></span></h2>
+        <div class="scroll" style="max-height:132px">
+          <table id="reach"><thead><tr>
+            <th>Device</th><th>Reach it at</th><th>How</th>
+          </tr></thead><tbody></tbody></table>
+          <div id="reach-empty" class="empty">
+            Nothing connected yet. Pick a device below and press Connect.
+          </div>
+        </div>
+      </div>
+
+      <div class="card flex">
+        <h2>Devices on the plant network <span class="count" id="dev-count"></span></h2>
+        <div class="scroll">
+          <table id="devices"><thead><tr>
+            <th>Address</th><th>What it is</th><th>Ports</th><th></th>
+          </tr></thead><tbody></tbody></table>
+          <div id="dev-empty" class="empty">
+            Nothing scanned yet — press <b>Find devices</b>.
+          </div>
+        </div>
+      </div>
+
+      <!-- 2026-10-31, requested: "shows the recent connections and also save
+           them a favorite and rename the connection if needed". Keyed by the
+           other end's permanent unit id, so an entry survives the pairing
+           code rotating and the far end being renamed. -->
+      <div class="card flex">
+        <h2>Saved connections <span class="count" id="conn-count"></span></h2>
+        <div class="scroll">
+          <table id="conns"><thead><tr>
+            <th></th><th>Name</th><th>Unit</th><th>Last used</th><th></th>
+          </tr></thead><tbody></tbody></table>
+          <div id="conn-empty" class="empty">
+            No connections yet - they are saved the first time you pair.
+          </div>
+        </div>
+      </div>
+
+      <div class="card flex">
+        <h2>What is happening <span class="count sub">newest first</span></h2>
+        <div class="scroll" id="logs"></div>
+      </div>
+    </section>
+  </main>
+
+<style>
+  #conns .star { background: none; border: 0; cursor: pointer; font-size: 15px;
+                 color: #9aa4b2; padding: 0 2px; }
+  #conns .star.on { color: #f0b429; }
+  #conns .mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
+  #conns td button { margin-left: 4px; }
+  #conns td button.primary { background: #0f766e; color: #fff; border-color: #0f766e; }
+  #conns td button.primary:disabled { background: #334155; border-color: #334155;
+                                      color: #94a3b8; cursor: not-allowed; }
+</style>
+<script>
+const $ = (id) => document.getElementById(id);
+let busy = false;
+let selected = "";
+let devSig = "";      // what the device table was last drawn from
+
+// The same page runs two ways: inside Electron, where a preload exposes
+// window.core, and in an ordinary browser served by the core itself, where
+// __TNLINK__ carries this run's token. One page, so the two cannot drift.
+//
+// NOT named `core`: the preload exposes window.core as a non-configurable
+// global, and a top-level `const core` beside it is a redeclaration that
+// kills the whole script before its first line.
+const link = window.core || (() => {
+  const cfg = window.__TNLINK__ || {};
+  const call = async (route, method, body) => {
+    const r = await fetch(route, {
+      method: method || "GET",
+      headers: { "X-TNLink-Token": cfg.token || "", "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!r.ok) throw new Error("core returned " + r.status);
+    return r.json();
+  };
+  return {
+    state: () => call("/state"),
+    logs: () => call("/logs"),
+    run: (name, body) => call("/do/" + name, "POST", body || {}),
+    alive: async () => { try { await call("/state"); return true; } catch (_) { return false; } },
+  };
+})();
+
+// 2026-10-29, reported: "the list of devices is not working all the time
+// when I click one time". A click used to be DROPPED whenever a refresh
+// was in flight - silently, so the only sign was that nothing happened.
+// A click is now answered: it waits its turn instead of vanishing.
+let queued = null;
+async function run(name, body) {
+  if (busy) { queued = [name, body]; note("queued " + name); return; }
+  busy = true;
+  document.body.style.cursor = "progress";
+  try { await link.run(name, body || {}); }
+  catch (e) { note(String((e && e.message) || e), "error"); }
+  finally {
+    busy = false; document.body.style.cursor = "";
+    const q = queued; queued = null;
+    if (q) { run(q[0], q[1]); } else { refresh(); }
+  }
+}
+
+let notes = [];
+function note(text, kind) {
+  notes.unshift({ ts: new Date().toLocaleTimeString(),
+                  kind: kind || "info", text: String(text) });
+  notes = notes.slice(0, 20);
+  drawLogs();
+}
+function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+
+let coreLines = [];
+let logSig = "";
+let connSig = "";
+function drawConns(rows) {
+  rows = Array.isArray(rows) ? rows : [];
+  // Redraw only on a real change: this runs on every poll, and rebuilding
+  // the table under the operator's cursor loses a click and any text they
+  // are part-way through typing in a rename box.
+  const sig = JSON.stringify(rows);
+  if (sig === connSig) return;
+  connSig = sig;
+
+  const tb = document.querySelector("#conns tbody");
+  const empty = $("conn-empty");
+  const count = $("conn-count");
+  if (count) count.textContent = rows.length ? String(rows.length) : "";
+  if (empty) empty.hidden = rows.length > 0;
+  if (!tb) return;
+  tb.innerHTML = "";
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+
+    const star = document.createElement("td");
+    const sb = document.createElement("button");
+    sb.className = "star" + (r.favorite ? " on" : "");
+    sb.textContent = r.favorite ? "\u2605" : "\u2606";
+    sb.title = r.favorite ? "Remove from favourites" : "Keep as a favourite";
+    sb.onclick = async () => {
+      sb.disabled = true;
+      try { await link.run("favorite_connection", { unit: r.unit, on: !r.favorite }); }
+      finally { connSig = ""; refresh(); }
+    };
+    star.appendChild(sb);
+
+    const name = document.createElement("td");
+    name.textContent = r.label || r.unit;
+    name.title = r.host ? ("Computer name: " + r.host) : "";
+
+    const unit = document.createElement("td");
+    unit.className = "mono";
+    unit.textContent = r.unit;
+    unit.title = r.address ? ("Last reached at " + r.address) : "";
+
+    const when = document.createElement("td");
+    when.textContent = r.last_utc
+      ? new Date(r.last_utc * 1000).toLocaleString()
+      : "-";
+
+    const act = document.createElement("td");
+    // 2026-10-31: the list showed machines but gave no way to use one.
+    // Reconnecting needs no code: the one this machine expects from us next
+    // was handed over at the previous pairing, over the encrypted channel.
+    const go = document.createElement("button");
+    go.textContent = "Connect";
+    go.className = "primary";
+    go.disabled = !r.can_connect;
+    go.title = r.can_connect
+      ? "Reconnect to " + (r.label || r.unit) + " - no code needed"
+      : "Pair once with a code from this machine; after that it reconnects on its own";
+    go.onclick = async () => {
+      go.disabled = true;
+      go.textContent = "Connecting...";
+      try { await link.run("connect_saved", { unit: r.unit }); }
+      finally { connSig = ""; setTimeout(refresh, 1500); }
+    };
+    act.appendChild(go);
+    const rn = document.createElement("button");
+    rn.textContent = "Rename";
+    rn.onclick = async () => {
+      const next = window.prompt(
+        "What do you call this machine?", r.name || r.host || "");
+      if (next === null) return;          // cancelled - change nothing
+      rn.disabled = true;
+      try { await link.run("rename_connection", { unit: r.unit, name: next }); }
+      finally { connSig = ""; refresh(); }
+    };
+    const fg = document.createElement("button");
+    fg.textContent = "Forget";
+    fg.title = "Remove it from this list";
+    fg.onclick = async () => {
+      fg.disabled = true;
+      try { await link.run("forget_connection", { unit: r.unit }); }
+      finally { connSig = ""; refresh(); }
+    };
+    act.appendChild(rn);
+    act.appendChild(fg);
+
+    tr.appendChild(star); tr.appendChild(name); tr.appendChild(unit);
+    tr.appendChild(when); tr.appendChild(act);
+    tb.appendChild(tr);
+  }
+}
+
+function drawLogs() {
+  // Newest at the TOP, as asked: the thing that just happened is the
+  // thing being waited for, and it should not be below the fold.
+  const all = notes.concat(coreLines);
+  const sig = all.length + "|" + (all[0] ? all[0].ts + all[0].text : "");
+  if (sig === logSig) return;      // nothing new - do not disturb the view
+  logSig = sig;
+  const el = $("logs");
+  const keep = el.scrollTop;
+  el.innerHTML = all.map(x =>
+    `<div><span class="ts">${escapeHtml(x.ts)}</span> ` +
+    `<span class="lg-${escapeHtml(x.kind)}">${escapeHtml(x.text)}</span></div>`
+  ).join("");
+  // Reading back through a scan must not be yanked to the top every two
+  // seconds just because a line arrived.
+  el.scrollTop = keep ? keep : 0;
+}
+
+// One exchange costs the same whatever its size - measured 78.0 ms for
+// 64 bytes and 78.0 ms for 4,002 through the relay. So this single number
+// predicts a download: a project cut into 20,000 CIP exchanges takes
+// 20,000 x this. Showing it is what stops someone starting a download and
+// watching it for half an hour.
+function renderLink(s) {
+  const ms = Number(s.link_ms || 0);
+  const el = $("link"), note = $("link-note");
+  if (!ms) { el.textContent = "-"; note.hidden = true; return; }
+  const mins = (ms * 20000) / 60000;
+  el.textContent = `${ms.toFixed(0)} ms per exchange`;
+  const same = (s.same_lan || []);
+  if (same.length) {
+    note.hidden = false;
+    note.innerHTML = `<span class="lg-warn">Same network as the plant ` +
+      `(${escapeHtml(same.join(", "))})</span> — traffic is going out to ` +
+      `the relay and back for a machine that is right here.`;
+  } else {
+    note.hidden = false;
+    note.textContent = `A download cut into 20,000 exchanges would take ` +
+      `about ${mins < 1 ? "under a minute" : Math.round(mins) + " minutes"}.`;
+  }
+}
+
+function renderReach(list) {
+  const tb = $("reach").querySelector("tbody");
+  tb.innerHTML = "";
+  const any = (list || []).length;
+  $("reach-empty").hidden = !!any;
+  $("reach").hidden = !any;
+  $("reach-count").textContent = any ? `(${any})` : "";
+  (list || []).forEach((r) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="mono">${escapeHtml(r.device)}</td>` +
+                   `<td class="mono">${escapeHtml(r.at)}</td>` +
+                   `<td>${escapeHtml(r.how)}</td>`;
+    tb.appendChild(tr);
+  });
+}
+
+function renderDevices(list) {
+  // Only redraw when the data actually changed. Rebuilding the rows every
+  // two seconds replaced the button under the pointer mid-click, which is
+  // the other half of "I have to click more than once".
+  const sig = JSON.stringify((list || []).map(d => [d.ip, d.what, d.ports])) + "|" + selected;
+  if (sig === devSig) return;
+  devSig = sig;
+  const tb = $("devices").querySelector("tbody");
+  tb.innerHTML = "";
+  const any = (list || []).length;
+  $("dev-empty").hidden = !!any;
+  $("dev-count").textContent = any ? `(${any})` : "";
+  (list || []).forEach((d) => {
+    const tr = document.createElement("tr");
+    if (d.ip === selected) tr.className = "sel";
+    const part = [d.part ? "part " + d.part : "", d.revision ? "rev " + d.revision : ""]
+                 .filter(Boolean).join(", ");
+    const what = d.what
+      ? `${escapeHtml(d.what)}<div class="what">${escapeHtml(d.type || d.kind || "")}` +
+        `${part ? " &middot; " + escapeHtml(part) : ""}</div>`
+      : `${escapeHtml(d.kind || "device")}`;
+    tr.innerHTML = `<td class="mono">${escapeHtml(d.ip)}</td>` +
+                   `<td>${what}</td>` +
+                   `<td class="mono">${(d.ports||[]).join(", ")}</td>` +
+                   `<td class="row"><button class="primary sm">Connect</button>` +
+                   `<button class="sm">All ports</button></td>`;
+    const [b1, b2] = tr.querySelectorAll("button");
+    // 1: the device at its REAL address, which is what RSLinx needs.
+    b1.onclick = () => { selected = d.ip; devSig = ""; run("connect_plc", { ip: d.ip }); };
+    // 4: every port it answers on - web page, Remote Desktop, Modbus.
+    b2.onclick = () => { selected = d.ip; devSig = ""; run("reach_device", { ip: d.ip }); };
+    tb.appendChild(tr);
+  });
+}
+
+async function refresh() {
+  const alive = await link.alive();
+  $("offline").hidden = alive;
+  if (!alive) {
+    $("dot").className = "dot";
+    $("subtitle").textContent = "not running";
+    return;
+  }
+  let s;
+  try { s = await link.state(); } catch (_) { return; }
+  drawConns(s.connections);
+
+  const running = !!s.running, peers = Number(s.peers || 0);
+  const plant = s.role === "server";
+  $("dot").className = "dot " + (running ? (peers ? "on" : "wait") : "");
+  $("subtitle").textContent = !s.role ? "choose what this PC is"
+      : (peers ? "connected" : (running ? "waiting to pair" : "stopped"));
+  $("title").textContent = !s.role ? "TN-Link"
+      : (plant ? "TN-Link - at the plant" : "TN-Link - engineer");
+
+  $("unit").textContent = s.unit_id || "-";
+  $("role").textContent = !s.role ? "not chosen" : (plant ? "plant" : "engineer");
+  $("relay").textContent = s.relay ? "configured" : "direct";
+  $("expires").textContent = s.expires || "-";
+  $("btn-plant").className    = "sm" + (plant ? " on" : "");
+  $("btn-engineer").className = "sm" + (s.role && !plant ? " on" : "");
+
+  $("card-code").hidden    = !plant;
+  $("card-join").hidden    = plant || !s.role;
+  $("card-peer").hidden    = plant || !peers;
+  $("card-actions").hidden = plant || !peers;
+  $("card-reach").hidden   = plant || !s.role;
+  $("code").textContent = s.code || "-";
+  $("peer").textContent = s.peer || "the plant";
+  $("peer-nets").textContent = (s.shared || []).join(", ") || "-";
+  renderLink(s);
+
+  renderReach(s.reachable || []);
+  renderDevices(s.devices || []);
+
+  try {
+    const l = await link.logs();
+    coreLines = (l.lines || []).slice().reverse();
+    drawLogs();
+  } catch (_) {}
+}
+
+document.querySelectorAll(".acts button").forEach((b) => {
+  b.onclick = () => run(b.dataset.act);
+});
+
+$("btn-plant").onclick    = () => run("become_plant");
+$("btn-engineer").onclick = () => run("become_engineer");
+$("btn-copy").onclick     = () => run("copy_code");
+$("btn-newcode").onclick  = () => run("new_code");
+$("btn-stop").onclick     = () => run("stop_everything");
+$("btn-scan").onclick     = () => run("find_devices");
+$("btn-join").onclick     = () => run("connect_to", { code: $("join-code").value.trim() });
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -426,6 +426,30 @@ if (typeof document !== "undefined" && typeof window !== "undefined") {
   });
 }
 
+// 2026-10-31. The timeout message asserted "The edge did not answer in time.
+// It is busy, not unreachable" - a claim nobody had measured. On the machine
+// where this happens a RENDERER was burning 74.6% of a core while the backend
+// sat at 30.5%, and a blocked event loop delays the fetch promise and the
+// abort timer alike: the edge gets blamed for the browser.
+//
+// This samples how late a 1s interval actually fires. When the page itself
+// was stalled the message says so, and points at the right machine.
+let _loopLagMs = 0;
+try {
+  let _lastTick = (typeof performance !== "undefined" ? performance.now() : Date.now());
+  setInterval(() => {
+    const now = (typeof performance !== "undefined" ? performance.now() : Date.now());
+    const late = now - _lastTick - 1000;
+    _lastTick = now;
+    // Decay, so one old stall does not colour every later message.
+    _loopLagMs = Math.max(late > 0 ? late : 0, _loopLagMs * 0.5);
+  }, 1000);
+} catch (_) { /* no timers: leave the lag at 0 and say nothing about it */ }
+
+export function uiStallMs() {
+  return Math.round(_loopLagMs);
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
   // Once the session is over, stop touching the network. Twenty-two pollers
   // queueing 12-second timeouts against a six-socket pool is what makes a
@@ -498,10 +522,57 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
       if (isNetwork) {
         let target = String(url || "");
         try { target = new URL(url, window.location.href).origin; } catch (_) { /* keep the raw url */ }
-        const wrapped = new Error(
-          `No response from ${target}. The service did not answer - check that `
-          + `TrustNode is running there, and that a firewall or antivirus is not `
-          + `blocking it.`);
+        // 2026-10-29, reported: "it keeps asking if TrustNode is running
+        // there, when I am from the local edge - that is not acceptable".
+        // Quite right. When the request goes to the SAME host that served
+        // this page, TrustNode is obviously running there and there is no
+        // firewall between them: the page came from it. Sending an
+        // operator to check an antivirus in that case is a wild goose
+        // chase, and it hides the real cause.
+        //
+        // Measured the same day on an idle edge, with the UI's own 22
+        // pollers running: /api/app-store/sync/status 11.5s median,
+        // /api/plc/gateways/status 8.8s, /api/app-store/live 4.0s - on
+        // LOOPBACK. A browser allows six connections per origin, so slow
+        // pollers hold all six and a save queues behind them until its
+        // 20/30/40s retries are spent. That is this error, and it has
+        // nothing to do with the network.
+        //
+        // 2026-10-30: comparing against the page's own origin was not
+        // enough. The desktop shell does not serve the UI from
+        // http://127.0.0.1:8000, so an edge talking to its own backend
+        // failed that test and the operator was told to check a firewall
+        // between a process and itself. Reported with a screenshot of
+        // exactly that on the local edge.
+        //
+        // The rule that actually holds: if the target is LOOPBACK, the
+        // service is on this machine and nothing is in between.
+        let sameOrigin = false;
+        try {
+          const host = new URL(target, window.location.href).hostname;
+          sameOrigin = (host === "127.0.0.1" || host === "localhost"
+                        || host === "::1" || host === "[::1]"
+                        || target === window.location.origin);
+        } catch (_) { /* unknown */ }
+        // Only blame the edge when this page was actually responsive.
+        const stall = Math.round(_loopLagMs);
+        if (sameOrigin && stall >= 1000) {
+          const stalled = new Error(
+            `This computer was too busy to process the reply (its display `
+            + `stalled for ${(stall / 1000).toFixed(1)}s during the request). `
+            + `The edge may have answered normally - check Settings > `
+            + `Diagnostics for which process is using the CPU.`);
+          stalled.timedOut = true;
+          stalled.uiStalled = true;
+          throw stalled;
+        }
+        const wrapped = new Error(sameOrigin
+          ? `The edge did not answer in time. It is busy, not unreachable - `
+            + `this page is served by it. Wait for the current work to finish `
+            + `and try again; if it keeps happening, send the Diagnostics page.`
+          : `No response from ${target}. The service did not answer - check that `
+            + `TrustNode is running there, and that a firewall or antivirus is not `
+            + `blocking it.`);
         wrapped.networkError = true;
         wrapped.target = target;
         throw wrapped;
@@ -1472,6 +1543,35 @@ export async function getAppStoreHistorian(limit = 1000, cloudEdge = null) {
     { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
   );
   if (!res.ok) throw new Error("App store historian fetch failed");
+  return res.json();
+}
+
+// 2026-10-28: where a trigger-windowed chart should START.
+//
+// Asks the edge for the most recent moment the condition BECAME true - a
+// rising edge, not "is it true now" - so a start bit that has been high for
+// an hour still anchors the axis where the run began, and a new run moves
+// it. from_utc comes back empty when it has never been true; the caller
+// falls back to its reading count rather than showing a blank chart.
+export async function getHistorianTriggerWindow({
+  gateway = "", tag = "", operator = "==", value = "",
+  stopGateway = "", stopTag = "", stopOperator = "==", stopValue = "",
+} = {}) {
+  const params = new URLSearchParams();
+  params.set("gateway", String(gateway || ""));
+  params.set("tag", String(tag || ""));
+  params.set("operator", String(operator || "=="));
+  params.set("value", String(value ?? ""));
+  if (stopTag) {
+    params.set("stop_gateway", String(stopGateway || gateway || ""));
+    params.set("stop_tag", String(stopTag));
+    params.set("stop_operator", String(stopOperator || "=="));
+    params.set("stop_value", String(stopValue ?? ""));
+  }
+  const res = await fetchWithTimeout(
+    `${getAppStoreApiBase()}/api/app-store/historian/trigger-window?${params.toString()}`,
+    { method: "GET", headers: { "Content-Type": "application/json" } }, 20000);
+  if (!res.ok) return { ok: false, found: false, from_utc: "", to_utc: "" };
   return res.json();
 }
 
@@ -3956,11 +4056,23 @@ export async function deleteScheduledReport(scheduleId) {
  * choose to bypass.
  */
 export async function runScheduledReport(scheduleId, emailSettings = null, { force = false } = {}) {
+  // 2026-10-31. This used to hold the request open for the whole render -
+  // up to 60 seconds of one of the browser's SIX connections per origin.
+  // Everything else the page wanted queued behind it and expired on its own
+  // 12-second timeout, which is why the customer's log shows "Run failed"
+  // and "templates ... could not be loaded" in the SAME SECOND with a
+  // healthy heartbeat either side. The edge was not slow; it was holding a
+  // socket.
+  //
+  // The run now starts on the edge and we poll a cheap job endpoint. Each
+  // HTTP call is short, so a long render costs one connection for a moment
+  // rather than for a minute.
   const res = await fetchWithTimeout(`${_reportApiBase()}/api/reports/schedules/${encodeURIComponent(scheduleId)}/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email_settings: emailSettings || null, force: !!force }),
-  }, 60000);
+    body: JSON.stringify({ email_settings: emailSettings || null,
+                           force: !!force, background: true }),
+  }, 20000);
   if (res.status === 409) {
     let detail = "Gateway is not running.";
     try {
@@ -3973,7 +4085,36 @@ export async function runScheduledReport(scheduleId, emailSettings = null, { for
     throw err;
   }
   await ensureOk(res, "Run scheduled report failed");
-  return res.json();
+  const started = await res.json();
+  const jobId = started && started.job_id;
+  if (!jobId) return started;            // an older edge ran it inline
+
+  // Poll until it finishes. The budget is generous because a big report
+  // legitimately takes minutes - what matters is that we are not holding a
+  // connection while it does.
+  const deadline = Date.now() + 15 * 60 * 1000;
+  let waitMs = 1000;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, waitMs));
+    waitMs = Math.min(5000, Math.round(waitMs * 1.4));
+    let job;
+    try {
+      const jr = await fetchWithTimeout(
+        `${_reportApiBase()}/api/reports/jobs/${encodeURIComponent(jobId)}`, {}, 15000);
+      await ensureOk(jr, "Checking the report run failed");
+      job = await jr.json();
+    } catch (e) {
+      if (Date.now() > deadline) throw e;
+      continue;                          // a dropped poll is not a failed run
+    }
+    if (job.state === "done") return { ok: true, ...(job.result || {}) };
+    if (job.state === "error") throw new Error(job.error || "Run failed");
+    if (Date.now() > deadline) {
+      throw new Error(
+        `The report is still being produced after ${Math.round((Date.now() - (deadline - 15 * 60 * 1000)) / 60000)} minutes. `
+        + `It will finish on the edge and appear in Generated Reports.`);
+    }
+  }
 }
 
 export async function getReportSchedulerStatus() {

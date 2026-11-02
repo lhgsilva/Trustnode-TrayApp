@@ -76,6 +76,7 @@ import {
   getAppStoreLive,
   getAppStoreHistorian,
   getAppStoreHistorianRange,
+  getHistorianTriggerWindow,
   getAppStoreHistorianAgg,
   getAppStoreHistorianStats,
   getAppStoreHistorianRuleStats,
@@ -5464,8 +5465,81 @@ function AppShell() {
   // Flipped to true the first time applyAppStoreBootstrapToState() runs, so
   // the stub-gateway seed effect can tell "still loading" from "loaded but
   // empty" and avoid clobbering a saved gateway list during the load race.
+  // 2026-10-30, reported on a BRAND-NEW install: "Database connections could
+  // not be saved: The edge did not answer in time" sitting on screen while
+  // the edge was perfectly healthy - measured on that very machine, the same
+  // save completed in 0.011s, three times running.
+  //
+  // The banner was true once and never again. These savers call setError on
+  // a failure and nothing clears it on the next success, so a single hiccup
+  // while the backend was still finishing its 4s boot leaves a red banner
+  // for the rest of the session. The operator reads it as "the app is
+  // broken"; the app has long since recovered.
+  //
+  // Two rules, the same ones the reports module already follows:
+  //   * a transport failure is retried quietly and only announced once it
+  //     has happened twice - a boot race announces nothing;
+  //   * a success CLEARS the message this saver put up, and only that one.
+  // A refusal (an HTTP status) is an answer, not a hiccup, and is shown at
+  // once as before.
+  const saveFailureCountRef = useRef({});
+  const noteSaveFailed = (label, why) => {
+    const transient = !/HTTP \d{3}/.test(String(why || ""));
+    const n = (saveFailureCountRef.current[label] || 0) + 1;
+    saveFailureCountRef.current[label] = n;
+    if (transient && n < 2) return false;      // ride out the first one
+    return true;
+  };
+  const noteSaveOk = (label) => {
+    if (!saveFailureCountRef.current[label]) return;
+    saveFailureCountRef.current[label] = 0;
+    setError((cur) => (String(cur || "").startsWith(label) ? "" : cur));
+  };
+
   const gatewayBootstrapAppliedRef = useRef(false);
   const dashboardHistorySeedRef = useRef(false);
+  // 2026-10-28: resolved start (and optional end) for every widget set to
+  // "From a trigger". Keyed by widget id. Re-derived from the historian on
+  // a slow poll rather than stored, so a new run moves the window by itself
+  // and a restart needs no state to have survived.
+  const [triggerWindows, setTriggerWindows] = useState({});
+  useEffect(() => {
+    const wanted = (Array.isArray(dashboardWidgets) ? dashboardWidgets : [])
+      .filter((w) => String(w?.config?.window_mode || "") === "trigger"
+                     && String(w?.config?.window_tag_name || "").trim());
+    if (!wanted.length) {
+      setTriggerWindows((prev) => (Object.keys(prev).length ? {} : prev));
+      return;
+    }
+    let dead = false;
+    const resolve = async () => {
+      for (const w of wanted) {
+        const c = w.config || {};
+        try {
+          const res = await getHistorianTriggerWindow({
+            gateway: c.window_gateway_id || "",
+            tag: c.window_tag_name || "",
+            operator: c.window_operator || "==",
+            value: c.window_value ?? "",
+            stopGateway: c.window_gateway_id || "",
+            stopTag: c.window_stop_tag || "",
+            stopOperator: c.window_stop_operator || "==",
+            stopValue: c.window_stop_value ?? "",
+          });
+          if (dead) return;
+          setTriggerWindows((prev) => {
+            const cur = prev[w.id] || {};
+            if (cur.from === (res?.from_utc || "") && cur.to === (res?.to_utc || "")) return prev;
+            return { ...prev, [w.id]: { from: res?.from_utc || "", to: res?.to_utc || "" } };
+          });
+        } catch (_) { /* a chart must not break because a window did */ }
+      }
+    };
+    resolve();
+    const t = setInterval(resolve, 15000);
+    return () => { dead = true; clearInterval(t); };
+  }, [dashboardWidgets]);
+
   const gatewayRuntimeStatusesRef = useRef({});
   const gatewayRuntimePrevRef = useRef({});
   const gatewayRuntimeTransitionsRef = useRef({});
@@ -7748,7 +7822,7 @@ function AppShell() {
     appStoreSaveTimerRef.current = setTimeout(async () => {
       if (appStorePersistInFlightRef.current) return;
       const payload = buildAppStorePayload();
-      const signature = JSON.stringify(payload);
+      const signature = configSignature(payload);
       // Seed baseline from hydrated data and skip first implicit write.
       // This prevents stale browser sessions from overwriting cloud config
       // immediately on page load.
@@ -7836,7 +7910,7 @@ function AppShell() {
         // Saved layouts travel with the dashboard they belong to.
         profiles: Array.isArray(dashboardProfiles) ? dashboardProfiles : [],
       };
-      const signature = JSON.stringify(payload);
+      const signature = configSignature(payload);
       // Always save on the first run (previously this branch returned
       // early to avoid an idempotent hydration round-trip). The "skip"
       // meant a fresh launch never re-mirrored the dashboard to Supabase
@@ -7933,7 +8007,7 @@ function AppShell() {
     alarmsDomainSaveTimerRef.current = setTimeout(async () => {
       if (alarmsDomainPersistInFlightRef.current) return;
       const payload = { alarms: Array.isArray(alarms) ? alarms : [] };
-      const signature = JSON.stringify(payload);
+      const signature = configSignature(payload);
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       // Bug A guard: see dashboard_configurations note above.
       // Never write a document we never read. A page whose bootstrap
@@ -8008,7 +8082,7 @@ function AppShell() {
         collection_trigger_mode: collectionTriggerMode,
         trigger_rules: Array.isArray(triggerRules) ? triggerRules : [],
       };
-      const signature = JSON.stringify(payload);
+      const signature = configSignature(payload);
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       // Bug A guard: triggers + rules empty BEFORE hydration would
       // erase the customer's configured triggers/rules. Refuse PUT.
@@ -8064,7 +8138,7 @@ function AppShell() {
     gatewayConfigsSaveTimerRef.current = setTimeout(async () => {
       if (gatewayConfigsPersistInFlightRef.current) return;
       const payload = Array.isArray(gatewayConfigs) ? gatewayConfigs : [];
-      const signature = JSON.stringify(payload);
+      const signature = configSignature(payload);
       // Operator 2026-06-25 (final fix): the prior `if (!ref) { ref =
       // sig; return; }` skip-first-run guard MEANT to avoid an
       // immediate re-persist of bootstrap data, but the guard fires
@@ -8098,6 +8172,7 @@ function AppShell() {
             ...domainVersionsRef.current, "gateway_configurations": _v };
         }
         gatewayConfigsLastPersistSignatureRef.current = signature;
+        noteSaveOk('Gateway configuration');
       } catch (err) {
         // Surfaced, not swallowed. A save that fails silently is
         // indistinguishable from one that worked - which is how a
@@ -8115,7 +8190,9 @@ function AppShell() {
             + `Reloading the current configuration — please redo your change.`);
           reloadAppStoreConfig();
         } else {
-          setError(`Gateway configuration could not be saved: ${why}`);
+          if (noteSaveFailed('Gateway configuration', why)) {
+            setError(`Gateway configuration could not be saved: ${why}`);
+          }
         }
       }
       finally { gatewayConfigsPersistInFlightRef.current = false; }
@@ -8141,7 +8218,7 @@ function AppShell() {
     devicesSaveTimerRef.current = setTimeout(async () => {
       if (devicesPersistInFlightRef.current) return;
       const payload = Array.isArray(devices) ? devices : [];
-      const signature = JSON.stringify(payload);
+      const signature = configSignature(payload);
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       // Bug A guard: refuse to PUT an empty devices list if backend
       // hydration has never confirmed.
@@ -8164,6 +8241,7 @@ function AppShell() {
             ...domainVersionsRef.current, "devices": _v };
         }
         devicesLastPersistSignatureRef.current = signature;
+        noteSaveOk('Devices');
       } catch (err) {
         // Surfaced, not swallowed. A save that fails silently is
         // indistinguishable from one that worked - which is how a
@@ -8181,7 +8259,9 @@ function AppShell() {
             + `Reloading the current configuration — please redo your change.`);
           reloadAppStoreConfig();
         } else {
-          setError(`Devices could not be saved: ${why}`);
+          if (noteSaveFailed('Devices', why)) {
+            setError(`Devices could not be saved: ${why}`);
+          }
         }
       }
       finally { devicesPersistInFlightRef.current = false; }
@@ -8207,7 +8287,7 @@ function AppShell() {
     dbConnectionsSaveTimerRef.current = setTimeout(async () => {
       if (dbConnectionsPersistInFlightRef.current) return;
       const payload = Array.isArray(dbConnections) ? dbConnections : [];
-      const signature = JSON.stringify(payload);
+      const signature = configSignature(payload);
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       // Bug A guard: this is THE bug that erased mari's cloud DB on
       // edge reactivation — empty React state PUT before bootstrap
@@ -8232,6 +8312,7 @@ function AppShell() {
             ...domainVersionsRef.current, "database_configurations": _v };
         }
         dbConnectionsLastPersistSignatureRef.current = signature;
+        noteSaveOk('Database connections');
       } catch (err) {
         // Surfaced, not swallowed. A save that fails silently is
         // indistinguishable from one that worked - which is how a
@@ -8249,7 +8330,9 @@ function AppShell() {
             + `Reloading the current configuration — please redo your change.`);
           reloadAppStoreConfig();
         } else {
-          setError(`Database connections could not be saved: ${why}`);
+          if (noteSaveFailed('Database connections', why)) {
+            setError(`Database connections could not be saved: ${why}`);
+          }
         }
       }
       finally { dbConnectionsPersistInFlightRef.current = false; }
@@ -8278,7 +8361,7 @@ function AppShell() {
       // Attach the resolved sinks before saving, so the running meter receives
       // them instead of looking them up in a table it cannot see.
       const payload = powerConfigWithSinks(basePayload, dbConnectionsRef.current);
-      const signature = JSON.stringify(payload);
+      const signature = configSignature(payload);
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       // Bug A guard: empty object before hydration is React initial state.
       // Never write a document we never read. A page whose bootstrap
@@ -8300,6 +8383,7 @@ function AppShell() {
             ...domainVersionsRef.current, "power_management_config": _v };
         }
         powerConfigLastPersistSignatureRef.current = signature;
+        noteSaveOk('Power configuration');
       } catch (err) {
         // Surfaced, not swallowed. A save that fails silently is
         // indistinguishable from one that worked - which is how a
@@ -8317,7 +8401,9 @@ function AppShell() {
             + `Reloading the current configuration — please redo your change.`);
           reloadAppStoreConfig();
         } else {
-          setError(`Power configuration could not be saved: ${why}`);
+          if (noteSaveFailed('Power configuration', why)) {
+            setError(`Power configuration could not be saved: ${why}`);
+          }
         }
       }
       finally { powerConfigPersistInFlightRef.current = false; }
@@ -15103,8 +15189,25 @@ const getGatewayHealth = (gateway) => {
         ? String(gateway?.opc_url || "")
         : String(gateway?.plc_ip || "");
       const widgetTag = String(w.tag_name || "");
+      // 2026-10-28: a widget set to "From a trigger" is bounded by the run
+      // it belongs to, not by a rolling count. The window is resolved from
+      // the historian (the moment the start condition BECAME true) and
+      // simply narrows the rows this chart may use - everything downstream,
+      // including the live stream, is untouched. With no window resolved
+      // yet the chart keeps its reading count, so it is never blank.
+      const tw = (String(w?.config?.window_mode || "") === "trigger")
+        ? (triggerWindows[w.id] || null) : null;
+      const twFromMs = tw?.from ? parseTimestampMs(String(tw.from)) : NaN;
+      const twToMs = tw?.to ? parseTimestampMs(String(tw.to)) : NaN;
       const filteredRows = dataLogView.filter((r) => {
         if (String(r.tag || r.tag_name || "") !== widgetTag) return false;
+        if (Number.isFinite(twFromMs)) {
+          const ts = parseTimestampMs(String(r.ts_utc || r.ts || ""));
+          if (Number.isFinite(ts)) {
+            if (ts < twFromMs) return false;
+            if (Number.isFinite(twToMs) && ts > twToMs) return false;
+          }
+        }
         if (String(r.gateway_id || "") === String(w.gateway_id || "")) return true;
         if (widgetEndpoint && String(r.plc_ip || "") === widgetEndpoint) return true;
         return false;
@@ -27151,7 +27254,23 @@ const getGatewayHealth = (gateway) => {
                 mode="generated"
                 emailSettings={buildEmailTransportPayload(emailSettings || {})}
                 onNotify={(n) => {
+                  // 2026-10-31. A page that retries can now take its message
+                  // back. The reporting pages fail their FIRST read while the
+                  // backend is still starting - measured on a customer edge:
+                  // "Failed to load templates" at 15:07:53, with the gateway
+                  // still stopped and DB recovery not finished until 15:08:33 -
+                  // then retry and succeed seconds later. The banner stayed up
+                  // for the rest of the session, so a problem that had already
+                  // fixed itself looked permanent, and every other page
+                  // inherited the same red bar.
+                  //
+                  // Only the exact message is cleared, so retracting one
+                  // cannot wipe an unrelated error raised in the meantime.
                   if (n?.type === "error") setError(String(n.message || ""));
+                  else if (n?.type === "clear") {
+                    const gone = String(n.message || "");
+                    setError((cur) => (cur && cur === gone ? "" : cur));
+                  }
                 }}
               />
             </div>
@@ -27166,7 +27285,23 @@ const getGatewayHealth = (gateway) => {
                 emailSettings={buildEmailTransportPayload(emailSettings || {})}
                 formatTagForDisplay={formatTagForDisplay}
                 onNotify={(n) => {
+                  // 2026-10-31. A page that retries can now take its message
+                  // back. The reporting pages fail their FIRST read while the
+                  // backend is still starting - measured on a customer edge:
+                  // "Failed to load templates" at 15:07:53, with the gateway
+                  // still stopped and DB recovery not finished until 15:08:33 -
+                  // then retry and succeed seconds later. The banner stayed up
+                  // for the rest of the session, so a problem that had already
+                  // fixed itself looked permanent, and every other page
+                  // inherited the same red bar.
+                  //
+                  // Only the exact message is cleared, so retracting one
+                  // cannot wipe an unrelated error raised in the meantime.
                   if (n?.type === "error") setError(String(n.message || ""));
+                  else if (n?.type === "clear") {
+                    const gone = String(n.message || "");
+                    setError((cur) => (cur && cur === gone ? "" : cur));
+                  }
                 }}
               />
               
@@ -29734,7 +29869,23 @@ const getGatewayHealth = (gateway) => {
                 emailSettings={buildEmailTransportPayload(emailSettings || {})}
                 formatTagForDisplay={formatTagForDisplay}
                 onNotify={(n) => {
+                  // 2026-10-31. A page that retries can now take its message
+                  // back. The reporting pages fail their FIRST read while the
+                  // backend is still starting - measured on a customer edge:
+                  // "Failed to load templates" at 15:07:53, with the gateway
+                  // still stopped and DB recovery not finished until 15:08:33 -
+                  // then retry and succeed seconds later. The banner stayed up
+                  // for the rest of the session, so a problem that had already
+                  // fixed itself looked permanent, and every other page
+                  // inherited the same red bar.
+                  //
+                  // Only the exact message is cleared, so retracting one
+                  // cannot wipe an unrelated error raised in the meantime.
                   if (n?.type === "error") setError(String(n.message || ""));
+                  else if (n?.type === "clear") {
+                    const gone = String(n.message || "");
+                    setError((cur) => (cur && cur === gone ? "" : cur));
+                  }
                 }}
               />
               
@@ -33589,6 +33740,79 @@ const getGatewayHealth = (gateway) => {
                     <label><span>Reading points</span>
                       <input type="number" min="10" max="2000" value={Number(current.readings_count || 200)} onChange={(e) => setField("readings_count", Math.max(10, Math.min(2000, Number(e.target.value || 200))))} />
                     </label>
+                    {/* 2026-10-28, requested: a chart whose X axis starts
+                        when a trigger fired, so the operator sees the
+                        CURRENT batch or test rather than a rolling count.
+                        "Last readings" is the existing behaviour and stays
+                        the default - an existing widget is untouched. */}
+                    <label><span>Time window</span>
+                      <select value={current.window_mode || "count"}
+                        onChange={(e) => setField("window_mode", e.target.value)}>
+                        <option value="count">Last readings (rolling)</option>
+                        <option value="trigger">From a trigger (batch / test)</option>
+                      </select>
+                    </label>
+                    {String(current.window_mode || "count") === "trigger" ? (
+                      <>
+                        <label><span>Start when</span>
+                          <select value={current.window_gateway_id || ""}
+                            onChange={(e) => setField("window_gateway_id", e.target.value)}>
+                            <option value="">Any gateway</option>
+                            {(allGatewayOptions || []).map((g) => (
+                              <option key={g.id} value={g.id}>{g.name || g.id}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label><span>Start tag</span>
+                          <select value={current.window_tag_name || ""}
+                            onChange={(e) => setField("window_tag_name", e.target.value)}>
+                            <option value="">Pick a tag…</option>
+                            {(triggerTagsByGateway?.[String(current.window_gateway_id || "")] || []).map((t) => (
+                              <option key={t} value={t}>{formatTagForDisplay(t)}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label><span>Is</span>
+                          <select value={current.window_operator || "=="}
+                            onChange={(e) => setField("window_operator", e.target.value)}>
+                            <option value="==">equal to</option>
+                            <option value="!=">not equal to</option>
+                            <option value=">">greater than</option>
+                            <option value=">=">at least</option>
+                            <option value="<">less than</option>
+                            <option value="<=">at most</option>
+                          </select>
+                        </label>
+                        <label><span>Value</span>
+                          <input value={current.window_value ?? ""}
+                            placeholder="1"
+                            title="The chart restarts each time this becomes true."
+                            onChange={(e) => setField("window_value", e.target.value)} />
+                        </label>
+                        <label><span>Stop tag (optional)</span>
+                          <select value={current.window_stop_tag || ""}
+                            onChange={(e) => setField("window_stop_tag", e.target.value)}>
+                            <option value="">Keep running to now</option>
+                            {(triggerTagsByGateway?.[String(current.window_gateway_id || "")] || []).map((t) => (
+                              <option key={t} value={t}>{formatTagForDisplay(t)}</option>
+                            ))}
+                          </select>
+                        </label>
+                        {current.window_stop_tag ? (
+                          <label><span>Stop value</span>
+                            <input value={current.window_stop_value ?? ""}
+                              placeholder="1"
+                              onChange={(e) => setField("window_stop_value", e.target.value)} />
+                          </label>
+                        ) : null}
+                        <p className="tn-token-help" style={{ gridColumn: "1 / -1" }}>
+                          The window opens at the moment the start condition
+                          BECAME true, so a bit that stays high keeps the run
+                          it began. Until it has ever been true the chart
+                          shows the reading points above, so it is never blank.
+                        </p>
+                      </>
+                    ) : null}
                     <label><span>Chart colors</span>
                       <select value={current.color_mode || "default"} onChange={(e) => setField("color_mode", e.target.value)}>
                         <option value="default">Default brand colors</option>
@@ -34756,6 +34980,72 @@ function BannerDismiss({ onClick }) {
     </button>
   );
 }
+
+// 2026-10-31. THE SAVE LOOP, from a customer's own log:
+//
+//   13:26:01 ERROR config  Database connections was NOT saved
+//   13:26:01 ERROR config  Devices was NOT saved
+//   13:26:14 INFO  system  Loop heartbeat: devices 1/1 online, databases 1/1
+//                          online, gateways 1/1 running, ws connected.
+//   13:26:21 ERROR config  Database connections was NOT saved
+//   13:26:21 ERROR config  Devices was NOT saved
+//   13:26:31 ERROR config  Database connections was NOT saved
+//
+// A healthy edge, and a config save failing every ten seconds - while nobody
+// was editing anything.
+//
+// Each saver decides "has this changed?" with JSON.stringify over its whole
+// React state. That state carries RUNTIME counters: db_write_count climbs
+// with every historian row, db_last_write_utc moves every write, ping_ok and
+// last_check_utc change on every status poll. The backend throws all of them
+// away - _strip_runtime_fields_for_config_sync in app_store.py - so the
+// stored document is identical, but the signature is different every single
+// time, and the saver fires again. On an idle bench nothing moves and this
+// never shows; on a machine collecting at 500 ms it never stops.
+//
+// Worse, the signature is only recorded on SUCCESS, so one timeout turns
+// every later tick into another retry. That is the storm that exhausts the
+// six sockets a browser gives an origin, which is why templates, scheduled
+// reports and generated reports then "could not be loaded" too.
+//
+// The fix is to ask the right question: compare what the backend actually
+// STORES. The payload sent is untouched - the server strips it anyway - so
+// nothing can be lost by this.
+//
+// Keep this list identical to transient_keys in
+// app_store.py::_strip_runtime_fields_for_config_sync.
+// scripts/test_config_save_loop.py fails if the two ever drift apart.
+const CONFIG_TRANSIENT_KEYS = new Set([
+  "saved_utc", "connection_ok", "ping_ok", "port_ok", "protocol_ok",
+  "last_test", "last_check_utc", "db_write_count", "db_pending_count",
+  "db_last_write_utc", "db_last_error", "last_error", "running",
+  "transient", "collection_blocked", "collection_block_reason",
+]);
+
+export function stripRuntimeFields(value) {
+  if (Array.isArray(value)) return value.map(stripRuntimeFields);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const k of Object.keys(value)) {
+      if (CONFIG_TRANSIENT_KEYS.has(k)) continue;
+      out[k] = stripRuntimeFields(value[k]);
+    }
+    return out;
+  }
+  return value;
+}
+
+//: The signature a saver compares - over the stored shape, not the live one.
+export function configSignature(payload) {
+  try {
+    return JSON.stringify(stripRuntimeFields(payload));
+  } catch (_) {
+    // Never let change-detection throw; a worst case of one extra save is
+    // far better than a saver that stops working.
+    try { return JSON.stringify(payload); } catch (__) { return ""; }
+  }
+}
+
 
 export default function App() {
   try {

@@ -698,6 +698,9 @@ class AuthStore:
         users_access_payload: Any,
         scoped_payloads: Optional[Iterable[Any]] = None,
         actor: str = "boot_migration",
+        prior_hashes: Optional[Dict[str, str]] = None,   # kept: callers pass it,
+        # no longer the discriminator - see the password rule below.
+        default_tenant: str = "",
     ) -> Dict[str, int]:
         """Copy users from the legacy app_store users_access docs into
         the AuthStore. Idempotent — uses INSERT OR REPLACE on username.
@@ -706,11 +709,53 @@ class AuthStore:
         the fly only if a plaintext password is encountered (legacy
         format some old configs still carry).
 
+        2026-10-30 — THE PASSWORD RULE. This ran on every users_access save
+        and wrote the document's hash straight over the AuthStore row, so a
+        document carrying a stale or foreign hash silently invalidated a
+        password that was working. Measured on the operator's machine:
+
+            19:47:02  admin signs in over the LAN - OK
+            19:47:06  this edge's users_access document is saved, carrying
+                      a DIFFERENT admin hash (pbkdf2…803afc95…)
+            19:53:44  every sign-in from that moment: invalid_credentials
+
+        The same file held three other users_access documents - the legacy
+        unscoped one and two other edges' - all carrying the hash that
+        actually matched the operator's password. Nothing was logged.
+
+        So: this mirror may CREATE users and may update role, permissions
+        and status. It changes a password only when the save really changed
+        one, which the caller proves by passing `prior_hashes` - what the
+        stored document held before this save. A hash that is unchanged in
+        the document cannot be a password change, whatever it is, and the
+        credential already in the AuthStore stands.
+
+        With no `prior_hashes` the caller cannot tell a change from a stale
+        copy, so an EXISTING user keeps their password. Only a user the
+        AuthStore has never seen is seeded from the document.
+
         Returns counts so the boot path can log what moved.
         """
-        out = {"unscoped": 0, "scoped": 0, "skipped": 0}
+        out = {"unscoped": 0, "scoped": 0, "skipped": 0, "password_kept": 0}
 
-        def _consume(payload: Any, bucket: str) -> None:
+        def _home_tenant(u: Dict[str, Any], existing: Optional[Dict[str, Any]]) -> str:
+            # 2026-11-02: `default` is TrustNode's developer tenant. A user
+            # created on an activated edge belongs to that edge's tenant, so
+            # a document that names no tenant (the Users page never did)
+            # must not file a customer's user under `default`. An account
+            # the AuthStore already holds keeps whatever it has - this is
+            # for the row being CREATED. `default_tenant` is what the caller
+            # resolved the edge to; it is "" on an edge with no identity.
+            doc = str(u.get("tenant_id") or "").strip()
+            if existing:
+                return doc or str(existing.get("tenant_id") or "") or "default"
+            home = str(default_tenant or "").strip()
+            if doc and doc != "default":
+                return doc
+            return home if (home and home != "default") else (doc or "default")
+
+        def _consume(payload: Any, bucket: str,
+                     prior: Optional[Dict[str, str]] = None) -> None:
             if not isinstance(payload, dict):
                 return
             users = payload.get("users")
@@ -742,6 +787,45 @@ class AuthStore:
                 else:
                     out["skipped"] += 1
                     continue
+                # Never let a mirror replace a working credential.
+                existing = None
+                try:
+                    existing = self.get_user(uname)
+                except Exception:
+                    existing = None
+                existing_hash = str((existing or {}).get("password_hash") or "")
+                if existing_hash:
+                    # ABSOLUTE: a users_access save never changes an existing
+                    # local account's password.
+                    #
+                    # 2026-10-30, measured. The Users and Access Control screen
+                    # builds this document from the CONTROL-PLANE user list and
+                    # mirrors it down, so it carries the CLOUD's hash for a
+                    # username that also exists locally. On the operator's edge
+                    # the cloud admin hashed to …803afc95 and the local one to
+                    # …bb1b2d96; the mirror wrote the cloud's over the local
+                    # one and the password that had signed in 4 seconds earlier
+                    # stopped working. Nothing was logged and nothing on screen
+                    # said a credential had been touched.
+                    #
+                    # A first attempt allowed the change when the document's
+                    # hash differed from the document's PREVIOUS hash. That
+                    # fails here: the document really had changed, so the rule
+                    # permitted exactly the write it was meant to stop. The
+                    # test against the packaged build caught it.
+                    #
+                    # Passwords belong to the password endpoints -
+                    # /api/auth/change-password and /api/auth/reset-password -
+                    # which write the credential directly. This mirror creates
+                    # users and syncs role, permissions and status. It does not
+                    # carry credentials for accounts that already exist.
+                    if stored_hash != existing_hash:
+                        print("[trustnode][auth] %s: a users_access save carried a "
+                              "different password hash; keeping the stored "
+                              "credential (actor=%s). Use the password endpoints "
+                              "to change a password." % (uname, actor), flush=True)
+                        out["password_kept"] += 1
+                    stored_hash = existing_hash
                 try:
                     self.upsert_user(
                         username=uname,
@@ -749,7 +833,7 @@ class AuthStore:
                         role=str(u.get("role") or "viewer"),
                         permissions=u.get("permissions") if isinstance(u.get("permissions"), dict) else None,
                         modules=u.get("modules") if isinstance(u.get("modules"), list) else None,
-                        tenant_id=str(u.get("tenant_id") or "default"),
+                        tenant_id=_home_tenant(u, existing),
                         status=str(u.get("status") or "active"),
                         must_change_password=bool(u.get("must_change_password")),
                     )
@@ -757,7 +841,12 @@ class AuthStore:
                 except Exception:
                     out["skipped"] += 1
 
-        _consume(users_access_payload, "unscoped")
+        # `prior_hashes` describes the ONE document being saved, so only that
+        # document may prove a password change. The extra scoped payloads are
+        # other sources - at boot they are this edge's own documents, and
+        # historically they were every edge's - and a source that cannot prove
+        # a change must never force one.
+        _consume(users_access_payload, "unscoped", prior_hashes)
         for sp in (scoped_payloads or []):
-            _consume(sp, "scoped")
+            _consume(sp, "scoped", None)
         return out

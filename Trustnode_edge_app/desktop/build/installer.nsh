@@ -38,6 +38,30 @@
   IfFileExists "$PROGRAMFILES32\TrustNode\TrustNode\TrustNode.exe" 0 +2
     StrCpy $INSTDIR "$PROGRAMFILES32\TrustNode\TrustNode"
   tn_initdone:
+
+  ; --- Operator 2026-10-30: CLOSE THE RUNNING APP BEFORE COPYING FILES.
+  ;
+  ; Reported: the setup "says we have something inside of the installer and
+  ; partially cannot be installed ... something about a -old file". That is
+  ; Windows, not the package. An upgrade cannot overwrite an executable that
+  ; is running, so NSIS renames the locked file to TrustNode.exe-old, carries
+  ; on, and reports a partial install. The leftover is then deleted on the
+  ; next reboot - which is why nothing suspicious is in the installer and
+  ; nothing is left on disk afterwards.
+  ;
+  ; Ask politely first, then insist. The backend is killed too: it holds the
+  ; sidecar binaries open, and it is a child of the app being replaced.
+  ; SQLite is crash-safe (WAL), so a hard stop costs nothing - and the
+  ; alternative, a half-replaced install, costs the customer their morning.
+  DetailPrint "Closing TrustNode if it is running..."
+  nsExec::Exec 'taskkill /IM TrustNode.exe'
+  nsExec::Exec 'taskkill /IM trustnode-service.exe'
+  Sleep 1500
+  nsExec::Exec 'taskkill /F /IM TrustNode.exe'
+  nsExec::Exec 'taskkill /F /IM trustnode-service.exe'
+  nsExec::Exec 'taskkill /F /IM TrustNodeOpcUa.exe'
+  nsExec::Exec 'taskkill /F /IM mosquitto.exe'
+  Sleep 1000
 !macroend
 
 !macro customInstall

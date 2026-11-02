@@ -5802,8 +5802,11 @@ textarea {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
+  min-width: 0;
   margin-bottom: 8px;
 }
+.scheduled-reports-list-head > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .schedule-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; }
 .schedule-list-row { padding: 0; }
 .schedule-list-btn {
@@ -9388,10 +9391,33 @@ textarea {
   gap: 6px;
   align-items: center;
 }
+/* 2026-10-30, requested: "elements aligned with same size". The two
+   destination fields were 2fr and 1fr, so Save-to and File-name were
+   visibly different widths in every rule. Equal columns, and each field
+   lays its own row out the same way: label, input, tag picker. */
 .sr-rule-dest {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
+  align-items: end;
+}
+.sr-rule-dest label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+}
+.sr-rule-dest label > span { color: var(--muted, #9aa4b2); font-size: 12px; }
+.sr-rule-dest label > input { min-width: 0; }
+
+/* The tag picker: two short selects that stay the same size wherever they
+   appear, so a row never reflows just because one list has longer names. */
+.sr-token-pick { display: inline-flex; gap: 4px; flex: 0 0 auto; }
+.sr-token-pick select {
+  width: 104px;
+  min-width: 104px;
+  font-size: 12px;
+  padding: 4px 6px;
 }
 .sr-rule-dest label {
   display: flex;
@@ -9406,6 +9432,155 @@ textarea {
   .sr-rule-dest { grid-template-columns: minmax(0, 1fr); }
   .sr-rule-cond { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
 }
+
+/* 2026-10-27: the Generated Reports column editor. It first borrowed the
+   schedule editor's .sr-rule-dest / .sr-path-row, which are sized for a
+   narrow form column - inside the full-width reports card the fields came
+   out mismatched and misaligned. Its own small set instead. */
+
+/* The report file name: the widest useful identifier in the row, but it
+   must not push the actions off the end on a narrow window. */
+.gr-name {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.rc-panel {
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  background: var(--card_2, var(--bg));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.rc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.rc-hint { font-size: 12px; color: var(--muted); margin: 0; line-height: 1.5; }
+.rc-hint code {
+  background: var(--bg);
+  border: 1px solid var(--stroke);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 11px;
+}
+.rc-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  gap: 10px;
+  align-items: end;
+}
+.rc-row > label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  min-width: 0;
+}
+.rc-row input { width: 100%; min-width: 0; box-sizing: border-box; }
+.rc-value { display: flex; gap: 8px; align-items: center; min-width: 0; }
+.rc-value input { flex: 1 1 auto; min-width: 0; }
+.rc-value .btn { flex: 0 0 auto; white-space: nowrap; }
+.rc-actions { display: flex; gap: 8px; align-items: center; }
+@media (max-width: 860px) {
+  .rc-row { grid-template-columns: minmax(0, 1fr); }
+}
+/* 2026-10-30: the destination editor, rebuilt as one aligned two-column
+   grid. Label column is fixed so Folder, File name, Insert and Preview
+   share an edge; the control column is the only thing that stretches, so
+   nothing can push past the card on a narrow window. */
+.sr-dest-grid {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 8px 12px;
+  align-items: center;
+}
+.sr-dest-label {
+  font-size: 12px;
+  color: var(--muted);
+  text-align: right;
+  white-space: nowrap;
+}
+.sr-dest-control {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+.sr-dest-control input { flex: 1 1 auto; min-width: 0; }
+.sr-chips { flex-wrap: wrap; }
+.sr-chip {
+  background: var(--card_2, var(--bg));
+  border: 1px solid var(--stroke);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  height: 24px;
+  padding: 0 8px;
+}
+.sr-chip:hover { border-color: var(--brand-strong, var(--ok)); color: var(--brand-strong, var(--ok)); }
+.sr-chip-where { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.sr-dest-preview {
+  background: var(--card_2, var(--bg));
+  border: 1px solid var(--stroke);
+  border-radius: 6px;
+  color: var(--text);
+  display: block;
+  font-size: 12px;
+  overflow-x: auto;
+  padding: 6px 8px;
+  white-space: nowrap;
+}
+
+/* The "+ New" button on Saved schedules. It used to be `btn btn-link` and
+   inherited a full-height filled pill from the generic .btn rule, which
+   overlapped the card edge. Self-contained so no later rule resizes it. */
+.schedule-new-btn {
+  background: transparent;
+  border: 1px solid var(--stroke);
+  border-radius: 6px;
+  color: var(--brand-strong, var(--ok));
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  height: 26px;
+  line-height: 1;
+  padding: 0 8px;
+}
+.schedule-new-btn:hover { border-color: var(--brand-strong, var(--ok)); }
+.schedule-new-btn svg { width: 12px; height: 12px; }
+
+@media (max-width: 700px) {
+  .sr-dest-grid { grid-template-columns: minmax(0, 1fr); }
+  .sr-dest-label { text-align: left; }
+}
+
+/* A folder that will be created is not a fault - it reads as a note, not a
+   warning, so the one real failure state stays recognisable. */
+.sr-path-note {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
 .sr-path-field { min-width: 0; }
 .sr-path-row {
   display: flex;
@@ -9614,4 +9789,21 @@ textarea {
   border: 1px solid var(--stroke);
   border-radius: var(--radius-md);
   box-shadow: 0 8px 24px rgba(0, 0, 0, .28);
+}
+
+/* Drop preview: where a dragged widget will land. 2026-10-30, requested -
+   "when we drag it shows a preview of what would happen". It sits in the
+   same grid cells the widget will occupy, under the widgets themselves, so
+   it reads as a target and never covers content. */
+.dashboard-drop-preview {
+  border: 2px dashed var(--accent, #14a89a);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent, #14a89a) 12%, transparent);
+  pointer-events: none;
+  z-index: 0;
+  animation: tn-drop-preview-in 120ms ease-out;
+}
+@keyframes tn-drop-preview-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }

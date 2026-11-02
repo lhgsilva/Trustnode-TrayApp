@@ -103,6 +103,38 @@ def _tenant_from_configured_domains(host_txt: str) -> Optional[str]:
     return mapping.get(host_txt)
 
 
+def effective_tenant(token_tenant: str, host_tenant: str, configured_tenant: str) -> str:
+    """Which tenant a request runs as.
+
+    2026-11-02, from the owner: `default` is TrustNode's own developer tenant,
+    where the portal's licence controls live. "None of customer or new
+    installations should have a default tenant user. Every new installation
+    is always linked to a tenant customer id from the portal."
+
+    Until now a request from the desktop app - always 127.0.0.1 - with no
+    token tenant resolved to `default` (see _resolve_from_host), so every
+    user, document and historian row a customer created locally could land
+    in the developer tenant. Measured on a live edge: cp_users held the
+    customer's own `admin` under tenant `default`.
+
+    The rule, in order:
+      1. the token's tenant - a signed-in user carries their own;
+      2. a real host-mapped tenant (a hosted portal domain);
+      3. the tenant this edge was ACTIVATED into - the configured one;
+      4. `default`, which after activation should never be reached.
+    """
+    tok = normalize_tenant_id(str(token_tenant or ""))
+    if tok and tok != "default":
+        return tok
+    host = normalize_tenant_id(str(host_tenant or ""))
+    if host and host != "default":
+        return host
+    conf = normalize_tenant_id(str(configured_tenant or ""))
+    if conf and conf != "default":
+        return conf
+    return tok or host or "default"
+
+
 def resolve_request_tenant(request: Request) -> str:
     forced = request.headers.get("X-Trustnode-Tenant", "").strip()
     if forced:

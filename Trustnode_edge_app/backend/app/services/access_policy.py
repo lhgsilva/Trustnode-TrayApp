@@ -474,7 +474,23 @@ def surface_access(surface: str, payload: Dict[str, Any], remote: bool) -> Tuple
     # only when the portal issued a licence that actually carries seat counts —
     # a licence predating seats keeps the previous behaviour untouched, and the
     # desktop (loopback) is never gated on a seat.
-    if remote and lic_eff == "enforce":
+    # 2026-10-27, reported from a customer edge:
+    #     {"detail":"Access to this surface is not allowed (seat:studio)"}
+    # on https://<edge>:8443/trustnode/full/app/ - signed in as the admin.
+    #
+    # An ADMIN is never blocked by a seat. The seat check sits BEFORE the
+    # `role in ADMIN_ROLES` bypass below, so on a licence carrying explicit
+    # seats the owner-administrator was refused the full runtime until
+    # somebody assigned them one - and the screen where seats are assigned
+    # IS the full runtime. On a new edge, reached over the LAN, nobody can
+    # ever be first: the same chicken-and-egg the licence gate had.
+    #
+    # This does not give away Studio. `full` is already restricted to admin
+    # or engineer by the role rule above; engineers still need a seat, which
+    # is where seat counts actually do their work. It means the person who
+    # administers the edge can always reach it to hand the seats out.
+    _admin_exempt = role in ADMIN_ROLES
+    if remote and lic_eff == "enforce" and not _admin_exempt:
         try:
             from app.services import license_inspect as _li
             from app.services import seats as _seats

@@ -232,11 +232,27 @@ check("the draft carries destination_rules", "destination_rules: []" in SRM,
       "a field missing from the draft is dropped on save")
 check("  there is an editor for them", "function DestinationRules(" in SRM)
 check("  the destination has its own block, not the cycle grid",
-      "Where the file is written" in SRM and 'className="sr-destination"' in SRM)
+      "Where the file is written" in SRM and 'className="sr-dest-grid"' in SRM)
 check("  shown for every trigger mode, not only cycle",
       SRM.index("Where the file is written") > SRM.index("Cycle options"),
       "a time-triggered schedule could not set a destination at all")
-check("  the run number is documented on screen", '{"{n}"}' in SRM)
+# 2026-10-30: the tokens used to be a sentence of <code> under the field.
+# They are buttons now, so the operator inserts one instead of transcribing
+# it - the complaint was a file literally named {R1_Work_Order_string}.
+check("  the run number is offered on screen", '"{n}"' in SRM)
+check("  every token is a button, not something to copy by hand",
+      '"{date}", "{time}", "{n}", "{template}", "{id}"' in SRM)
+check("  the folder and the file name are one aligned grid",
+      SRM.count('className="sr-dest-label"') >= 4,
+      "labels in their own column is what keeps the fields aligned")
+check("  the result is previewed before a run happens",
+      "destinationPreview" in SRM,
+      "a pattern that becomes a file instead of a folder must be visible "
+      "while typing, not after a scheduled run")
+# The column editor belongs to the Generated Reports list, not to the
+# destination - it was reported as "should not be here at all".
+check("  the column editor is not inside the destination block",
+      SRM.index("<ReportColumns") > SRM.index("Generated Reports list"))
 
 print()
 print("[the store persists them - both statements, or they vanish]")
@@ -362,6 +378,216 @@ SCHED2 = io.open(os.path.join(ROOT, "backend", "app", "services",
 check("  and the scheduler reads the global set",
       'settings.get("report_columns")' in SCHED2,
       "columns defined once must apply to every schedule")
+
+# ------------------------------------- the LAN status must not mislead
+print()
+print("[the LAN status reports what is actually reachable]")
+LANR = io.open(os.path.join(ROOT, "backend", "app", "routers",
+                            "lan_sharing.py"), encoding="utf-8").read()
+FW_SRC = io.open(os.path.join(ROOT, "backend", "app", "services",
+                             "windows_firewall.py"), encoding="utf-8").read()
+check("the legacy port field is not faked from the loopback port",
+      '"port": http_port,' in LANR and '"port": http_port or primary_port' not in LANR,
+      "it reported 8000 - a LOOPBACK-only listener - as the LAN port, so "
+      "the operator was handed an http:// address that refuses every call")
+check("  reachability is stated per protocol",
+      '"http_lan_exposed"' in LANR and '"https_lan_exposed"' in LANR)
+check("the firewall check matches the executable PATH",
+      "exe_path.replace" in FW_SRC and "in norm" in FW_SRC
+      and "_rule_exists_for_path(exe)" in LANR,
+      "matching the name 'trustnode' or the bare exe answered present=True "
+      "on a machine with NO TrustNode rule - it hit an unrelated python.exe "
+      "rule and a 2025 leftover service rule")
+
+# -------------------------------- the columns editor reads the right place
+print()
+print("[the column editor reads and writes the real settings document]")
+check("it reads app_settings from boot.data",
+      "boot?.data?.app_settings?.report_columns" in SRM,
+      "the bootstrap nests domains under `data`; reading boot.app_settings "
+      "returned undefined, which is why the feature did nothing")
+check("  and refuses to save when it cannot read them back",
+      "nothing else in app_settings can be lost" in SRM,
+      "saving {} merged would REPLACE app_settings with just the columns")
+check("  the panel has its own layout, not the form grid",
+      'className="rc-panel"' in SRM and ".rc-row" in io.open(
+          os.path.join(ROOT, "frontend", "src", "styles.css"),
+          encoding="utf-8").read(),
+      "it borrowed .sr-rule-dest, sized for a narrow form column")
+
+# ------------------------- LAN must work on BOTH installers, LAN and WiFi
+print()
+print("[remote access: firewall and certificate]")
+LANS = io.open(os.path.join(ROOT, "backend", "app", "services",
+                            "lan_socket.py"), encoding="utf-8").read()
+MAINPY = io.open(os.path.join(ROOT, "backend", "app", "main.py"),
+                 encoding="utf-8").read()
+TLS = io.open(os.path.join(ROOT, "backend", "app", "services",
+                           "lan_tls.py"), encoding="utf-8").read()
+FW = io.open(os.path.join(ROOT, "backend", "app", "services",
+                          "windows_firewall.py"), encoding="utf-8").read()
+
+check("the firewall result is no longer thrown away",
+      "_firewall_state = _fw.ensure_backend_rule()" in LANS
+      and "ensure_backend_rule()" in LANS and "except Exception:" in LANS
+      and LANS.count("_firewall_state") >= 2,
+      "it sat inside an `except Exception: pass`, so the portable build "
+      "failed with 'requires elevation' every time and nothing said so")
+check("  there is a way to add the rule with elevation",
+      "def add_rule_elevated" in FW and "-Verb RunAs" in FW,
+      "the installer runs elevated and gets a rule; the portable never can")
+check("  it is offered, not forced",
+      "Deliberately NOT called automatically" in FW,
+      "an unprompted UAC dialog is how an app gets uninstalled")
+check("  and exposed to the UI", "/firewall-rule" in LANR)
+
+check("the certificate is re-checked against today's addresses",
+      "ensure_certificate_covers_lan" in LANS and "def ensure_certificate_covers_lan" in TLS,
+      "SANs are written once at generation; a laptop that later joins WiFi "
+      "serves a certificate that does not name its new address, and every "
+      "browser on that network refuses outright")
+
+# ------------- the LAN is a VIEW of this edge, so its runtime must match
+print()
+print("[the LAN listeners run with the same runtime as the edge]")
+PLCM = io.open(os.path.join(ROOT, "backend", "app", "services",
+                            "plc_manager.py"), encoding="utf-8").read()
+check("each LAN loop raises its own thread limiter",
+      "current_default_thread_limiter" in LANS and "total_tokens = 64" in LANS,
+      "main.py raises it in startup_event, but the LAN servers run with "
+      "lifespan=off in their OWN loops and the limiter is a per-loop RunVar - "
+      "they served with 40 tokens, which is the 20s save timeout")
+check("a subscriber remembers which loop it belongs to",
+      "_tn_loop" in PLCM and "def subscribe" in PLCM,
+      "a WebSocket accepted by a LAN listener owns a Queue on THAT loop")
+check("  and both push paths deliver on that loop",
+      PLCM.count("_deliver") >= 3,
+      "asyncio.Queue is not thread-safe: put_nowait from the main loop wakes "
+      "a future owned by the LAN loop, so a LAN viewer could sit on a stale "
+      "chart while the desktop updated live")
+
+# ------------------- remote access must not switch itself on
+print()
+print("[remote access stays off until someone turns it on]")
+check("LAN sharing defaults OFF",
+      "LAN_SHARING_DEFAULT = False" in LANS and "def sharing_enabled" in LANS,
+      "2026-10-29, from a customer machine: lan_sharing_enabled is absent on "
+      "every install made before this was flipped on - not one of the 12 "
+      "settings documents in the live store carries it - so defaulting ON "
+      "started two listeners, a certificate and a firewall rule needing "
+      "elevation on sites that never asked for remote access")
+# Behaviour, not spelling: the constant could be renamed and these still hold.
+# One dict for globals AND locals: the function looks LAN_SHARING_DEFAULT
+# up in its module globals, and splitting them hid it.
+_ns = {"Optional": object, "Dict": dict, "Any": object}
+exec(compile(LANS[LANS.index("LAN_SHARING_DEFAULT"):
+                  LANS.index("def _https_possible")], "lan_socket", "exec"), _ns)
+_se = _ns["sharing_enabled"]
+check("  an absent setting means off", _se({}) is False and _se(None) is False,
+      "this is the key every pre-existing install has")
+check("  an operator who turns it ON gets it",
+      _se({"lan_sharing_enabled": True}) is True,
+      "the 10-27 request is unchanged for anyone who asks for remote access")
+check("  and a stored False is still a decision",
+      _se({"lan_sharing_enabled": False}) is False)
+check("  an operator who turns it off keeps it off",
+      'value = s.get("lan_sharing_enabled", None)' in LANS
+      and "if value is None:" in LANS,
+      "only the ABSENT key may change meaning; a stored False is a decision")
+for f, where in (("main.py", MAINPY), ("lan_sharing.py", LANR)):
+    check("  %s asks the shared reading" % f, "sharing_enabled(" in where,
+          "four call sites each doing their own bool() is how they drift")
+check("  nothing reads the raw key any more",
+      'bool(s.get("lan_sharing_enabled"))' not in MAINPY
+      and 'bool(s.get("lan_sharing_enabled"))' not in LANR)
+
+# ------------------- the administrator can always reach the edge remotely
+print()
+print("[an admin is not locked out by a seat]")
+#
+# 2026-10-27, from a customer edge over the LAN, signed in as the admin:
+#   {"detail":"Access to this surface is not allowed (seat:studio)"}
+# The seat check sits BEFORE the `role in ADMIN_ROLES` bypass, so on a
+# licence carrying explicit seats the owner-administrator was refused the
+# full runtime until somebody gave them a seat - and the screen that hands
+# out seats IS the full runtime. Nobody could ever be first.
+import subprocess as _sp
+_probe = (
+    "import sys; sys.path.insert(0,'.');"
+    "from app.services import access_policy as ap;"
+    "import app.services.license_inspect as li;"
+    "ap.has_module = lambda k: True;"
+    "li.seats_are_explicit = lambda: True;"
+    "print('|'.join('%s=%s' % (n, ap.surface_access('full', p, True)[0]) for n, p in ("
+    "  ('admin',    {'role':'admin','sub':'a','permissions':{}}),"
+    "  ('engineer', {'role':'engineer','sub':'e','permissions':{}}),"
+    "  ('eng_seat', {'role':'engineer','sub':'e2','permissions':{'seats':['studio'],'access_full':True}}),"
+    ")))"
+)
+_env = dict(os.environ, TRUSTNODE_SKIP_DOTENV="1",
+            TRUSTNODE_LICENSE_GATES="enforce")
+try:
+    _out = _sp.run([sys.executable, "-I", "-c", _probe],
+                   cwd=os.path.join(ROOT, "backend"), env=_env,
+                   capture_output=True, text=True, timeout=180).stdout or ""
+    _line = [l for l in _out.splitlines() if "admin=" in l]
+    _res = dict(kv.split("=") for kv in (_line[-1].split("|") if _line else []))
+except Exception as _exc:                                    # noqa: BLE001
+    _res = {}
+    print("   probe failed:", _exc)
+
+check("an admin with NO seat may open the full LAN app",
+      _res.get("admin") == "True",
+      "got %r - the screen that assigns seats is the one being refused"
+      % _res.get("admin"))
+check("  an engineer without a seat is still refused",
+      _res.get("engineer") == "False",
+      "got %r - seat counts must still mean something" % _res.get("engineer"))
+check("  and an engineer WITH a seat gets in",
+      _res.get("eng_seat") == "True", "got %r" % _res.get("eng_seat"))
+
+# ------------------- saving a column must visibly do something
+print()
+print("[the Generated Reports columns behave as the operator expects]")
+check("configured headings show before any new report exists",
+      "for (const c of globalColumns || [])" in SRM
+      and "globalColumns]" in SRM,
+      "reading headings only off the ROWS meant nothing changed until the "
+      "next report was generated, so saving looked like it had failed")
+check("  a bare tag name is accepted as a tag",
+      '"{" not in pattern' in SCHED2,
+      "the operator typed SimREAL[3] in a field labelled Value, beside a tag "
+      "name, and got that text back")
+check("  a pattern that already has tokens is left alone",
+      'pattern = "{%s}" % pattern.strip()' in SCHED2
+      and 'if "{" not in pattern:' in SCHED2,
+      "a mixed pattern like 'WO {Work_Order}' must keep working")
+
+# ------------------ a chart can start where a run started
+print()
+print("[dashboard chart window from a trigger]")
+ROUTER2 = io.open(os.path.join(ROOT, "backend", "app", "routers",
+                               "app_store.py"), encoding="utf-8").read()
+API = io.open(os.path.join(ROOT, "frontend", "src", "api.js"),
+              encoding="utf-8").read()
+check("the edge answers WHEN the condition became true",
+      "/historian/trigger-window" in ROUTER2 and "def _edge(" in ROUTER2,
+      "a rising edge, not 'is it true now' - a start bit held high must "
+      "keep the run it began, or every refresh moves the axis")
+check("  a stop condition only counts AFTER the start",
+      "from_utc=start_at" in ROUTER2,
+      "an older stop belongs to the previous run and must not truncate this one")
+check("  the UI can ask for it", "getHistorianTriggerWindow" in API)
+check("the widget offers the choice",
+      '"window_mode"' in APPJSX and "From a trigger" in APPJSX)
+check("  rolling count stays the default",
+      'current.window_mode || "count"' in APPJSX,
+      "an existing widget must be untouched")
+check("  charts are bounded by the resolved window",
+      "twFromMs" in APPJSX and "triggerWindows[w.id]" in APPJSX)
+check("  and fall back when nothing has fired yet",
+      "? (triggerWindows[w.id] || null) : null" in APPJSX,
+      "an operator must never be shown a blank chart")
 
 print()
 print("RESULT: {0}".format("PASS" if not FAILS else "FAIL - " + ", ".join(FAILS)))

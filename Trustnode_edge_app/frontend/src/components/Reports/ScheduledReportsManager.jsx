@@ -135,13 +135,43 @@ function makeId(prefix) {
 //
 // The pattern is the same token language as the file name and the folder -
 // one syntax for all three, including masks like {Result|1=PASS,0=FAIL}.
+// Pick a tag, get the token. 2026-10-30, requested: "where we have tags we
+// should have option to pick a tag to create the save path and conditions".
+//
+// The folder and the file name accept {TagName}, but that only helps someone
+// who already knows the tag's exact spelling - and an operator who typed it
+// slightly wrong got the literal text in the filename instead of the value.
+// Choosing from the list cannot be spelled wrong.
+function TagTokenPicker({ gatewayOptions, tagListForGateway, formatTagForDisplay,
+                          onInsert, title = "Insert a tag" }) {
+  const [gw, setGw] = useState("");
+  const tags = tagListForGateway ? (tagListForGateway(gw) || []) : [];
+  return (
+    <span className="sr-token-pick" title={title}>
+      <select aria-label="Gateway" value={gw} onChange={(e) => setGw(e.target.value)}>
+        <option value="">Any gateway</option>
+        {(gatewayOptions || []).map((g) => (
+          <option key={g.id} value={g.id}>{g.name || g.id}</option>
+        ))}
+      </select>
+      <select aria-label="Insert tag" value=""
+              onChange={(e) => { if (e.target.value) onInsert(`{${e.target.value}}`); }}>
+        <option value="">+ Tag…</option>
+        {tags.map((t) => (
+          <option key={t} value={t}>{formatTagForDisplay ? formatTagForDisplay(t) : t}</option>
+        ))}
+      </select>
+    </span>
+  );
+}
+
 function ReportColumns({ columns, onChange }) {
   const list = Array.isArray(columns) ? columns : [];
   const patch = (i, next) => onChange(list.map((c, x) => (x === i ? { ...c, ...next } : c)));
   return (
     <div className="sr-rules">
       <div className="sr-rules-head">
-        <span>Extra columns on the Generated Reports list</span>
+        <span>Extra columns</span>
         <button type="button" className="btn btn-secondary btn-sm"
                 onClick={() => onChange([...list, { label: "", pattern: "" }])}>
           + Add column
@@ -149,10 +179,7 @@ function ReportColumns({ columns, onChange }) {
       </div>
       {list.length === 0 ? (
         <p className="sr-token-hint">
-          None: the list shows when each report was generated, its template
-          and schedule. Add a column to show a value from the run itself -
-          a work order, a batch, a result - read from a tag at the moment
-          the report was produced.
+          None. Add one to show a tag value - a work order, a batch, a result.
         </p>
       ) : null}
       {list.map((col, i) => (
@@ -283,16 +310,28 @@ function DestinationRules({ rules, onChange, gatewayOptions,
           ))}
           <div className="sr-rule-dest">
             <label>
-              Save to
+              <span>Save to</span>
               <input value={rule.output_path || ""}
-                     placeholder="leave blank to keep the folder above"
+                     placeholder="blank = folder above"
                      onChange={(e) => patch(i, { output_path: e.target.value })} />
+              <TagTokenPicker
+                gatewayOptions={gatewayOptions}
+                tagListForGateway={tagListForGateway}
+                formatTagForDisplay={formatTagForDisplay}
+                onInsert={(tok) => patch(i, { output_path: `${rule.output_path || ""}${tok}` })}
+              />
             </label>
             <label>
-              File name
+              <span>File name</span>
               <input value={rule.file_name_pattern || ""}
-                     placeholder="leave blank to keep the name above"
+                     placeholder="blank = name above"
                      onChange={(e) => patch(i, { file_name_pattern: e.target.value })} />
+              <TagTokenPicker
+                gatewayOptions={gatewayOptions}
+                tagListForGateway={tagListForGateway}
+                formatTagForDisplay={formatTagForDisplay}
+                onInsert={(tok) => patch(i, { file_name_pattern: `${rule.file_name_pattern || ""}${tok}` })}
+              />
             </label>
           </div>
         </div>
@@ -497,6 +536,25 @@ export function ScheduledReportsManager({
   const [generated, setGenerated] = useState([]);
   const [draft, setDraft] = useState(emptySchedule());
 
+  // Which field the token chips write into: whichever the operator last
+  // put the cursor in. Defaults to the file name, which is the one almost
+  // every pattern needs.
+  const [tokenTarget, setTokenTarget] = useState("file_name_pattern");
+  const insertToken = (tok) => setDraft((p) => ({
+    ...p, [tokenTarget]: `${p[tokenTarget] || ""}${tok}` }));
+
+  // The shape of the result, with the tokens left visible - they are filled
+  // from tags at run time, so a real value here would be a guess. What it
+  // DOES show is the folder/file split, which is the part that surprised
+  // people (see scripts/test_report_paths.py).
+  const destinationPreview = useMemo(() => {
+    const folder = String(draft.output_path || "").trim().replace(/[\\/]+$/, "");
+    const name = String(draft.file_name_pattern || "").trim();
+    const base = folder || "the default Reports folder";
+    if (!name) return `${base}\\<template>_<date>.pdf`;
+    return `${base}\\${name}${/\.[a-z0-9]{2,5}$/i.test(name) ? "" : ".pdf"}`;
+  }, [draft.output_path, draft.file_name_pattern]);
+
   // Live check of the "Save to" folder. Debounced, because it runs while the
   // operator types; {tokens} are only resolved at run time, so the backend
   // checks the fixed part of the path ahead of the first "{".
@@ -563,28 +621,60 @@ export function ScheduledReportsManager({
   // stops being transient. Whatever loaded stays on screen throughout.
   const [loadState, setLoadState] = useState({ failures: 0, message: "" });
   const failuresRef = useRef(0);
+  // What we last put on the global banner, so we can retract exactly that.
+  const shoutedRef = useRef("");
   const retryRef = useRef(null);
 
   const refresh = async () => {
-    try {
-      const [tplRes, schRes, genRes, statusRes] = await Promise.all([
-        listReportTemplates(),
-        listScheduledReports(),
-        listGeneratedReports({ limit: 200 }),
-        getReportSchedulerStatus().catch(() => null),
-      ]);
-      setTemplates(Array.isArray(tplRes?.templates) ? tplRes.templates : []);
-      setSchedules(Array.isArray(schRes?.schedules) ? schRes.schedules : []);
-      setGenerated(Array.isArray(genRes?.generated) ? genRes.generated : []);
-      if (statusRes && typeof statusRes.any_gateway_running === "boolean") {
-        setAnyGatewayRunning(statusRes.any_gateway_running);
-      }
+    // 2026-10-30: these four were a Promise.all, so ONE failing request
+    // threw away three good answers - the templates and the generated list
+    // were already on screen and the banner still said "Reports could not
+    // be loaded". Reported with a screenshot showing exactly that: rows
+    // listed, error above them.
+    //
+    // Each part now stands or falls on its own. Whatever arrives is shown,
+    // and only the parts that actually failed are reported. A module this
+    // important must degrade one piece at a time, never all at once.
+    const [tplR, schR, genR, statusR] = await Promise.allSettled([
+      listReportTemplates(),
+      listScheduledReports(),
+      listGeneratedReports({ limit: 200 }),
+      getReportSchedulerStatus(),
+    ]);
+    const failed = [];
+    if (tplR.status === "fulfilled") {
+      setTemplates(Array.isArray(tplR.value?.templates) ? tplR.value.templates : []);
+    } else { failed.push(["templates", tplR.reason]); }
+    if (schR.status === "fulfilled") {
+      setSchedules(Array.isArray(schR.value?.schedules) ? schR.value.schedules : []);
+    } else { failed.push(["scheduled reports", schR.reason]); }
+    if (genR.status === "fulfilled") {
+      setGenerated(Array.isArray(genR.value?.generated) ? genR.value.generated : []);
+    } else { failed.push(["generated reports", genR.reason]); }
+    // The scheduler status is informational; it never counted as a failure
+    // and still does not.
+    if (statusR.status === "fulfilled"
+        && typeof statusR.value?.any_gateway_running === "boolean") {
+      setAnyGatewayRunning(statusR.value.any_gateway_running);
+    }
+
+    if (!failed.length) {
       failuresRef.current = 0;
+      // 2026-10-31: take the banner back when the retry works. This page
+      // already rides out a transient failure - it only shouts on the 4th -
+      // but once it had shouted the red bar stayed up for the session, so a
+      // boot-window hiccup that healed itself still looked like a fault.
+      if (shoutedRef.current) {
+        onNotify({ type: "clear", message: shoutedRef.current });
+        shoutedRef.current = "";
+      }
       setLoadState((prev) => (prev.failures || prev.message ? { failures: 0, message: "" } : prev));
-    } catch (e) {
+    } else {
+      const e = failed[0][1];
+      const what = failed.map(([name]) => name).join(", ");
       const n = failuresRef.current + 1;
       failuresRef.current = n;
-      setLoadState({ failures: n, message: String(e?.message || e) });
+      setLoadState({ failures: n, what, message: String(e?.message || e) });
       // 2s, 4s, 8s … capped at 30s. The 15s poll below keeps running, so this
       // only adds the fast early retries that ride out a brief hiccup.
       if (n <= 5) {
@@ -594,7 +684,9 @@ export function ScheduledReportsManager({
       }
       // Only shout once it is clearly not transient, and never more than once.
       if (n === 4) {
-        onNotify({ type: "error", message: `Reports could not be loaded: ${e?.message || e}` });
+        const msg = `${what} could not be loaded: ${e?.message || e}`;
+        shoutedRef.current = msg;
+        onNotify({ type: "error", message: msg });
       }
     }
   };
@@ -787,7 +879,10 @@ export function ScheduledReportsManager({
     (async () => {
       try {
         const boot = await getAppStoreBootstrap();
-        const cols = boot?.app_settings?.report_columns;
+        // The bootstrap nests every domain under `data` - reading
+        // boot.app_settings returned undefined, which is why this feature
+        // did nothing at all.
+        const cols = boot?.data?.app_settings?.report_columns;
         if (!dead && Array.isArray(cols)) setGlobalColumns(cols);
       } catch (_) { /* the list still works without them */ }
     })();
@@ -801,7 +896,16 @@ export function ScheduledReportsManager({
       // partial document here would blank whatever else is in it, which is
       // a mistake this codebase has made before and paid for.
       const boot = await getAppStoreBootstrap();
-      const current = (boot && boot.app_settings) || {};
+      const current = boot?.data?.app_settings;
+      // Refuse rather than write a one-key document over the real one.
+      // `{}` here would have REPLACED app_settings with just the columns -
+      // the blank-write mistake this codebase has paid for repeatedly, and
+      // the read above was returning undefined, so that is exactly what
+      // this would have done.
+      if (!current || typeof current !== "object" || Array.isArray(current)) {
+        throw new Error("settings could not be read back - not saving, so "
+          + "nothing else in app_settings can be lost");
+      }
       await saveAppStoreDomain("app_settings",
         { ...current, report_columns: next }, "reports-columns");
       setGlobalColumns(next);
@@ -819,6 +923,15 @@ export function ScheduledReportsManager({
   // a report produced before any were configured simply has none.
   const extraColumns = useMemo(() => {
     const seen = [];
+    // 2026-10-28, reported: columns were saved and the table did not change.
+    // Reading the headings only off the ROWS meant nothing appeared until
+    // the next report was generated - so saving looked like it had failed.
+    // The configured headings show straight away; a report produced before
+    // they existed simply has no value for them and shows a dash.
+    for (const c of globalColumns || []) {
+      const label = String(c?.label || "").trim();
+      if (label && !seen.includes(label)) seen.push(label);
+    }
     for (const g of filteredGenerated || []) {
       const cols = g?.meta?.columns;
       if (!cols || typeof cols !== "object") continue;
@@ -827,14 +940,15 @@ export function ScheduledReportsManager({
       }
     }
     return seen;
-  }, [filteredGenerated]);
+  }, [filteredGenerated, globalColumns]);
 
   return (
     <div className="scheduled-reports-page">
       {loadState.failures > 0 ? (
         <div className={`status ${loadState.failures >= 4 ? "error" : "warn"}`} style={{ marginBottom: 8 }}>
           {loadState.failures >= 4
-            ? `Reports are not loading (${loadState.message}). Retrying every 15 seconds.`
+            ? `${loadState.what || "Reports"} not loading (${loadState.message}). `
+              + `Everything else on this page is current. Retrying every 15 seconds.`
             : "Reconnecting to the reports service…"}
         </div>
       ) : null}
@@ -853,7 +967,12 @@ export function ScheduledReportsManager({
             <aside className="scheduled-reports-list">
               <div className="scheduled-reports-list-head">
                 <strong>Saved schedules</strong>
-                <button type="button" className="btn btn-link" onClick={handleNewSchedule}>
+                {/* 2026-10-30, reported: "the new button is overlapped". It was
+                    `btn btn-link`, and which of the four .btn/.btn-link rules
+                    won depended on where the page class landed - it came out
+                    as a full-size filled pill that pushed past the card edge.
+                    Its own rule, so no cascade can resize it. */}
+                <button type="button" className="schedule-new-btn" onClick={handleNewSchedule}>
                   <IconPlus /> New
                 </button>
               </div>
@@ -1131,76 +1250,122 @@ export function ScheduledReportsManager({
                   Their own block now, full width, for every schedule. */}
               <fieldset className="schedule-fieldset">
                 <legend>Where the file is written</legend>
-                <div className="sr-destination">
-                      {/* 2026-10-07: "the location ... should be a option to
-                          pick the folder and validated". Free text meant a
-                          typo or an un-synced OneDrive folder only showed up
-                          when a scheduled run failed hours later. */}
-                      <label className="sr-path-field">
-                        Save to
-                        <div className="sr-path-row">
-                          <input
-                            value={draft.output_path || ""}
-                            placeholder="C:/Reports/{Work_Order}/{template}.pdf"
-                            onChange={(e) => setDraft((p) => ({ ...p, output_path: e.target.value }))}
-                          />
+                {/* 2026-10-30, requested: "better controls to customise how
+                    the file and path should be generated and saved, nicely,
+                    using tag picker, user friendly with everything aligned".
+
+                    One label column, one control column, so Folder, File name,
+                    Insert and Preview all line up. The token chips insert into
+                    whichever field was last focused, which is what made the
+                    old layout confusing: there were two separate tag pickers
+                    and a paragraph of token names you had to type by hand.
+
+                    Preview is the real win - it shows the shape of the result,
+                    so a pattern that silently becomes a file instead of a
+                    folder is visible while typing, not after a scheduled run. */}
+                <div className="sr-dest-grid">
+                  <span className="sr-dest-label">Folder</span>
+                  <div className="sr-dest-control">
+                    <input
+                      value={draft.output_path || ""}
+                      placeholder="C:/Reports/{Work_Order}"
+                      onFocus={() => setTokenTarget("output_path")}
+                      onChange={(e) => setDraft((p) => ({ ...p, output_path: e.target.value }))}
+                    />
+                    <button type="button" className="btn btn-secondary btn-sm"
+                            disabled={!folderPickerAvailable}
+                            title={folderPickerAvailable
+                              ? "Pick a folder"
+                              : "Folder picker is only available in the desktop app"}
+                            onClick={pickOutputFolder}>
+                      Browse…
+                    </button>
+                  </div>
+
+                  {pathCheck.message ? (
+                    <>
+                      <span className="sr-dest-label" />
+                      {/* 2026-10-31, reported: "the folders that are not
+                          created should be created by the software and it is
+                          not, it only says that the folder does not exist".
+                          It IS created - the writer does mkdir(parents=True)
+                          before every report, and a folder named from a tag
+                          can ONLY be created then, because the value is not
+                          known until the run. The warning described the
+                          present and the operator read it as a refusal. A
+                          missing folder is now a note about what will happen;
+                          anything else still shows as a fault. */}
+                      <span className={pathCheck.ok
+                        ? "sr-path-ok"
+                        : (pathCheck.state === "missing" ? "sr-path-note" : "sr-path-bad")}>
+                        {pathCheck.ok ? "✓" : (pathCheck.state === "missing" ? "•" : "⚠")}{" "}
+                        {pathCheck.state === "missing"
+                          ? "This folder does not exist yet - it is created when the report runs."
+                          : pathCheck.message}
+                        {!pathCheck.ok && pathCheck.state === "missing" ? (
                           <button type="button" className="btn btn-secondary btn-sm"
-                                  disabled={!folderPickerAvailable}
-                                  title={folderPickerAvailable
-                                    ? "Pick a folder"
-                                    : "Folder picker is only available in the desktop app"}
-                                  onClick={pickOutputFolder}>
-                            Browse…
+                                  style={{ marginLeft: 8 }}
+                                  onClick={createOutputFolder}>
+                            Create it now
                           </button>
-                        </div>
-                        {pathCheck.message ? (
-                          <span className={pathCheck.ok ? "sr-path-ok" : "sr-path-bad"}>
-                            {pathCheck.ok ? "✓" : "⚠"} {pathCheck.message}
-                            {!pathCheck.ok && pathCheck.state === "missing" ? (
-                              <button type="button" className="btn btn-secondary btn-sm"
-                                      style={{ marginLeft: 8 }}
-                                      onClick={createOutputFolder}>
-                                Create it
-                              </button>
-                            ) : null}
-                          </span>
                         ) : null}
-                      </label>
-                      <label>
-                        File name
-                        <input
-                          value={draft.file_name_pattern || ""}
-                          placeholder="{Work_Order}_{date}"
-                          onChange={(e) => setDraft((p) => ({ ...p, file_name_pattern: e.target.value }))}
-                        />
-                        {/* The tokens, written out. The operator typed
-                            {R1_Work_Order_string} and got a file called
-                            exactly that, because only {tag:Name} resolved -
-                            a bare name now works too, but nothing on screen
-                            said so. */}
-                        <span className="sr-token-hint">
-                          Use <code>{"{TagName}"}</code> for a tag value, plus{" "}
-                          <code>{"{template}"}</code> <code>{"{id}"}</code>{" "}
-                          <code>{"{date}"}</code> <code>{"{time}"}</code>{" "}
-                          <code>{"{n}"}</code>.{" "}
-                          <code>{"{n}"}</code> is the run number, used when a
-                          report would otherwise overwrite one already there.
-                          A tag can print as a word with{" "}
-                          <code>{"{TagName|1=first,2=second}"}</code>, and both
-                          work in the folder as well as the name.
-                        </span>
-                      </label>
+                      </span>
+                    </>
+                  ) : null}
+
+                  <span className="sr-dest-label">File name</span>
+                  <div className="sr-dest-control">
+                    <input
+                      value={draft.file_name_pattern || ""}
+                      placeholder="{Work_Order}_{date}"
+                      onFocus={() => setTokenTarget("file_name_pattern")}
+                      onChange={(e) => setDraft((p) => ({ ...p, file_name_pattern: e.target.value }))}
+                    />
+                  </div>
+
+                  <span className="sr-dest-label">Insert</span>
+                  <div className="sr-dest-control sr-chips">
+                    {["{date}", "{time}", "{n}", "{template}", "{id}"].map((tok) => (
+                      <button type="button" key={tok} className="sr-chip"
+                              title={`Add ${tok} to the ${tokenTarget === "output_path" ? "folder" : "file name"}`}
+                              onClick={() => insertToken(tok)}>
+                        {tok}
+                      </button>
+                    ))}
+                    <TagTokenPicker
+                      gatewayOptions={gatewayOptions}
+                      tagListForGateway={tagListForGateway}
+                      formatTagForDisplay={formatTagForDisplay}
+                      title="Insert a tag value"
+                      onInsert={insertToken}
+                    />
+                    <span className="sr-chip-where">
+                      → {tokenTarget === "output_path" ? "folder" : "file name"}
+                    </span>
+                  </div>
+
+                  <span className="sr-dest-label">Preview</span>
+                  <code className="sr-dest-preview">{destinationPreview}</code>
                 </div>
-                <ReportColumns
-                  columns={draft.report_columns || []}
-                  onChange={(next) => setDraft((p) => ({ ...p, report_columns: next }))}
-                />
                 <DestinationRules
                   rules={draft.destination_rules || []}
                   gatewayOptions={gatewayOptions}
                   tagListForGateway={tagListForGateway}
                   formatTagForDisplay={formatTagForDisplay}
                   onChange={(next) => setDraft((p) => ({ ...p, destination_rules: next }))}
+                />
+              </fieldset>
+
+              {/* 2026-10-30, reported: "the information about new columns
+                  should not be here at all". It sat inside "Where the file is
+                  written", which is about the path and the name - these are
+                  columns on a different screen entirely. Own section, and the
+                  paragraph of prose is gone. */}
+              <fieldset className="schedule-fieldset">
+                <legend>Generated Reports list</legend>
+                <ReportColumns
+                  columns={draft.report_columns || []}
+                  onChange={(next) => setDraft((p) => ({ ...p, report_columns: next }))}
                 />
               </fieldset>
 
@@ -1344,8 +1509,8 @@ export function ScheduledReportsManager({
         </header>
         <div className="tn-card-body">
           {columnsOpen ? (
-              <div className="sr-rules" style={{ marginBottom: 10 }}>
-                <div className="sr-rules-head">
+              <div className="rc-panel">
+                <div className="rc-head">
                   <span>Columns on this list - defined once, applied to every report generated from now on</span>
                   <button type="button" className="btn btn-secondary btn-sm"
                           disabled={columnsBusy}
@@ -1353,7 +1518,7 @@ export function ScheduledReportsManager({
                     + Add column
                   </button>
                 </div>
-                <p className="sr-token-hint">
+                <p className="rc-hint">
                   The value is read from the run itself when the report is
                   produced, so a report keeps what it was generated with.
                   Use <code>{"{TagName}"}</code>, and{" "}
@@ -1361,7 +1526,7 @@ export function ScheduledReportsManager({
                   instead of a number. Existing reports are not changed.
                 </p>
                 {(globalColumns || []).map((col, i) => (
-                  <div className="sr-rule-dest" key={i}>
+                  <div className="rc-row" key={i}>
                     <label>
                       Column heading
                       <input value={col.label || ""} placeholder="e.g. Work order"
@@ -1369,7 +1534,7 @@ export function ScheduledReportsManager({
                     </label>
                     <label>
                       Value
-                      <div className="sr-path-row">
+                      <div className="rc-value">
                         <input value={col.pattern || ""} placeholder="{TagName}"
                                onChange={(e) => setGlobalColumns(globalColumns.map((c, x) => x === i ? { ...c, pattern: e.target.value } : c))} />
                         <button type="button" className="btn btn-secondary btn-sm"
@@ -1380,7 +1545,7 @@ export function ScheduledReportsManager({
                     </label>
                   </div>
                 ))}
-                <div className="row" style={{ gap: 8 }}>
+                <div className="rc-actions">
                   <button type="button" className="btn btn-primary btn-sm"
                           disabled={columnsBusy}
                           onClick={() => saveGlobalColumns(globalColumns)}>
@@ -1396,6 +1561,11 @@ export function ScheduledReportsManager({
               <table className="generated-reports-table">
                 <thead>
                   <tr>
+                    {/* 2026-10-27, requested: the file name first - it is
+                        what the operator recognises, and with the naming
+                        patterns it now carries the work order, the stage and
+                        the run number. A timestamp identifies nothing. */}
+                    <th>Report</th>
                     <th>Generated</th>
                     {extraColumns.map((c) => <th key={c}>{c}</th>)}
                     <th>Template</th>
@@ -1409,6 +1579,9 @@ export function ScheduledReportsManager({
                 <tbody>
                   {filteredGenerated.map((g) => (
                     <tr key={g.id}>
+                      <td className="gr-name" title={g.file_name || ""}>
+                        {g.file_name || g.file_path?.split(/[\/]/).pop() || "-"}
+                      </td>
                       <td>{g.created_utc || "-"}</td>
                       {extraColumns.map((c) => (
                         <td key={c}>{(g?.meta?.columns || {})[c] || "-"}</td>

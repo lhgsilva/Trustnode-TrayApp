@@ -64,10 +64,29 @@ def _rule_exists_for_path(exe_path: str) -> bool:
     netsh prints "No rules match the specified criteria." when missing.
     A matching rule's output contains "Program:" followed by the path
     (case-insensitive on Windows).
+
+    2026-10-30, MEASURED on a machine whose rule was correct and present:
+
+        plain    rc=0 bytes= 610  has 'Program:'=False  path found=False
+        verbose  rc=0 bytes= 950  has 'Program:'=True   path found=True
+
+    `show rule name=X` does NOT print the Program line. Without `verbose`
+    this scanned output that could never contain the path, so it returned
+    False for a rule that existed and matched. Two consequences, both seen:
+
+      * the Remote Access page permanently warned "no inbound rule allows
+        this program - other computers cannot reach it" while the LAN was
+        in fact reachable, which is the kind of false alarm that sends
+        somebody hunting a fault that is the measurement itself;
+      * ensure_backend_rule() short-circuits on this check, so it ran
+        `netsh advfirewall firewall add rule` on EVERY start. Unelevated
+        that fails; elevated it appends a duplicate every time. That is
+        where a machine ends up with hundreds of identical rules.
     """
     try:
         proc = subprocess.run(
-            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={_RULE_NAME}"],
+            ["netsh", "advfirewall", "firewall", "show", "rule",
+             f"name={_RULE_NAME}", "verbose"],
             capture_output=True,
             text=True,
             timeout=4,
@@ -153,4 +172,67 @@ def ensure_backend_rule(force: bool = False) -> dict:
         # operator-as-admin tray relaunch) should still get a chance.
         return result
     _cached_result = result
+    return result
+
+def add_rule_elevated() -> dict:
+    """Add the inbound rule, asking Windows for elevation (one UAC prompt).
+
+    2026-10-27, requested: remote access must work on BOTH installers. The
+    NSIS installer runs elevated and gets its rule; the PORTABLE build runs
+    as the operator and `_add_rule` fails every single time with
+
+        "The requested operation requires elevation (Run as administrator)."
+
+    so LAN sharing listens on 0.0.0.0 and Windows silently drops every
+    packet from every other computer. This is the same netsh command the
+    installer runs, launched through ShellExecute's `runas` verb so the
+    operator confirms it once and it persists.
+
+    Deliberately NOT called automatically: a prompt nobody asked for, on a
+    machine the operator may not administer, is how an app gets uninstalled.
+    The Remote Access page offers it when the status says the rule is
+    missing.
+    """
+    result = {"ok": False, "added": False, "reason": "", "exe_path": ""}
+    if not _is_windows():
+        result.update(ok=True, reason="not windows")
+        return result
+    exe = _current_exe_path()
+    result["exe_path"] = exe
+    if not exe or not os.path.isfile(exe):
+        result["reason"] = "exe path not resolvable"
+        return result
+    if _rule_exists_for_path(exe):
+        result.update(ok=True, reason="rule already present")
+        return result
+    args = (
+        'advfirewall firewall add rule name="%s" dir=in action=allow '
+        'program="%s" enable=yes profile=private,domain '
+        'description="Allow TrustNode Edge on the local network."'
+        % (_RULE_NAME, exe)
+    )
+    ps = (
+        "$p = Start-Process -FilePath netsh -ArgumentList '%s' "
+        "-Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode"
+        % args.replace("'", "''")
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=120, errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as exc:                         # noqa: BLE001
+        result["reason"] = "%s: %s" % (type(exc).__name__, exc)
+        return result
+    if _rule_exists_for_path(exe):
+        global _cached_result
+        _cached_result = None                        # re-probe next time
+        result.update(ok=True, added=True, reason="rule created")
+        return result
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    low = out.lower()
+    if "canceled" in low or "cancelled" in low or r.returncode == 1223:
+        result["reason"] = "the administrator prompt was declined"
+    else:
+        result["reason"] = out[:200] or "netsh did not create the rule"
     return result

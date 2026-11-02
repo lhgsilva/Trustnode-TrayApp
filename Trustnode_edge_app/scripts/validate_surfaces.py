@@ -223,9 +223,29 @@ def run(remote: bool = True) -> tuple[bool, list[str], dict]:
         st, b, _ = _call("PUT", f"{LAN}/api/lan-sharing/config", token=admin_r, body={})
         chk("LAN admin configuration allowed", st == 200, f"status={st} {b if st != 200 else ''}")
 
+    # 2026-10-31: this created the viewer with access_client and nothing else,
+    # then expected the Local View bundle to load. On a licence carrying
+    # EXPLICIT seats it does not, and should not. Measured on this edge the
+    # licence holds {'edge_runtime': 1, 'studio': 1, 'view_lan': 1,
+    # 'cloud_view': 1} and the server refused with
+    #
+    #     {"detail":"Access to this surface is not allowed (seat:view_lan)"}
+    #
+    # which is the seat model working. The check was asserting the pre-seat
+    # behaviour, so it reported a LAN fault that did not exist - and a run
+    # that cries wolf is how a real regression gets ignored. Assigning the
+    # seat is what an administrator actually does, so that is what this
+    # exercises now.
+    # 2026-10-31: a previous run leaves these accounts behind - revoking a
+    # SESSION does not delete the USER - so the create came back 409 and
+    # every check after it failed on a stale password. A validation that
+    # cannot be run twice in a row is a validation nobody runs.
+    for _leftover in (VIEWER[0], VIEWER[0] + "x"):
+        _call("DELETE", f"{API}/api/control-plane/users/{_leftover}", token=admin)
     st, b, _ = _call("POST", f"{API}/api/control-plane/users", token=admin,
                      body={"username": VIEWER[0], "password": VIEWER[1], "role": "viewer", "status": "active",
-                           "permissions": {"access_client": True}, "modules": []})
+                           "permissions": {"access_client": True, "view_ui": "app_readonly"},
+                           "seats": ["view_lan"], "view_ui": "app_readonly", "modules": []})
     chk("temp viewer created", st in (200, 201), f"status={st}")
     time.sleep(0.8)
     st, vtok, body, _ = _login(LAN, *VIEWER)
@@ -244,9 +264,30 @@ def run(remote: bool = True) -> tuple[bool, list[str], dict]:
         st, _, _ = _call("GET", f"{LAN}/trustnode/full/app/", raw=True, token=vtok, follow=False)
         chk("viewer full bundle refused (403)", st == 403, f"status={st}")
         st, _, _ = _call("GET", f"{LAN}/trustnode/client/app/", raw=True, token=vtok, follow=False)
-        chk("viewer Local View bundle (access_client)", st == 200, f"status={st}")
+        chk("viewer Local View bundle (access_client + seat)", st == 200, f"status={st}")
+        # The seat must actually be doing something: a viewer WITHOUT one is
+        # refused, by name. A seat model that lets everybody through is the
+        # same as no seat model, and this is the line that would catch it.
+        st2, _b2, _ = _call("POST", f"{API}/api/control-plane/users", token=admin,
+                            body={"username": VIEWER[0] + "x", "password": VIEWER[1],
+                                  "role": "viewer", "status": "active",
+                                  "permissions": {"access_client": True}, "modules": []})
+        if st2 in (200, 201):
+            time.sleep(0.6)
+            _s, nst, _b, _ = _login(LAN, VIEWER[0] + "x", VIEWER[1])
+            if nst:
+                st4, nb, _ = _call("GET", f"{LAN}/trustnode/client/app/", raw=True,
+                                   token=nst, follow=False)
+                blob = nb if isinstance(nb, bytes) else str(nb).encode()
+                chk("  a viewer with no seat is refused, and says why",
+                    st4 == 403 and b"seat:" in blob, f"status={st4} {str(nb)[:80]}")
+            _call("POST", f"{API}/api/lan-sharing/sessions/revoke", token=admin,
+                  body={"username": VIEWER[0] + "x"})
         st, b, _ = _call("POST", f"{API}/api/lan-sharing/sessions/revoke", token=admin, body={"username": VIEWER[0]})
         chk("revoke viewer", st == 200, f"status={st}")
+        # Delete the accounts too, not just their sessions.
+        for _tmp in (VIEWER[0], VIEWER[0] + "x"):
+            _call("DELETE", f"{API}/api/control-plane/users/{_tmp}", token=admin)
         st, b, _ = _call("GET", f"{LAN}/api/plc/gateways/status", token=vtok)
         chk("revoked token refused (401)", st == 401, f"status={st}")
     # Account lockout vs the per-IP login limiter (10/min). Both are deliberate,

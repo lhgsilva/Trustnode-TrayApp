@@ -3830,6 +3830,13 @@ export function ReportTemplateDesigner({
       const list = Array.isArray(res?.templates) ? res.templates : [];
       setTemplates(list);
       setLoadError("");
+      // Take the banner back. The retry loop below already recovers from a
+      // first read that lands while the backend is still starting; without
+      // this the operator kept seeing the failure long after it was over.
+      if (notifiedErrRef.current) {
+        onNotify({ type: "clear",
+                   message: `Failed to load templates: ${notifiedErrRef.current}` });
+      }
       notifiedErrRef.current = "";
       return list;
     } catch (e) {

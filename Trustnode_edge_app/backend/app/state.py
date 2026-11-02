@@ -297,6 +297,7 @@ def _render_fn(template: dict[str, Any], *, window=None, segments=None,
     exactly as it always has.
     """
     output_path = None
+    _fallback_reason = ""
     if file_name:
         import os as _os
         from pathlib import Path as _Path
@@ -308,7 +309,16 @@ def _render_fn(template: dict[str, Any], *, window=None, segments=None,
             try:
                 candidate.parent.mkdir(parents=True, exist_ok=True)
                 output_path = candidate
-            except OSError:
+            except OSError as _mkdir_exc:
+                # 2026-10-31, reported from a customer machine: "the pdf are
+                # not being created using the custom folder and file path ...
+                # it is creating it all the time using [the default]". This
+                # fallback is right - a report somewhere beats no report - but
+                # it happened in COMPLETE SILENCE, so the operator saw their
+                # chosen folder ignored and had nothing to go on. Measured:
+                #   C:/R?bad|name/... -> WinError 123, then written to
+                #   ~/.trustnode_edge/data/reports/ with nothing logged.
+                _fallback_reason = "%s: %s" % (type(_mkdir_exc).__name__, _mkdir_exc)
                 output_path = None
         if output_path is None:
             base = _os.environ.get("TRUSTNODE_DATA_DIR", "").strip() or _os.path.join(
@@ -316,6 +326,23 @@ def _render_fn(template: dict[str, Any], *, window=None, segments=None,
             reports_dir = _Path(base) / "reports"
             reports_dir.mkdir(parents=True, exist_ok=True)
             output_path = reports_dir / candidate.name
+            try:
+                print("[trustnode][reports] could not use the configured "
+                      "destination %r (%s) - wrote to %r instead"
+                      % (str(candidate), _fallback_reason or
+                         "the name carries no folder", str(output_path)),
+                      flush=True)
+                from app.services.app_store import AppStore as _AS  # noqa: F401
+                app_store.append_log_rows([{
+                    "level": "error", "category": "reports",
+                    "message": ("Report destination %s could not be used (%s). "
+                                "Written to %s instead."
+                                % (str(candidate),
+                                   _fallback_reason or "no folder in the pattern",
+                                   str(output_path))),
+                }])
+            except Exception:
+                pass
     return render_template_to_pdf(template, output_path=output_path, window=window,
                                   segments=segments)
 

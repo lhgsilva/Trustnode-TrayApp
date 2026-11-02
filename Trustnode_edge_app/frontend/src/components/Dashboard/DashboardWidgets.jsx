@@ -785,6 +785,107 @@ function renderPieSliceLabelFactory({ showCount, showPercent }) {
 // Used for the LIVE case — no time range, no grouping. The complex
 // fetcher path stays for historical + grouping.
 // =====================================================================
+// "End tag" can name a real tag, be empty (the run lasts until the next
+// start), or be this sentinel - end the run when the START condition stops
+// being true.
+export const SAME_TAG_STOP = "__start_condition_ends__";
+
+// Does one reading satisfy "<tag> <op> <value>"? Numbers compare as
+// numbers; anything else compares as trimmed, case-insensitive text, so a
+// state tag reading "RUNNING" works without the operator inventing a code.
+// Which timestamps the chart draws. Two mutually exclusive rules, pulled out
+// of the render memo so a test can prove the window is APPLIED and not merely
+// computed - grepping the source could not tell those apart, which is the
+// same blind spot that let the control ship into the wrong editor.
+//
+//   * a trigger window is open -> the window decides, full stop;
+//   * otherwise -> the rolling last-N behaviour, unchanged since 2026-06-12.
+export function boundRowsToWindow(sorted, trigWin, { capacity, windowMs, nowMs }) {
+  if (trigWin && trigWin.start > 0) {
+    // A run is in force: the window decides, not the clock and not
+    // readings_count. The end stays open while the test is running.
+    const endMs = trigWin.end > 0 ? trigWin.end : Infinity;
+    const kept = sorted.filter((ts) => ts >= trigWin.start && ts <= endMs);
+    return kept.length > 20000 ? kept.slice(-20000) : kept;
+  }
+  let out = sorted;
+  if (out.length > 0) {
+    const latestSampleMs = out[out.length - 1];
+    const freshnessHorizon = windowMs * 2;
+    const isFresh = (nowMs - latestSampleMs) <= freshnessHorizon;
+    if (isFresh) {
+      const windowStartMs = nowMs - windowMs;
+      out = out.filter((ts) => ts >= windowStartMs);
+    }
+  }
+  return out.length > capacity ? out.slice(-capacity) : out;
+}
+
+export function triggerMatches(row, op, want) {
+  const num = Number(row?.value);
+  const wantNum = Number(want);
+  if (Number.isFinite(num) && Number.isFinite(wantNum) && String(want).trim() !== "") {
+    switch (op) {
+      case "!=": return num !== wantNum;
+      case ">": return num > wantNum;
+      case ">=": return num >= wantNum;
+      case "<": return num < wantNum;
+      case "<=": return num <= wantNum;
+      default: return num === wantNum;
+    }
+  }
+  const got = String(row?.value_text ?? row?.value ?? "").trim().toLowerCase();
+  const exp = String(want ?? "").trim().toLowerCase();
+  return op === "!=" ? got !== exp : got === exp;
+}
+
+// Walk readings oldest-first and move the window. A RISING edge on the
+// start condition opens a new window - that is the "restart" the operator
+// asked for; the stop condition closes it. With no stop tag a run lasts
+// until the start condition goes away, or until the next start.
+export function applyTriggerRows(rows, cfg, ref, setWin) {
+  const st = ref.current || { start: 0, end: 0, on: false, seen: -Infinity };
+  const mine = [];
+  for (const r of rows) {
+    const tag = String(r?.tag || r?.tag_name || "");
+    if (tag !== cfg.tag
+        && !(cfg.stopTag && cfg.stopTag !== SAME_TAG_STOP && tag === cfg.stopTag)) continue;
+    const gid = String(r?.gateway_id || "");
+    if (cfg.gatewayId && gid && gid !== cfg.gatewayId) continue;
+    const ts = toTsMs(r?.ts || r?.ts_utc);
+    if (!Number.isFinite(ts) || ts <= st.seen) continue;
+    mine.push({ ts, tag, row: r });
+  }
+  if (!mine.length) return;
+  mine.sort((a, b) => a.ts - b.ts);
+  let { start, end, on } = st;
+  let seen = st.seen;
+  for (const m of mine) {
+    if (m.tag === cfg.tag) {
+      const now = triggerMatches(m.row, cfg.op, cfg.value);
+      if (now && !on) { start = m.ts; end = 0; }   // rising edge: restart
+      // 2026-10-30: the dropdown said "Runs until the next start" and the
+      // code closed the window the moment the start condition went away -
+      // two different promises, and the label was the one the operator
+      // read. On a value that crosses its threshold on every cycle that
+      // meant the chart froze halfway through each run. The label wins;
+      // ending on the falling edge is now something you ask for.
+      if (cfg.stopTag === SAME_TAG_STOP && on && !now && start > 0 && end === 0) {
+        end = m.ts;
+      }
+      on = now;
+    }
+    if (cfg.stopTag && cfg.stopTag !== SAME_TAG_STOP && m.tag === cfg.stopTag
+        && start > 0 && end === 0
+        && triggerMatches(m.row, cfg.stopOp, cfg.stopValue)) {
+      end = m.ts;
+    }
+    seen = m.ts;
+  }
+  ref.current = { start, end, on, seen };
+  if (start !== st.start || end !== st.end) setWin({ start, end });
+}
+
 function LiveTagChart({
   widget,
   dataLogView,
@@ -797,6 +898,35 @@ function LiveTagChart({
   const cfg = widget?.config || {};
   const widgetType = String(widget?.type || "line_chart");
   const capacity = Math.max(5, Math.min(5000, Number(cfg?.readings_count || 60)));
+
+  // Trigger window. Operator 2026-10-30: "a chart that restarts the X
+  // timestamp when a test starts and ends, so the chart only shows data
+  // in that window". Configured in DashboardDesigner > Time window.
+  // When no start has been seen yet the chart behaves exactly as before
+  // (rolling last-N), so an unconfigured or not-yet-fired widget is
+  // never left blank.
+  const trigCfg = useMemo(() => {
+    if (String(cfg?.window_mode || "count") !== "trigger") return null;
+    const tag = String(cfg?.window_tag_name || "").trim();
+    if (!tag) return null;
+    return {
+      gatewayId: String(cfg?.window_gateway_id || ""),
+      tag,
+      op: String(cfg?.window_operator || "=="),
+      value: cfg?.window_value ?? "1",
+      stopTag: String(cfg?.window_stop_tag || "").trim(),
+      stopOp: String(cfg?.window_stop_operator || "=="),
+      stopValue: cfg?.window_stop_value ?? "1",
+    };
+  }, [cfg?.window_mode, cfg?.window_tag_name, cfg?.window_gateway_id,
+      cfg?.window_operator, cfg?.window_value, cfg?.window_stop_tag,
+      cfg?.window_stop_operator, cfg?.window_stop_value]);
+
+  const [trigWin, setTrigWin] = useState({ start: 0, end: 0 });
+  const trigWinRef = useRef({ start: 0, end: 0, on: false, seen: -Infinity });
+  // A run can be far longer than `readings_count`, so the ring buffer must
+  // not be sized by it while a window is in force.
+  const bufferCap = trigCfg ? 20000 : capacity * 2;
   // pollMs is now ONLY used as a sanity floor on the per-series gap
   // threshold (when we have fewer than 4 samples to measure cadence).
   // The real gap threshold is derived per series from the median of
@@ -993,6 +1123,11 @@ function LiveTagChart({
     // bucketAndAggregateRows can yield `capacity` filled buckets.
     // Hard ceiling of 5000 to keep the SQLite read snappy.
     const seedLimit = (() => {
+      // A trigger run is as long as the test, not as long as "Reading
+      // points". Seeding only `capacity` rows meant a run already under way
+      // started mid-way up the ramp, because the rows before that were
+      // never fetched.
+      if (trigCfg) return 5000;
       if (!groupBucketMs) return capacity;
       const rowsPerBucket = Math.max(1, Math.ceil(groupBucketMs / pollMs));
       return Math.min(5000, capacity * rowsPerBucket);
@@ -1044,7 +1179,7 @@ function LiveTagChart({
   // The fetcher is read from a ref so its unstable identity doesn't
   // restart the seed on every parent render.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [seriesKey, capacity, groupBucketMs, pollMs]);
+  }, [seriesKey, capacity, groupBucketMs, pollMs, trigCfg]);
 
   // Ingest WS samples: append rows from dataLogView whose ts is strictly
   // newer than the last seen ts for that series. Runs on every parent
@@ -1100,16 +1235,54 @@ function LiveTagChart({
       }
       // Cap ring buffer at 2× capacity so we always have a small tail
       // for gap detection without unbounded memory growth.
-      if (buf.size > capacity * 2) {
+      if (buf.size > bufferCap) {
         const sorted = [...buf.keys()].sort((a, b) => a - b);
-        for (let i = 0; i < sorted.length - capacity * 2; i += 1) buf.delete(sorted[i]);
+        for (let i = 0; i < sorted.length - bufferCap; i += 1) buf.delete(sorted[i]);
       }
     }
     if (didAppend) setTick((t) => t + 1);
   // seriesDefs intentionally omitted; we read its current value via
   // the ref. dataLogView is the only signal that drives ingest.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dataLogView, capacity]);
+  }, [dataLogView, capacity, bufferCap]);
+
+  // Watch the trigger tag and move the window. Two sources, same reducer:
+  // one historian seed so a test already under way is shown from ITS
+  // start, then the live stream. State only changes when a boundary
+  // actually moves, so this cannot loop.
+  useEffect(() => {
+    if (!trigCfg) {
+      trigWinRef.current = { start: 0, end: 0, on: false, seen: -Infinity };
+      setTrigWin((w) => (w.start === 0 && w.end === 0 ? w : { start: 0, end: 0 }));
+      return undefined;
+    }
+    let cancelled = false;
+    const fetcher = fetchRowsRef.current;
+    if (typeof fetcher !== "function") return undefined;
+    (async () => {
+      const want = [trigCfg.tag];
+      if (trigCfg.stopTag && trigCfg.stopTag !== trigCfg.tag) want.push(trigCfg.stopTag);
+      const got = [];
+      for (const t of want) {
+        try {
+          const rows = await fetcher({
+            fromUtc: "", toUtc: "", limit: 500, offset: 0,
+            gateway: trigCfg.gatewayId || "", tag: t,
+            timeoutMs: 8000, maxAttempts: 1,
+          });
+          for (const r of Array.isArray(rows) ? rows : []) got.push(r);
+        } catch (_) { /* the live stream still drives the window */ }
+      }
+      if (cancelled || !got.length) return;
+      applyTriggerRows(got, trigCfg, trigWinRef, setTrigWin);
+    })();
+    return () => { cancelled = true; };
+  }, [trigCfg]);
+
+  useEffect(() => {
+    if (!trigCfg || !Array.isArray(dataLogView) || !dataLogView.length) return;
+    applyTriggerRows(dataLogView, trigCfg, trigWinRef, setTrigWin);
+  }, [dataLogView, trigCfg]);
 
   // Re-seed when the WS appears to have stalled — heuristic: if no new
   // sample has hit the buffer for 3× the poll interval (and we ARE
@@ -1244,17 +1417,9 @@ function LiveTagChart({
     // Bucketing case uses capacity × groupBucketMs as the window.
     const effectivePollMs = groupBucketMs > 0 ? groupBucketMs : pollMs;
     const windowMs = Math.max(1, capacity) * effectivePollMs;
-    const nowMs = Date.now();
-    if (sorted.length > 0) {
-      const latestSampleMs = sorted[sorted.length - 1];
-      const freshnessHorizon = windowMs * 2;
-      const isFresh = (nowMs - latestSampleMs) <= freshnessHorizon;
-      if (isFresh) {
-        const windowStartMs = nowMs - windowMs;
-        sorted = sorted.filter((ts) => ts >= windowStartMs);
-      }
-    }
-    if (sorted.length > capacity) sorted = sorted.slice(-capacity);
+    sorted = boundRowsToWindow(sorted, trigWin, {
+      capacity, windowMs, nowMs: Date.now(),
+    });
 
     // Per-series sorted entries so we can carry-forward by walking with
     // a pointer. Operator request 2026-06-11: "the chart should print
@@ -1391,7 +1556,7 @@ function LiveTagChart({
     return { rows, hasRightAxis, axesUsed };
     // tick changes are the signal that buffers mutated.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick, seriesDefs, capacity, pollMs, groupBucketMs, reducerKey, showGaps]);
+  }, [tick, seriesDefs, capacity, pollMs, groupBucketMs, reducerKey, showGaps, trigWin]);
 
   // Y axis: auto (data-fit) or manual. When manual is ON but the
   // operator has not yet typed values, we still pin the axis to a
@@ -3583,10 +3748,26 @@ function DashboardWidgetCardImpl({
       // mode — those need the full server-side query pipeline.
       const hasTimePreset = String(cfg?.query_time_filter_preset || "none").toLowerCase() !== "none";
       const hasTimeRange = !!(cfg?.query_time_filter_from || cfg?.query_time_filter_to);
+      // 2026-10-30, reported with a screenshot: a chart configured with
+      // "Time window: From a trigger" showed two full sawtooth cycles and
+      // ignored the trigger completely. The operator had ALSO left "Time
+      // range" on "Last 15 minutes" - the default - and that preset routes
+      // the widget down the historical pipeline, where the trigger window
+      // was never implemented. The feature was unreachable for anyone who
+      // did not first set Time range to None, which nothing said.
+      //
+      // A trigger window IS a time range: it says "from when the test
+      // started until it ended". So when one is configured it replaces the
+      // preset rather than losing to it, and the widget stays on the live
+      // path where the window is applied. The designer now disables the
+      // Time range control in this mode so the two cannot disagree on
+      // screen either.
+      const hasTriggerWindow =
+        String(cfg?.window_mode || "count") === "trigger"
+        && !!String(cfg?.window_tag_name || "").trim();
       const liveModeEligible =
         !historicalMode
-        && !hasTimePreset
-        && !hasTimeRange
+        && (hasTriggerWindow || (!hasTimePreset && !hasTimeRange))
         && (resolvedLimitLines || []).length === 0;
       if (liveModeEligible) {
         return (

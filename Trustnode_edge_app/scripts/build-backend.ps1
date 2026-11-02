@@ -268,6 +268,69 @@ print('compile-check OK')
         Write-Host "[ro-probe] PASS: /api/health 200 after ${roElapsed}s against a read-only data dir"
     }
 
+    # 2026-10-30: the probe above hands the exe an EMPTY read-only directory.
+    # The shape that actually killed a customer's app sails straight past it:
+    # a directory the user CAN write, holding a database they CANNOT. That is
+    # what the ProgramData store looks like after an earlier install left one
+    # behind - and measured on this machine the old writability guard called
+    # that store fine (BEGIN IMMEDIATE is granted) while the process then died
+    # on the first ALTER TABLE in _ensure_schema. The launcher shows that as
+    # "Backend service did not respond within 120 seconds".
+    Write-Host "Running unwritable-database boot self-test..."
+    $uw = Join-Path $env:TEMP ("tn-uw-probe-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
+    $uwHome = Join-Path $uw "home"
+    $uwData = Join-Path $uw "programdata"
+    New-Item -ItemType Directory -Force $uwHome | Out-Null
+    New-Item -ItemType Directory -Force $uwData | Out-Null
+    $uwDb = Join-Path $uwData "trustnode_app_store.db"
+    # A real file, then deny writes on the FILE only - the directory stays
+    # writable, which is the whole point of this probe.
+    [IO.File]::WriteAllBytes($uwDb, [byte[]]@())
+    & icacls $uwDb /inheritance:r | Out-Null
+    & icacls $uwDb /grant:r "SYSTEM:F" | Out-Null
+    & icacls $uwDb /grant:r "Administrators:F" | Out-Null
+    & icacls $uwDb /grant:r "Authenticated Users:RX" | Out-Null
+    $uwBlocked = $false
+    try { [IO.File]::AppendAllText($uwDb, "x") } catch { $uwBlocked = $true }
+    if (-not $uwBlocked) {
+        Write-Host "[uw-probe] SKIP: this account can write the file through the ACL (elevated?) - the probe would prove nothing"
+    } else {
+        $uwPort = 8795
+        $psi3 = New-Object System.Diagnostics.ProcessStartInfo
+        $psi3.FileName = $exePath
+        $psi3.UseShellExecute = $false
+        $psi3.RedirectStandardOutput = $true
+        $psi3.RedirectStandardError = $true
+        $psi3.EnvironmentVariables["TRUSTNODE_DATA_DIR"] = $uwData
+        $psi3.EnvironmentVariables["USERPROFILE"] = $uwHome
+        $psi3.EnvironmentVariables["HOME"] = $uwHome
+        $psi3.EnvironmentVariables["TRUSTNODE_PORT"] = "$uwPort"
+        $psi3.EnvironmentVariables["TRUSTNODE_SKIP_DOTENV"] = "1"
+        $psi3.EnvironmentVariables["TRUSTNODE_BOOT_INTEGRITY_CHECK"] = "never"
+        $psi3.EnvironmentVariables.Remove("TRUSTNODE_APP_STORE_PATH") | Out-Null
+        $uwProc = [System.Diagnostics.Process]::Start($psi3)
+        $sw3 = [Diagnostics.Stopwatch]::StartNew()
+        $uwHealthy = $false
+        while ($sw3.Elapsed.TotalSeconds -lt 60) {
+            Start-Sleep -Milliseconds 1000
+            if ($uwProc.HasExited) { break }
+            try {
+                $r3 = Invoke-WebRequest "http://127.0.0.1:$uwPort/api/health" -TimeoutSec 3 -UseBasicParsing
+                if ($r3.StatusCode -eq 200) { $uwHealthy = $true; break }
+            } catch { }
+        }
+        $uwElapsed = [int]$sw3.Elapsed.TotalSeconds
+        $uwCode = if ($uwProc.HasExited) { $uwProc.ExitCode } else { "still running" }
+        if (-not $uwProc.HasExited) { try { $uwProc.Kill() } catch { } }
+        Start-Sleep -Milliseconds 500
+        & icacls $uwDb /grant:r "${env:USERNAME}:F" 2>&1 | Out-Null
+        Remove-Item -Recurse -Force $uw -ErrorAction SilentlyContinue
+        if (-not $uwHealthy) {
+            throw "Unwritable-database boot self-test FAILED (exit=$uwCode after ${uwElapsed}s): the backend could not start when its data dir holds a database it may read but not write. That is a customer machine with a leftover store under the installer ACL - do not ship this build."
+        }
+        Write-Host "[uw-probe] PASS: /api/health 200 after ${uwElapsed}s against an unwritable database"
+    }
+
     Write-Host "Backend bundle created: $(Join-Path $backendRoot 'dist\trustnode-service')"
 }
 finally {

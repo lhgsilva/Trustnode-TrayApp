@@ -585,6 +585,23 @@ class ReportsStore:
                             json.dumps(template_ids, ensure_ascii=False), output_path,
                             start_edge,
                             json.dumps(destination_rules, ensure_ascii=False),
+                            # 2026-10-30: this value was MISSING while the SET
+                            # list above assigned report_columns_json, so the
+                            # statement wanted 35 bindings and got 34. Every
+                            # edit of an existing schedule raised
+                            # sqlite3.ProgrammingError -> HTTP 500, while
+                            # CREATING one worked, because the INSERT below
+                            # does supply it. On the customer's machine that
+                            # meant the destination they were trying to set
+                            # never saved, so reports kept being written to
+                            # the previous path - which read as "the reports
+                            # are not generated correctly", not as a failed
+                            # save. The comment at the top of this method
+                            # warns about exactly this and was not enough;
+                            # scripts/test_reports_schedule_roundtrip.py now
+                            # edits a saved schedule so the two statements
+                            # cannot drift again.
+                            json.dumps(report_columns, ensure_ascii=False),
                             now,
                             tid, sid,
                         ),

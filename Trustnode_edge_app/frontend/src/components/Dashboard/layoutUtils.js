@@ -5,7 +5,7 @@ import {
   WIDGET_TYPES,
   getWidgetMeta,
   newWidgetId,
-} from "./widgetRegistry";
+} from "./widgetRegistry.js";
 
 // Normalize a series' axis to one of the FOUR canonical axes. Legacy configs
 // stored only "left"/"right"; the multi-axis UI stores left1/left2/right1/
@@ -286,6 +286,26 @@ export function normalizeWidgets(rawWidgets) {
                 limit_dash: ["dashed", "solid", "dotted"].includes(String(s.limit_dash || ""))
                   ? String(s.limit_dash)
                   : "dashed",
+                // 2026-10-30, reported: "when the app is restarted the
+                // configurations of dashboard and charts including the
+                // interpolation are being lost".
+                //
+                // This list is the allowlist trap the comment above warns
+                // about, and interpolation was the one field missing from
+                // it. The editor offers a per-series line shape and keeps
+                // it on save, but normalizeWidgets runs on EVERY load, drag
+                // and reflow - and silently dropped it every time, so the
+                // chart redrew with the widget default. Found by diffing
+                // the editor's own allowlist against this mapping; it was
+                // the only field that differed.
+                //
+                // "" means inherit the widget's setting, which is why the
+                // empty string is a legal value here and the default.
+                interpolation: ["linear", "monotone", "natural", "step",
+                                "stepBefore", "stepAfter"]
+                  .includes(String(s.interpolation || ""))
+                  ? String(s.interpolation)
+                  : "",
               }))
           : [],
         primary_unit: String(raw?.config?.primary_unit || ""),
@@ -363,12 +383,115 @@ export function reflowWidgetsForMoveToPoint(widgets, draggedId, targetX, targetY
   );
   placed.push(draggedPlaced);
 
-  for (const item of current) {
-    if (item.id === draggedId) continue;
-    const nextPlaced = placeAtOrNextFree({ ...item }, { x: item.x, y: item.y }, placed);
-    placed.push(nextPlaced);
+  // 2026-10-30, reported: "when we are automatically rearranging the widgets
+  // it goes totally wrong, messing with what was already in place and really
+  // hard to make it organized again."
+  //
+  // This is why. Every OTHER widget was re-placed with placeAtOrNextFree,
+  // whose fallback is findFirstFreeSpot scanning from the TOP of the grid.
+  // So a widget the drop happened to displace did not step aside - it flew
+  // to whatever hole existed anywhere above, and the widgets displaced by
+  // THAT moved too. One drop could rewrite the whole board.
+  //
+  // reflowWidgetsForResize already learned this: "colliding neighbours are
+  // PUSHED DOWN ... the previous version relocated widgets UPWARD". The move
+  // path never got the same treatment. It does now:
+  //
+  //   * neighbours are considered in READING ORDER (top to bottom, then left
+  //     to right), so the result is the same every time;
+  //   * a neighbour that still fits where it is does not move at all;
+  //   * one that does not is searched for from ITS OWN ROW downward, so it
+  //     steps out of the way instead of jumping to the top of the board.
+  const others = current
+    .filter((w) => w.id !== draggedId)
+    .sort((a, b) => (a.y !== b.y ? a.y - b.y : (a.x !== b.x ? a.x - b.x
+                                                : String(a.id).localeCompare(String(b.id)))));
+
+  // TWO PASSES, and the order is the whole point.
+  //
+  // 2026-10-30, reported: "I have 6 widgets on the first row completing the
+  // full width and two in the second row ... now I am adding and arranging
+  // widgets in the third row and it is moving components from the first two
+  // rows." Reproduced in test_dashboard_layout.mjs: a drop onto row 1 moved
+  // all EIGHT settled widgets.
+  //
+  // The single pass was the cause. It walked the widgets in order and placed
+  // each one against only those handled SO FAR - so a widget the drop pushed
+  // aside could be dropped onto a cell that a later, perfectly settled widget
+  // still owned. That widget then had to move too, onto someone else, and the
+  // board unravelled one widget at a time.
+  //
+  // Pass 1 reserves every widget that does NOT collide with the drop. They
+  // are staying, so their cells are spoken for before anything is relocated.
+  // Pass 2 then has the truth to work with, and only the genuinely displaced
+  // widgets move.
+  const movers = [];
+  for (const item of others) {
+    if (canPlace(item, placed)) {
+      placed.push({ ...item });        // stays exactly where it was
+    } else {
+      movers.push(item);
+    }
   }
-  return compactWidgets(placed);
+
+  // Only the displaced ones, searched from their OWN row downward. The scan
+  // runs left to right then on to the next row, so a pushed widget takes the
+  // space to its right first and wraps to the start of the next row - which
+  // is how the operator asked for it: "push item to the right and bottom
+  // first left on the next row so it is better manageable".
+  for (const item of movers) {
+    const free = findFirstFreeSpot({ w: item.w, h: item.h }, placed, item.y);
+    placed.push({ ...item, x: free.x, y: free.y });
+  }
+  return placed;
+}
+
+//: An explicit, predictable tidy: everything packed in reading order, left to
+//: right and top to bottom, with no holes. 2026-10-30, requested: "check if
+//: is better trying to align from left to right from top to bottom".
+//:
+//: It is - but only when the operator ASKS for it. Doing this on every drop
+//: is what made the board feel like it had a mind of its own, so this is a
+//: button, not a side effect. Widget sizes are preserved; only positions
+//: change, and the order follows where things already were.
+export function packWidgetsReadingOrder(widgets) {
+  const current = normalizeWidgets(widgets);
+  const ordered = [...current].sort((a, b) => {
+    if (a.y !== b.y) return a.y - b.y;
+    if (a.x !== b.x) return a.x - b.x;
+    return String(a.id).localeCompare(String(b.id));
+  });
+  const placed = [];
+  for (const item of ordered) {
+    const free = findFirstFreeSpot({ w: item.w, h: item.h }, placed, 0);
+    placed.push({ ...item, x: free.x, y: free.y });
+  }
+  return placed;
+}
+
+//: Where a drop would actually land, without changing anything. The canvas
+//: draws this as a placeholder so the operator can see the result BEFORE
+//: letting go - requested 2026-10-30: "when we drag it shows a preview of
+//: what would happen".
+export function previewDropRect(widgets, draggedId, targetX, targetY) {
+  const current = normalizeWidgets(widgets);
+  const dragged = current.find((w) => w.id === draggedId);
+  if (!dragged) return null;
+  // The dragged widget is placed FIRST by reflowWidgetsForMoveToPoint, into
+  // an empty board - so it always takes the cell it was dropped on, and the
+  // others move around it. The preview must say the same thing.
+  //
+  // The first version asked placeAtOrNextFree against the other widgets,
+  // which meant that dropping ONTO a neighbour previewed some far-away free
+  // hole while the real drop landed under the cursor. Caught by
+  // test_dashboard_layout.mjs: "preview 0,0 vs real 3,2". A preview that
+  // disagrees with the drop is worse than no preview at all.
+  return {
+    x: clamp(targetX, 0, DASHBOARD_GRID_COLS - dragged.w),
+    y: clamp(targetY, 0, DASHBOARD_GRID_VIRTUAL_ROWS - dragged.h),
+    w: dragged.w,
+    h: dragged.h,
+  };
 }
 
 export function reflowWidgetsForResize(widgets, resizedId, nextW, nextH) {
@@ -398,11 +521,20 @@ export function reflowWidgetsForResize(widgets, resizedId, nextW, nextH) {
   const others = current
     .filter((w) => w.id !== resizedId)
     .sort((a, b) => (a.y !== b.y ? a.y - b.y : a.x - b.x));
+  // Reserve the widgets that are staying BEFORE relocating any, for the same
+  // reason as reflowWidgetsForMoveToPoint: deciding against a half-built
+  // board lets a pushed widget land on a cell a settled one still owns, and
+  // the displacement spreads from there. Measured on the operator's board, a
+  // single drop moved all eight widgets of two finished rows.
+  const resizeMovers = [];
   for (const item of others) {
     if (canPlace(item, placed)) {
-      placed.push(item);
-      continue;
+      placed.push(item);              // untouched by the resize
+    } else {
+      resizeMovers.push(item);
     }
+  }
+  for (const item of resizeMovers) {
     // TRUE push-down: first try the widget's OWN column, sliding down row
     // by row (keeps the visual rhythm); only if the column is blocked all
     // the way down fall back to the general scan from its row.

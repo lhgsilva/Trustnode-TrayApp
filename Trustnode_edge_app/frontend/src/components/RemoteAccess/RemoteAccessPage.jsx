@@ -280,8 +280,16 @@ export function RemoteAccessPage({ canEdit = false, role = "", onOpenUsers = nul
     return rows;
   }, [running, httpsAvailable, ips, hostname, https]);
 
+  // 2026-10-27: the backend used to report the LOOPBACK port here when HTTP
+  // was not exposed on the LAN, which was simply untrue - so it now reports
+  // 0, and this read "Running on port ?". With HTTPS-only there is no HTTP
+  // port to name; say what is actually serving.
   const statusText = running
-    ? `Running on port ${httpPort || "?"}${httpsAvailable && https?.port ? ` (HTTPS ${https.port})` : ""}`
+    ? (httpPort
+        ? `Running on port ${httpPort}${httpsAvailable && https?.port ? ` (HTTPS ${https.port})` : ""}`
+        : (httpsAvailable && https?.port
+            ? `Running on HTTPS port ${https.port}`
+            : "Running"))
     : (enabled ? "Bind failed" : "Off");
   const certHref = httpsAvailable ? getLanSharingCertificateUrl(https?.cert_url) : "";
   const fingerprint = String(https?.cert_fingerprint_sha256 || "");

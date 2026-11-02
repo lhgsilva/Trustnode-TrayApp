@@ -51,6 +51,47 @@ def _runtime_for(channel: str) -> str:
     return fresh.get(channel, "python")
 
 
+_ACTIVE_CACHE: dict = {"val": False, "at": 0.0}
+
+
+def any_outbound_active() -> bool:
+    """Is ANY outbound service actually running right now?
+
+    2026-10-30. Collection calls this before touching the publish path, so a
+    service that is stopped, unlicensed or broken costs the gateway nothing.
+    Both checks are flag reads behind a reentrant lock; neither does I/O.
+
+    Cached for a second: the collection loop asks once per cycle per gateway
+    and the answer cannot change meaningfully faster than that.
+    """
+    import time as _t
+    now = _t.monotonic()
+    hit = _ACTIVE_CACHE.get("at", 0.0)
+    if hit and (now - hit) < 1.0:
+        return bool(_ACTIVE_CACHE.get("val"))
+    active = False
+    for ch in ("opcua", "mqtt"):
+        try:
+            if _runtime_for(ch) == "native":
+                if ch == "opcua":
+                    from app.services import opcua_server_dotnet as svc
+                else:
+                    from app.services import mqtt_broker_mosquitto as svc
+            else:
+                if ch == "opcua":
+                    from app.services import opcua_server as svc
+                else:
+                    from app.services import mqtt_broker as svc
+            if svc.is_running():
+                active = True
+                break
+        except Exception:
+            continue
+    _ACTIVE_CACHE["val"] = active
+    _ACTIVE_CACHE["at"] = now
+    return active
+
+
 def publish_opcua(gateway_id: str, device_name: str, tag_name: str,
                   value: Any, ts_utc: Optional[str] = None,
                   quality: Optional[str] = None) -> None:

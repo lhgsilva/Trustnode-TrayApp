@@ -49,3 +49,4 @@ ui_smoke*.png
 
 # browser-harness screenshots (scripts/run_lite_tabs.py, run_portal_ui.py)
 scripts/lite_shots/
+scripts/certs/

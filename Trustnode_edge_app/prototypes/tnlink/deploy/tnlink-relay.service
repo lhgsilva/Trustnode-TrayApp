@@ -1,0 +1,41 @@
+[Unit]
+Description=TrustNode Link relay (rendezvous for remote service access)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/tnlink/tnlink_relay.py --port 7443
+Restart=always
+RestartSec=3
+User=tnlink
+Group=tnlink
+
+# The relay is a byte pipe. It needs no files, no network config and no
+# privileges beyond binding one high port, so take everything else away.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadWritePaths=
+
+# Bound the blast radius of a busy or hostile day.
+LimitNOFILE=4096
+MemoryMax=256M
+TasksMax=512
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

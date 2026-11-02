@@ -523,24 +523,22 @@ class ControlPlaneStore:
                 # NOTE:
                 # We intentionally do NOT auto-reseed default customer/license rows.
                 # Operators must be able to delete them permanently from portal UI.
-                cur.execute("SELECT id FROM cp_users WHERE tenant_id='default' AND username='admin'")
-                if not cur.fetchone():
-                    cur.execute(
-                        "INSERT INTO cp_users(tenant_id, username, password_hash, role, status, email, mfa_enabled, modules_json, permissions_json, created_utc, updated_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            "default",
-                            "admin",
-                            self._hash_password("admin"),
-                            "admin",
-                            "active",
-                            "",
-                            0,
-                            json.dumps([m["key"] for m in self.MODULE_CATALOG], separators=(",", ":")),
-                            json.dumps({}, separators=(",", ":"), sort_keys=True),
-                            now,
-                            now,
-                        ),
-                    )
+                # 2026-11-02: this used to INSERT cp_users (default, admin,
+                # hash("admin")) into EVERY store - every customer edge
+                # included - and the login's any-tenant fallback accepted it.
+                # So admin/admin opened any customer's edge as an admin of the
+                # developer tenant. Measured on a live customer edge, where
+                # cp_users held exactly that row beside the customer's own.
+                # A store never seeds a credential. The row already there is
+                # removed only while it still carries the default password; a
+                # changed one is somebody's account and is left alone (the
+                # login refuses `default` rows on an activated edge anyway).
+                cur.execute("SELECT id, password_hash FROM cp_users WHERE tenant_id='default' AND username='admin'")
+                seeded = cur.fetchone()
+                if seeded and self._verify_password("admin", str(seeded[1] or "")):
+                    cur.execute("DELETE FROM cp_users WHERE id=?", (seeded[0],))
+                    print("[trustnode][control-plane] removed the seeded admin/admin "
+                          "row (tenant default) - a known default credential", flush=True)
                 conn.commit()
 
     def update_license_tier(self, license_id: str, package_key: str = "", limits: "Dict[str, Any] | None" = None) -> None:

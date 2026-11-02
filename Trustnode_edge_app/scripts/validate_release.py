@@ -273,6 +273,93 @@ SOURCE_CHECKS = [
     # build their own starting state, so none of them saw that activation
     # blanked the company contact_email it had just been given.
     ("onboarding flow, end to end", "validate_onboarding_flow.py"),
+    # 2026-10-30: a workspace carries what the operator built, never who the
+    # machine is. A wiped-and-reactivated edge imported the old machine's
+    # workspace and inherited its edge id, its licence receipt and its
+    # tenant - then wrote config under a scope it did not read from.
+    ("a workspace carries no machine identity", "test_workspace_isolation.py"),
+    # 2026-10-30: a side service must never stall collection. current_port()
+    # took a non-reentrant lock then called is_running(), which takes it
+    # again - the thread deadlocked against itself WHILE HOLDING the lock
+    # and the gateway went from 1 s to 8.02 s per cycle, last_error=None.
+    ("outbound services cannot stall collection", "test_outbound_never_blocks_collection.py"),
+    # 2026-10-30: one report pattern behaved two ways depending on whether
+    # the tag value happened to contain a dot, so {Work_Order} was a folder
+    # for one work order and a file for the next.
+    ("report paths mean the same thing every run", "test_report_paths.py"),
+    # 2026-10-30: the Remote Access page warned that no firewall rule
+    # allowed the backend while the rule existed and matched. netsh only
+    # prints the Program line with `verbose`, so the probe searched output
+    # that could not contain the path - and ensure_backend_rule() re-added
+    # the rule on every start because of it.
+    ("the firewall probe reads the real rule", "test_firewall_rule_probe.py"),
+    # 2026-10-30, rule 1b, from a dying remote session: Remote Access read
+    # and wrote the LEGACY UNSCOPED table, so in a file holding three edges
+    # "the LAN settings" were whichever edge wrote last. And the same edge
+    # held two personal documents - `|cust-a|` and `|-|` - because
+    # _build_scope_key degrades to `-` when the identity read comes back
+    # short, and canonicalisation could not heal a split once both had rows.
+    ("LAN settings belong to this edge", "test_lan_settings_scope.py"),
+    # 2026-10-30, the operator locked out of their own edge over the LAN:
+    # every users_access save wrote the document's hash straight over the
+    # AuthStore row, so a document carrying a stale or foreign hash silently
+    # replaced a password that worked - and the boot migration fed EVERY
+    # edge's users_access in the file into this edge's login store.
+    ("a save cannot invalidate a working password", "test_password_not_clobbered.py"),
+    # The same rule against the ARTIFACT, because the source being right has
+    # never been evidence of what shipped. This one earned its place: the
+    # first fix passed every source check and still clobbered the password
+    # in the packaged build.
+    ("the shipped build keeps the password too", "test_packaged_password_safety.py"),
+    # 2026-10-30: editing a SAVED schedule raised sqlite3.ProgrammingError
+    # (35 bindings wanted, 34 supplied) because report_columns_json was added
+    # to the UPDATE's SET list without a value. Creating one worked, so only a
+    # customer with a saved schedule ever hit it - and the destination they
+    # were setting never saved, so reports kept landing in the old folder.
+    ("a saved schedule can be edited again", "test_reports_schedule_roundtrip.py"),
+    # 2026-10-30, measured with py-spy: 37 threads, four of them for modules
+    # this edge is not licensed for, four with no name at all. The gates fail
+    # OPEN - an unreadable licence starts the feature rather than silently
+    # taking it away.
+    ("the edge starts only what it is licensed for", "test_edge_starts_light.py"),
+    # 2026-10-31: nine rows on the Diagnostics page and seven said "desktop
+    # app", which is why the process burning 74.6% of a core could not be
+    # named. Electron tags every child it spawns on the command line.
+    ("every process says what it is for", "test_diagnostics_roles.py"),
+    # 2026-10-31, THE root cause behind a day of "the edge did not answer in
+    # time": get_historian_agg_rows did a pure READ on the WRITER connection,
+    # whose timeout is 10s. On an edge collecting at 500 ms it queued behind
+    # the historian writer - measured at 12-14s per call, seven inside six
+    # seconds - and everything else timed out behind it. Invisible on an idle
+    # store, which is why it only ever showed at a customer.
+    ("chart reads do not queue behind the writer", "test_historian_reads_dont_queue.py"),
+    # 2026-11-02: break-glass admin/admin returned role=admin on a customer's
+    # edge, shadowing their own `admin`. A real account always wins.
+    ("break-glass never shadows a customer's admin", "test_master_never_shadows_customer.py"),
+    # 2026-11-02, from the owner: `default` is the developer tenant; no
+    # customer install may file users or data there. Loopback used to mean
+    # `default` - measured: historian rows and a cp_users admin under it on
+    # an activated edge. Users whose row still says `default` must keep
+    # signing in.
+    ("an activated edge never writes under `default`", "test_edge_tenant_is_never_default.py"),
+    # 2026-11-02: charts read historian_agg_* (never written) and rollups
+    # only ran with a deletion policy (no customer has one) - so every wide
+    # chart bucketed raw on every refresh, 2.2 s a call, ~10 s with seven
+    # widgets, and over a tunnel the edge looked dead.
+    ("charts read rollups that exist without a policy", "test_rollups_feed_charts.py"),
+    # 2026-10-30, asked for directly: "every new installer can be installed
+    # in existing computer with all fixes and updates". Boots the PACKAGED
+    # backend on a copy of a real workspace with NO data-dir override - the
+    # override is what made the last upgrade break slip through, because it
+    # meant the default path resolution a customer actually uses was never
+    # exercised. Skips cleanly when there is no build or no workspace.
+    ("a new build upgrades an existing install", "test_upgrade_over_existing.py"),
+    # 2026-10-30: a chart that restarts its X axis when a test starts. The
+    # feature existed, in a legacy editor nobody opens - "present in the
+    # bundle" was verified and reachability never was.
+    ("chart trigger window, and it is reachable", "test_chart_trigger_window.mjs"),
+    # 2026-10-30: a drop must move the widget, not rewrite the board.
+    ("dashboard layout survives a drop", "test_dashboard_layout.mjs"),
     # 2026-10-20 storage work: the archive that let 7.8 GB of legacy files
     # go without losing the 10.6M readings only they still held; the four
     # retention dials that were declared and read by nothing; and the
@@ -396,11 +483,16 @@ def _run_contained(argv):
 
 print("RELEASE GATE: source checks...", flush=True)
 for label, script in SOURCE_CHECKS:
-    rc = _run_contained([sys.executable, os.path.join(HERE, script)])
+    # 2026-10-30: the frontend checks are node, not python. They were run by
+    # hand and therefore not run - the dashboard layout one had been broken
+    # by an extensionless import for days without anybody noticing.
+    _exe = "node" if script.endswith(".mjs") else sys.executable
+    rc = _run_contained([_exe, os.path.join(HERE, script)])
     print("  {0:26s}: {1}".format(label, "PASS" if rc == 0 else "FAIL"), flush=True)
     if rc != 0:
         print("RELEASE GATE: FAIL - do NOT commit. Run "
-              "`python scripts/{0}` for the detail.".format(script), flush=True)
+              "`{1} scripts/{0}` for the detail.".format(
+                  script, "node" if script.endswith(".mjs") else "python"), flush=True)
         sys.exit(2)
 
 print("RELEASE GATE: running the 10-minute full-system validation...", flush=True)

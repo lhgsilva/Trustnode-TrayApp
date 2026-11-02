@@ -78,6 +78,12 @@ BATCH_FAST_MS = _env_int("TRUSTNODE_RETENTION_BATCH_FAST_MS", 60, 5, 5000)
 BATCH_SLOW_MS = _env_int("TRUSTNODE_RETENTION_BATCH_SLOW_MS", 150, 10, 10000)
 # Late-arriving data grace: a bucket is only closed this long after it ends.
 ROLLUP_GRACE_S = _env_int("TRUSTNODE_RETENTION_GRACE_S", 120, 5, 86400)
+
+# The tiers materialised on an edge that has NO retention policy. These are
+# the three grains the dashboard/report readers ask for (minute, hour, day);
+# a policy, when one is created, brings its own tiers and the same watermarks.
+NO_POLICY_ROLLUP_TIERS = {"tiers": [{"resolution": "1m"}, {"resolution": "1h"},
+                                    {"resolution": "1d"}]}
 # Disk guard thresholds.
 DISK_WARN_PCT = _env_int("TRUSTNODE_RETENTION_DISK_WARN_PCT", 15, 1, 90)
 DISK_EMERGENCY_PCT = _env_int("TRUSTNODE_RETENTION_DISK_EMERGENCY_PCT", 5, 1, 50)
@@ -1535,6 +1541,23 @@ class RetentionEngine:
 
             if policy is None:
                 summary["notes"].append("no active retention policy — nothing is deleted")
+                # 2026-11-02: a rollup is not a deletion. This used to return
+                # here, so on every edge without a policy - which is every
+                # customer edge measured so far - `historian_rollup` stayed
+                # empty for good and every chart wider than a few minutes
+                # bucketed raw rows on the fly: 2.2 s per call for a 24 h
+                # window on a 514k-row store, seven widgets at once ~10 s,
+                # and over a tunnel the whole edge looked dead ("templates
+                # could not be loaded", "did not answer in time"). The raw
+                # readings stay exactly as they are.
+                tenants = self.store.tenants()
+                summary["tenants"] = tenants
+                deadline = started + 10 * 60
+                for tenant in tenants:
+                    summary["rollups"].extend(
+                        self._rollup_tenant(NO_POLICY_ROLLUP_TIERS, tenant, deadline, dry_run))
+                    if self._stop.is_set() or time.time() > deadline:
+                        break
                 # Even with no policy we keep the WAL small and take config backups.
                 self._checkpoint_wal()
                 if not dry_run:

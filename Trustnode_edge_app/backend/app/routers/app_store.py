@@ -118,6 +118,12 @@ _SHARED_EDGE_DOMAINS = frozenset({
     # operator on the edge should see the same dashboards/charts; finer
     # personalisation (last-selected profile) lives in app_settings.
     "dashboard_configurations",
+    # 2026-10-30: whether this machine listens on the LAN, on which scheme
+    # and which interface, is a property of the MACHINE - every operator on
+    # it shares one answer. It lived in the per-user app_settings and was
+    # read from the unscoped table, which is two wrongs that cancelled out
+    # until a second edge appeared in the same file.
+    "lan_sharing",
 })
 
 
@@ -208,7 +214,10 @@ def shared_edge_scope_key() -> str:
     customer_id = (str(profile.get("linked_customer_id") or "").strip().lower()
                    or str(settings.get("customer_id") or "").strip().lower())
     tenant_id = str(settings.get("tenant_id") or get_current_tenant() or "default").strip().lower()
-    return f"{tenant_id}|{customer_id or '-'}|{edge_id}"
+    # 2026-10-30: _build_scope_key canonicalises and this did not, so the same
+    # install could compute one key per request and another for its site-level
+    # domains - the split this whole helper exists to prevent.
+    return app_store.canonical_scope_key(f"{tenant_id}|{customer_id or '-'}|{edge_id}")
 
 
 def overlay_shared_edge_domains(bootstrap: Dict[str, Any]) -> Dict[str, Any]:
@@ -444,6 +453,40 @@ def get_bootstrap(request: Request) -> dict:
     }
 
 
+
+def _users_access_hashes(doc: Any) -> Dict[str, str]:
+    """{username: stored password field} for a users_access document.
+
+    2026-10-30: the AuthStore mirror needs to know what the document held
+    BEFORE a save, so it can tell a real password change from a hash that
+    was simply sitting in the document. See
+    auth_store.migrate_from_app_store_payload.
+    """
+    out: Dict[str, str] = {}
+    if not isinstance(doc, dict):
+        return out
+    for u in (doc.get("users") or []):
+        if not isinstance(u, dict):
+            continue
+        name = str(u.get("username") or "").strip()
+        if name:
+            out[name] = str(u.get("password") or "")
+    return out
+
+
+def _stored_users_access(scope_key: str) -> Any:
+    """The users_access document as it stands right now, scope first."""
+    try:
+        if scope_key:
+            cur = app_store.get_scoped_domain_payload(scope_key, "users_access")
+            if isinstance(cur, dict):
+                return cur
+        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        cur = bootstrap.get("users_access")
+        return cur if isinstance(cur, dict) else None
+    except Exception:
+        return None
+
 @router.put("/bootstrap")
 def save_bootstrap(payload: BootstrapSaveRequest, request: Request) -> dict:
 
@@ -488,12 +531,16 @@ def save_bootstrap(payload: BootstrapSaveRequest, request: Request) -> dict:
     # Operator 2026-06-18: same AuthStore mirror as /domain — multi-
     # domain saves can carry users_access too, mirror those into the
     # auth DB so newly-saved users can log in without a reboot.
+    _bootstrap_prior_user_hashes = _users_access_hashes(
+        _stored_users_access(shared_scope or user_scope))
     ua_payload = (payload.data or {}).get("users_access") if isinstance(payload.data, dict) else None
     if isinstance(ua_payload, dict):
         try:
             from app.state import auth_store as _auth_store
             _auth_store.migrate_from_app_store_payload(
-                ua_payload, actor=f"ui_bootstrap_save:{payload.actor or 'admin'}"
+                ua_payload, actor=f"ui_bootstrap_save:{payload.actor or 'admin'}",
+                prior_hashes=_bootstrap_prior_user_hashes,
+                default_tenant=app_store._current_tenant_id(),   # noqa: SLF001
             )
         except Exception:
             pass
@@ -797,6 +844,12 @@ def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
     _guard_shared_write_permission(request, str(payload.domain or "").strip())
     scope_key = _build_scope_key(request, domain=payload.domain)
     _domain_name = str(payload.domain or "").strip()
+    # Captured BEFORE the write: what the stored document held, so the
+    # AuthStore mirror below can tell a real password change from a hash
+    # that was merely sitting in the document (see auth_store).
+    _prior_user_hashes = (
+        _users_access_hashes(_stored_users_access(scope_key))
+        if _domain_name == "users_access" else {})
     _base = payload.base_version
     if _base is not None and scope_key:
         stored = app_store.get_scoped_domain_version(scope_key, _domain_name)
@@ -906,12 +959,26 @@ def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
     # users created/edited via the "Users and Access Control" UI can log
     # in immediately. AuthStore is the auth hot path; without this hook
     # a brand-new user could only log in after the next boot migration.
+    # 2026-10-31: the power manager's threads no longer start on an edge that
+    # is not licensed for Power Management. Meters are configured through THIS
+    # endpoint, not /api/power - a workspace import and the UI's bootstrap
+    # save both land here - so without this hook a configured meter collected
+    # nothing until somebody happened to open the Power page. Caught by
+    # test_export_files_e2e: "the meter writes a CSV: 0 row(s)".
+    if str(payload.domain or "").strip() == "power_management_config":
+        try:
+            from app.state import power_manager as _pm
+            _pm.ensure_started()
+        except Exception:
+            pass
     if str(payload.domain or "").strip() == "users_access":
         try:
             from app.state import auth_store as _auth_store
             _auth_store.migrate_from_app_store_payload(
                 payload.payload if isinstance(payload.payload, dict) else None,
                 actor=f"ui_save:{payload.actor or 'admin'}",
+                prior_hashes=_prior_user_hashes,
+                default_tenant=app_store._current_tenant_id(),   # noqa: SLF001
             )
         except Exception:
             # Never let a mirror failure block the legacy save path.
@@ -1119,6 +1186,111 @@ def get_historian_range(
             edge_id=edge_id,
         ),
     }
+
+
+@router.get("/historian/trigger-window", dependencies=[_Depends_rs(_historian_read_slot)])
+def get_historian_trigger_window(
+    request: Request,
+    gateway: str = "",
+    tag: str = "",
+    operator: str = "==",
+    value: str = "",
+    stop_gateway: str = "",
+    stop_tag: str = "",
+    stop_operator: str = "==",
+    stop_value: str = "",
+    lookback: int = 20000,
+) -> dict:
+    """When did this tag last BECOME true? (and, optionally, stop being needed)
+
+    2026-10-28, requested: a dashboard chart whose X axis starts when a
+    trigger fired - "only show the data and time range of start and end
+    triggers, or resets when the start trigger starts so the operator can
+    see the current batch or test".
+
+    The answer is a RISING EDGE, not "is it true now": a start bit that has
+    been high for an hour must still place the window at the moment it went
+    high, otherwise every refresh would move the axis. So the rows are
+    walked newest-first and the window opens at the last False->True
+    transition.
+
+    Returns from_utc="" when the condition has never been satisfied in the
+    lookback - the caller decides what to show, and the dashboard falls back
+    to its reading count rather than leaving an operator with a blank chart.
+    """
+    def _as_float(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _holds(row, op, want_txt):
+        want = _as_float(want_txt)
+        raw = row.get("value")
+        num = _as_float(raw)
+        if num is None or want is None:
+            # Text comparison for state tags that carry words.
+            lhs = str(row.get("value_text") if row.get("value_text") not in (None, "") else raw or "").strip().lower()
+            rhs = str(want_txt or "").strip().lower()
+            if op in ("==", "=", "eq"):
+                return lhs == rhs
+            if op in ("!=", "<>", "ne"):
+                return lhs != rhs
+            return False
+        if op in ("==", "=", "eq"):
+            return num == want
+        if op in ("!=", "<>", "ne"):
+            return num != want
+        if op in (">", "gt"):
+            return num > want
+        if op in (">=", "gte"):
+            return num >= want
+        if op in ("<", "lt"):
+            return num < want
+        if op in ("<=", "lte"):
+            return num <= want
+        return False
+
+    def _edge(gw, tg, op, val):
+        """Timestamp of the most recent False->True transition, or ""."""
+        if not str(tg or "").strip():
+            return ""
+        rows = app_store.get_historian_rows_range(
+            from_utc="", to_utc="", limit=max(100, min(int(lookback or 20000), 50000)),
+            offset=0, prefer_cloud_reads=False, gateway=gw, device="", tag=tg,
+            edge_id="",
+        ) or []
+        # Oldest -> newest, so a transition is row[i-1] False and row[i] True.
+        rows = sorted(rows, key=lambda r: str(r.get("ts_utc") or ""))
+        last_true_start = ""
+        prev = False
+        for r in rows:
+            now_true = _holds(r, op, val)
+            if now_true and not prev:
+                last_true_start = str(r.get("ts_utc") or "")
+            prev = now_true
+        return last_true_start
+
+    start_at = _edge(gateway, tag, operator, value)
+    stop_at = ""
+    if str(stop_tag or "").strip() and start_at:
+        # Only a stop AFTER the start closes the window; an older one is a
+        # previous run and must not truncate this one.
+        rows = app_store.get_historian_rows_range(
+            from_utc=start_at, to_utc="", limit=max(100, min(int(lookback or 20000), 50000)),
+            offset=0, prefer_cloud_reads=False,
+            gateway=(stop_gateway or gateway), device="", tag=stop_tag, edge_id="",
+        ) or []
+        rows = sorted(rows, key=lambda r: str(r.get("ts_utc") or ""))
+        prev = False
+        for r in rows:
+            now_true = _holds(r, stop_operator, stop_value)
+            if now_true and not prev:
+                stop_at = str(r.get("ts_utc") or "")
+                break
+            prev = now_true
+    return {"ok": True, "found": bool(start_at), "from_utc": start_at,
+            "to_utc": stop_at}
 
 
 @router.get("/historian/agg", dependencies=[_Depends_rs(_historian_read_slot)])
@@ -1383,16 +1555,38 @@ def get_mirror_state() -> dict:
     }
 
 
+#: /sync/status is rebuilt from a whole-store snapshot; the dashboard polls
+#: it every couple of seconds. 3 s of staleness on a backlog counter is
+#: invisible; 11.5 s of blocked sockets is not.
+_SYNC_STATUS_TTL_S = 3.0
+_SYNC_STATUS_CACHE: dict = {"at": 0.0, "value": None}
+
+
 @router.get("/sync/status")
 def get_sync_status() -> dict:
     """Read-only summary of the cloud sync worker state.
 
     Returned shape matches the `summary` block of force_sync_now() but
-    runs no flush. Cheap enough for the UI to poll every 1–2 seconds.
-    Includes whether telemetry-v1 is enabled, the live/data sync errors
-    if any, and the historian/log backlog counts so the UI can decide
-    whether to show the "big backlog" prompt.
+    runs no flush. Includes whether telemetry-v1 is enabled, the live/data
+    sync errors if any, and the historian/log backlog counts so the UI can
+    decide whether to show the "big backlog" prompt.
+
+    2026-10-30: this said "cheap enough for the UI to poll every 1-2
+    seconds". Measured on an 8.27 GB store, with the dashboard's own
+    pollers running: 11.5 s median, on loopback. get_inspector_snapshot()
+    walks the store, and the UI asks for it every couple of seconds.
+    A browser allows six connections per origin, so pollers this slow hold
+    every socket and the operator's next save queues behind them until its
+    retries are spent - which is the "No response from ..." banner.
+
+    The numbers here are counters and backlogs. Being a few seconds old
+    costs nothing, so the snapshot is reused for a moment instead of being
+    rebuilt for every caller. Same shape of fix /api/health already has.
     """
+    now = _time_rs.time()
+    cached = _SYNC_STATUS_CACHE.get("at", 0.0)
+    if cached and (now - cached) < _SYNC_STATUS_TTL_S:
+        return _SYNC_STATUS_CACHE["value"]
     snap = app_store.get_inspector_snapshot(preview_limit=0) or {}
     outbox = snap.get("sync_outbox_status") or {}
     data_sync = snap.get("data_sync") or {}
@@ -1403,7 +1597,7 @@ def get_sync_status() -> dict:
         v1_summary = telemetry_service.sync_summary() if hasattr(telemetry_service, "sync_summary") else {}
     except Exception:
         v1_summary = {}
-    return {
+    out = {
         "ok": True,
         "config_pending": int(outbox.get("pending") or 0),
         "config_failed": int(outbox.get("failed") or 0),
@@ -1431,6 +1625,9 @@ def get_sync_status() -> dict:
         "cloud_database_configured": bool(_cloud_database_configured()),
         "telemetry_v1": v1_summary,
     }
+    _SYNC_STATUS_CACHE["value"] = out
+    _SYNC_STATUS_CACHE["at"] = _time_rs.time()
+    return out
 
 
 def _cloud_database_configured() -> bool:

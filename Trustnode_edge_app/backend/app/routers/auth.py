@@ -189,6 +189,21 @@ def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _cp_row_usable_here(row: Any) -> bool:
+    """2026-11-02: a control-plane row under tenant `default` belongs to the
+    developer tenant - the portal's own users. On an edge activated into a
+    customer tenant it must never sign anyone in: that is how the seeded
+    admin/admin row opened customer edges with developer scope. On the
+    portal itself, which is not activated into a customer, `default` is
+    the master's tenant and stays usable."""
+    if not isinstance(row, dict):
+        return False
+    row_tenant = normalize_tenant_id(str(row.get("tenant_id") or "default"))
+    if row_tenant != "default":
+        return True
+    return normalize_tenant_id(get_current_tenant()) == "default"
+
+
 @router.post("/login")
 def login(payload: LoginRequest, request: Request, response: Response) -> Dict[str, Any]:
     """Operator 2026-06-18 — clean auth path.
@@ -247,7 +262,35 @@ def login(payload: LoginRequest, request: Request, response: Response) -> Dict[s
     # 1. Master-admin break-glass account. Works on every install, even
     #    a brand-new one where AuthStore is empty. ENV-overridable.
     master_user, master_pass = _master_admin_credentials()
-    if username == master_user and verify_password(password, master_pass):
+    # 2026-11-02, raised by the owner: "every customer might have their own
+    # admin and none of this can give them a master permission."
+    #
+    # The break-glass account defaults to admin/admin and this check sat
+    # BEFORE the real one, so it SHADOWED any customer whose administrator is
+    # called `admin` - which is the default name the product itself creates.
+    # Anyone at that machine could type admin/admin and be handed
+    # _FULL_PERMISSIONS and tenant_id "default", bypassing both the
+    # customer's password and their scope. Verified on a live edge:
+    #
+    #     admin / admin  ->  200  role=admin
+    #
+    # A real account now always wins. Break-glass exists for an edge with no
+    # usable accounts - a fresh install, or a store that lost its users - and
+    # that is the only case it still answers. It is not a master key to
+    # somebody else's edge.
+    _owner = None
+    try:
+        _owner = auth_store.get_user(username)
+    except Exception:
+        _owner = None
+    _name_is_taken = bool(_owner and str(_owner.get("password_hash") or "").strip())
+    if _name_is_taken and username == master_user:
+        try:
+            auth_store.record_login(username, ok=False, remote_ip=client_host,
+                                    detail="master_shadowed_by_real_account")
+        except Exception:
+            pass
+    if (not _name_is_taken) and username == master_user and verify_password(password, master_pass):
         # 2026-08-21: the break-glass account with its DEFAULT password never
         # works from the network — only from the edge desktop itself.
         _master_default = not bool(str(__import__("os").environ.get("TRUSTNODE_MASTER_ADMIN_PASSWORD", "") or "").strip())
@@ -319,6 +362,13 @@ def login(payload: LoginRequest, request: Request, response: Response) -> Dict[s
                 username=username,
                 password=password,
             )
+            if cp_any and not _cp_row_usable_here(cp_any):
+                try:
+                    auth_store.record_login(username, ok=False, remote_ip=client_host,
+                                            detail="default_tenant_row_refused_on_edge")
+                except Exception:
+                    pass
+                cp_any = None
             if cp_any:
                 hit = {
                     "username": cp_any.get("username"),
@@ -337,10 +387,22 @@ def login(payload: LoginRequest, request: Request, response: Response) -> Dict[s
     if not hit:
         try:
             tid = normalize_tenant_id(get_current_tenant())
-            cp_rows = control_plane_store.list_users(tenant_id=tid)
+            cp_rows = list(control_plane_store.list_users(tenant_id=tid) or [])
+            # 2026-11-02: the mirrored row may sit under another tenant. An
+            # edge activated before loopback stopped meaning `default`
+            # carries its admin under `default` AND under the customer
+            # (measured: cp_users had both). The NAME is what Supabase
+            # verifies; the role and tenant come from whichever row exists.
+            try:
+                for _other in control_plane_store.list_user_tenants(username=username):
+                    if _other != tid:
+                        cp_rows.extend(control_plane_store.list_users(tenant_id=_other) or [])
+            except Exception:
+                pass
             cp_local = next(
                 (u for u in (cp_rows or [])
-                 if str(u.get("username") or "").lower() == username.lower()),
+                 if str(u.get("username") or "").lower() == username.lower()
+                 and _cp_row_usable_here(u)),
                 None,
             )
             if cp_local and _verify_against_supabase_auth(username, password):

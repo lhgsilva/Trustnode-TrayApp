@@ -43,6 +43,8 @@ logger = logging.getLogger(__name__)
 _lan_lock = threading.Lock()
 # scheme -> {"server": uvicorn.Server, "thread": Thread, "loop": loop, "port": int}
 _listeners: Dict[str, Dict[str, Any]] = {}
+#: Result of the last firewall self-heal, for /lan-sharing/status.
+_firewall_state: Dict[str, Any] = {}
 _lan_last_error: str = ""
 _bind_host: str = "0.0.0.0"
 
@@ -143,8 +145,48 @@ def _serve_in_thread(scheme: str, host: str, port: int, ssl_cert: str = "", ssl_
     with _lan_lock:
         entry = _listeners.setdefault(scheme, {})
         entry.update(server=server, loop=loop, port=int(port), socket=sock)
+    async def _serve() -> None:
+        # 2026-10-27: raise THIS loop's thread limiter before serving.
+        #
+        # main.py raises the anyio default limiter from 40 to 200 in
+        # startup_event - but these servers run with lifespan="off" in their
+        # OWN event loops, and current_default_thread_limiter() is a RunVar:
+        # per loop, not per process. So every LAN listener was serving with
+        # 40 tokens while the UI it serves runs ~22 pollers, and FastAPI puts
+        # every sync route on that same pool.
+        #
+        # Reported from a LAN browser, and this is the whole of it:
+        #   "Database connections could not be saved: Timed out after 20s:
+        #    https://<host>:8443/api/app-store/domain"
+        # The write never got a thread. The identical call on loopback, where
+        # the limiter IS 200, returns immediately.
+        # Raised to 64, NOT to the main loop's 200.
+        #
+        # 2026-10-27, measured: setting these loops to 200 cost ~3 points of
+        # WebSocket delivery (97.0% -> 93.5%/94.5%, below the 95% gate) while
+        # the database still committed 100.3% of stamps. Collection and the
+        # historian were fine; the LIVE stream was losing events, because two
+        # extra loops each allowed 200 concurrent threads to compete with the
+        # collector for the same store.
+        #
+        # The main loop needs 200 because collection runs on it. These serve
+        # HTTP only: they need enough that a config save is never starved -
+        # the 40-token default is what produced the 20s timeout on
+        # /api/app-store/domain - and no more than that.
+        try:
+            import anyio
+            limiter = anyio.to_thread.current_default_thread_limiter()
+            if limiter.total_tokens < 64:
+                limiter.total_tokens = 64
+                logger.info("LAN %s: thread limiter raised to %d",
+                            scheme, limiter.total_tokens)
+        except Exception as exc:                     # noqa: BLE001
+            logger.warning("LAN %s: could not raise thread limiter: %r",
+                           scheme, exc)
+        await server.serve(sockets=[sock])
+
     try:
-        loop.run_until_complete(server.serve(sockets=[sock]))
+        loop.run_until_complete(_serve())
     except OSError as exc:
         _lan_last_error = f"{scheme} bind failed on port {port}: {exc.errno} {exc.strerror or exc}"
         logger.warning("LAN server %s", _lan_last_error)
@@ -163,6 +205,38 @@ def _serve_in_thread(scheme: str, host: str, port: int, ssl_cert: str = "", ssl_
         with _lan_lock:
             entry = _listeners.get(scheme) or {}
             entry.update(server=None, loop=None, socket=None)
+
+
+#: Remote access is OFF until the operator turns it on.
+#:
+#: 2026-10-27 this was flipped to True, asked for as "ideally the app should
+#: have 1 lan access as default for setup of the software remotely using the
+#: admin users login with full access". Every call site read
+#: bool(s.get("lan_sharing_enabled")), so an absent key had meant OFF.
+#:
+#: 2026-10-29 it is back to OFF, from a customer machine. `lan_sharing_enabled`
+#: is absent on every install that predates the flip - measured here, not one
+#: of the 12 settings documents in the live store carries it - so the change
+#: did not only affect new edges. It switched a dormant subsystem ON for every
+#: existing customer: two listeners, a certificate, and a firewall rule the
+#: machine cannot create without administrator rights ("firewall rule not in
+#: place: The requested operation requires elevation"). None of it was asked
+#: for by the site, and a customer must not be handed that on an upgrade.
+#:
+#: The capability is unchanged. An operator who switches remote access on gets
+#: exactly what the 10-27 request described; /enable and /disable write an
+#: explicit True or False and are respected either way. Only the meaning of
+#: the ABSENT key is restored to what it was when the app worked.
+LAN_SHARING_DEFAULT = False
+
+
+def sharing_enabled(settings: Optional[Dict[str, Any]]) -> bool:
+    """One reading of the setting, so the four call sites cannot disagree."""
+    s = settings or {}
+    value = s.get("lan_sharing_enabled", None)
+    if value is None:
+        return LAN_SHARING_DEFAULT
+    return bool(value)
 
 
 def _pick_port(candidates, primary_port: int, host: str) -> tuple[int, list]:
@@ -195,6 +269,7 @@ def _start_listener(scheme: str, host: str, port: int, ssl_cert: str = "", ssl_k
     return False
 
 
+
 def start(primary_port: int, app_settings: Optional[Dict[str, Any]] = None) -> dict:
     """Start the LAN listeners according to settings. Idempotent.
     Returns {ok, running, port, https_port, candidates_tried, note}."""
@@ -210,11 +285,34 @@ def start(primary_port: int, app_settings: Optional[Dict[str, Any]] = None) -> d
 
     # Operator 2026-06-18: self-heal the Windows Firewall rule BEFORE binding a
     # non-loopback address (program-scoped rule, private/domain profiles).
+    # 2026-10-27: the result used to be discarded. On the portable build
+    # this fails EVERY time with "The requested operation requires elevation
+    # (Run as administrator)", so the app listened on 0.0.0.0 while Windows
+    # dropped every packet from every other computer - and nothing recorded
+    # why. Keep it for the status to report, and for the Remote Access page
+    # to offer the one-click elevated fix.
+    global _firewall_state
     try:
         from app.services import windows_firewall as _fw
-        _fw.ensure_backend_rule()
-    except Exception:
-        pass
+        _firewall_state = _fw.ensure_backend_rule()
+        if not _firewall_state.get("ok"):
+            logger.warning("LAN: firewall rule not in place: %s",
+                           _firewall_state.get("reason"))
+    except Exception as exc:                        # noqa: BLE001
+        _firewall_state = {"ok": False, "reason": type(exc).__name__}
+
+    # The certificate must name the addresses this machine answers on TODAY.
+    # Written once at generation, it goes stale the moment a laptop joins
+    # WiFi - and a browser on that network then refuses the connection,
+    # which looks exactly like the port being blocked.
+    try:
+        from app.services import lan_tls as _tls
+        _cert_state = _tls.ensure_certificate_covers_lan()
+        if _cert_state.get("regenerated"):
+            logger.info("LAN TLS: certificate refreshed (%s)",
+                        _cert_state.get("reason"))
+    except Exception as exc:                        # noqa: BLE001
+        logger.warning("LAN TLS: certificate check failed: %r", exc)
 
     http_port = 0
     if http_enabled and not https_only:

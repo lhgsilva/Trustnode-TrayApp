@@ -22,7 +22,25 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-_lock = threading.Lock()
+#: RLock, not Lock. 2026-10-30: `current_port()` took this lock and then
+#: called `is_running()`, which takes it again - and a plain Lock is NOT
+#: reentrant, so the thread deadlocked against ITSELF while holding it.
+#: Every other caller then blocked for ever behind a lock whose owner could
+#: never finish: the Connections page's own status polls, and - fatally -
+#: the gateway's persist workers publishing tag values.
+#:
+#: Captured live with py-spy on the operator's machine:
+#:     Thread 20652  is_running(:43) <- current_port(:53) <- opcua_status
+#:     4x AnyIO workers blocked in is_running(:43)
+#:     2x tn-persist workers blocked in publish_tag(:293)
+#: Collection fell from its configured 1 s to 8.02 s per cycle, because the
+#: persist step waited the full 8 s timeout every single time, and the
+#: gateway reported last_error=None throughout.
+#:
+#: The nested call is removed below as well - the lock is reentrant now, but
+#: a function that holds a lock should not depend on that to survive. This
+#: is the same fix app_store.py made for the same reason on 2026-07-26.
+_lock = threading.RLock()
 _thread: Optional[threading.Thread] = None
 _loop: Optional[asyncio.AbstractEventLoop] = None
 _broker = None
@@ -44,7 +62,8 @@ def last_error() -> str:
 
 def current_port() -> int:
     with _lock:
-        return _current_port if is_running() else 0
+        alive = (_broker is not None and _thread is not None and _thread.is_alive())
+        return _current_port if alive else 0
 
 
 def _build_publishable_set(bootstrap: Dict[str, Any]) -> set[str]:

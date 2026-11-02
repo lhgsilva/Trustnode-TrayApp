@@ -161,6 +161,89 @@ def _machine() -> dict[str, Any]:
     }
 
 
+# 2026-10-31, asked for: "would it be possible to have the data here more
+# realistic, showing what each role is doing, for better diagnostics".
+#
+# Nine rows and seven of them said "desktop app". That is what stopped us
+# naming the process burning 74.6% of a core: every candidate had the same
+# label and the same image name. Electron tags every child it spawns on the
+# command line - the main process has no --type at all, everything else says
+# what it is - so the real role was recoverable the whole time.
+#
+# Cached per pid: a command line never changes, and reading it costs a
+# handle open per process per sample.
+_ROLE_CACHE: dict[int, str] = {}
+
+#: Sidecars and helpers that are ours but are not the shell or the backend.
+_ROLE_BY_IMAGE = {
+    "trustnodeopcua.exe": "OPC UA server (sidecar)",
+    "mosquitto.exe": "MQTT broker (sidecar)",
+    "conhost.exe": "console host (Windows)",
+}
+
+#: Chromium's own words for its child process types, in ours.
+_ELECTRON_TYPES = {
+    "renderer": "app window (UI)",
+    "gpu-process": "graphics / rendering",
+    "utility": "helper",
+    "crashpad-handler": "crash reporter",
+    "zygote": "process spawner",
+    "ppapi": "plugin host",
+}
+
+#: The utility children worth naming on their own - these are the ones that
+#: show up with real CPU when something is wrong.
+_UTILITY_SUBTYPES = {
+    "network.mojom.networkservice": "network service",
+    "storage.mojom.storageservice": "storage service",
+    "audio.mojom.audioservice": "audio service",
+    "video_capture.mojom.videocaptureservice": "video capture",
+}
+
+
+def _refine_role(proc: Any, base: str) -> str:
+    """A role that says what the process is actually for.
+
+    Falls back to `base` whenever the command line cannot be read - a role
+    guess is never worth an exception on a diagnostics page.
+    """
+    pid = getattr(proc, "pid", 0)
+    hit = _ROLE_CACHE.get(pid)
+    if hit:
+        return hit
+
+    role = base
+    try:
+        image = str(_safe(proc.name, "") or "").lower()
+    except Exception:
+        image = ""
+    if image in _ROLE_BY_IMAGE:
+        role = _ROLE_BY_IMAGE[image]
+        _ROLE_CACHE[pid] = role
+        return role
+
+    if base.startswith("desktop app"):
+        argv = _safe(proc.cmdline, []) or []
+        ptype, subtype = "", ""
+        for arg in argv:
+            a = str(arg)
+            if a.startswith("--type="):
+                ptype = a.split("=", 1)[1].strip().lower()
+            elif a.startswith("--utility-sub-type="):
+                subtype = a.split("=", 1)[1].strip().lower()
+        if not argv:
+            return base                      # unreadable: do not cache a guess
+        if not ptype:
+            role = "desktop app (main)"
+        elif ptype == "utility":
+            role = "desktop app - " + _UTILITY_SUBTYPES.get(subtype, "helper")
+        else:
+            role = "desktop app - " + _ELECTRON_TYPES.get(ptype, ptype)
+
+    _ROLE_CACHE[pid] = role
+    return role
+
+
 def _trustnode_processes() -> dict[str, Any]:
     """Our own footprint: this backend, its children, and the desktop shell."""
     if psutil is None:
@@ -204,12 +287,14 @@ def _trustnode_processes() -> dict[str, Any]:
     for pid in list(_PROCS):
         if pid not in wanted:
             _PROCS.pop(pid, None)
+            _ROLE_CACHE.pop(pid, None)
 
     rows: list[dict[str, Any]] = []
     total_cpu = 0.0
     total_rss = 0
     for pid, (proc, role) in wanted.items():
         handle = _PROCS.setdefault(pid, proc)
+        role = _refine_role(handle, role)
         try:
             cpu = float(handle.cpu_percent(interval=None) or 0.0)
             mem = handle.memory_info()

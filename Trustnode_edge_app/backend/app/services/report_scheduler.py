@@ -14,6 +14,8 @@ code path produces the same artifact whether invoked manually or by the timer.
 """
 from __future__ import annotations
 
+import time as _time_rs
+
 import base64
 import json
 import logging
@@ -97,6 +99,16 @@ def _resolve_report_columns(schedule: dict[str, Any], window, gateway: str = "")
         pattern = str(entry.get("pattern") or "").strip()
         if not label or not pattern:
             continue
+        # 2026-10-28, reported with a screenshot: the operator typed the tag
+        # itself - `SimREAL[3]` - and got that text back, because the token
+        # engine only resolves a name inside braces. Asking somebody to
+        # remember `{SimREAL[3]}` when the field is labelled "Value" and sits
+        # beside a tag name is a syntax tax, not a feature. A value with no
+        # token in it at all is read as the tag name it plainly is; anything
+        # containing a brace is left exactly as written, so a mixed pattern
+        # like "WO {Work_Order}" keeps working.
+        if "{" not in pattern:
+            pattern = "{%s}" % pattern.strip()
         try:
             text = resolve_text_tokens(pattern, started, ended, gateway, None)
             text = fill_run_tokens(text, started, ended)
@@ -272,12 +284,21 @@ class ReportRunner:
             # conditions, and is named from the identifier captured at the
             # start. Both are optional: without them this renders exactly as
             # before.
+            # 2026-10-31. Measured against a copy of a real 349 MB workspace,
+            # the slowest of ten templates renders in 3.49s - so a run that
+            # reports "Timed out after 60s" is not a slow render, and the
+            # time is going somewhere else. Each phase is timed and the slow
+            # one is named, because "the report took a minute" is not a
+            # finding; "the record write took 58s of it" is.
+            _t_render = _time_rs.perf_counter()
             path, byte_count, sha = self.render(
                 template, window=window, segments=segments,
                 file_name=_cycle_file_name(schedule, template, window, report_id))
+            _render_s = _time_rs.perf_counter() - _t_render
         except Exception as exc:
             return {"ok": False, "error": f"PDF render failed: {exc}"}
 
+        _t_store = _time_rs.perf_counter()
         record = self.store.insert_generated({
             "tenant_id": tenant_id,
             "template_id": template.get("id"),
@@ -307,6 +328,22 @@ class ReportRunner:
                 "columns": _resolve_report_columns(schedule, window),
             },
         })
+
+        _store_s = _time_rs.perf_counter() - _t_store
+        if (_render_s + _store_s) >= 5.0:
+            try:
+                _note = ("Report %r took %.1fs: %.1fs rendering, %.1fs writing "
+                         "the record. The slow part is %s."
+                         % (template.get("name"), _render_s + _store_s,
+                            _render_s, _store_s,
+                            "the render" if _render_s >= _store_s
+                            else "the database write"))
+                print("[trustnode][reports] " + _note, flush=True)
+                from app.state import app_store as _st
+                _st.append_log_rows([{"level": "warning", "category": "system",
+                                      "message": _note}])
+            except Exception:
+                pass
 
         result = {"ok": True, "generated": record}
 
@@ -515,9 +552,36 @@ class ReportScheduler:
             try:
                 self._tick()
             except Exception:
-                # Swallow per-tick errors; one bad schedule shouldn't kill the daemon.
-                pass
+                # One bad schedule must not kill the daemon - but 2026-10-30,
+                # asked: "the triggers created for schedule reports need to be
+                # reliable". A trigger that stops firing and says nothing is
+                # indistinguishable from one that was never configured, so the
+                # failure is recorded. Throttled: a schedule that fails every
+                # tick must not fill the log at 4 lines a minute.
+                self._note_failure("scheduler tick", "")
             self._stop_event.wait(self.tick_seconds)
+
+    #: When each distinct failure was last logged, so a permanently broken
+    #: schedule reports once a minute rather than on every tick.
+    _FAILURE_LOG_EVERY_S = 60.0
+
+    def _note_failure(self, what: str, which: str) -> None:
+        try:
+            key = "%s|%s" % (what, which)
+            now = time.time()
+            seen = getattr(self, "_failure_seen", None)
+            if seen is None:
+                seen = {}
+                self._failure_seen = seen
+            if now - float(seen.get(key, 0.0)) < self._FAILURE_LOG_EVERY_S:
+                return
+            seen[key] = now
+            logger.warning("report scheduler: %s failed%s - the trigger did "
+                           "not run this time", what,
+                           (" for %s" % which) if which else "",
+                           exc_info=True)
+        except Exception:
+            pass
 
     def _tick(self) -> None:
         now_utc = datetime.now(timezone.utc)
@@ -528,6 +592,10 @@ class ReportScheduler:
             try:
                 self._consider_schedule(schedule, now_utc)
             except Exception:
+                self._note_failure(
+                    "schedule",
+                    str((schedule or {}).get("name")
+                        or (schedule or {}).get("id") or "?"))
                 continue
 
     def _conditions_hit(self, conditions: list, logic: str, since: str,

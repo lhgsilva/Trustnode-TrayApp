@@ -24,7 +24,7 @@ import {
   getWidgetMeta,
   newWidgetId,
 } from "./widgetRegistry";
-import { compactWidgets, findFirstFreeSpot, normalizeWidgets, reflowWidgetsForMove, reflowWidgetsForMoveToPoint, reflowWidgetsForResize } from "./layoutUtils";
+import { compactWidgets, findFirstFreeSpot, normalizeWidgets, packWidgetsReadingOrder, previewDropRect, reflowWidgetsForMove, reflowWidgetsForMoveToPoint, reflowWidgetsForResize } from "./layoutUtils";
 import { formatSeriesValue, formatWidgetValue } from "./dashboardAnalytics";
 import { DASHBOARD_GRID_VIRTUAL_ROWS } from "./widgetRegistry";
 import { materializePowerDashboardPayload } from "./powerDashboardTemplate";
@@ -372,6 +372,8 @@ const TABLE_WHERE_OPERATORS = [
   { value: "gte", label: ">=" },
   { value: "between", label: "Between" },
 ];
+const CHART_TYPES_WITH_WINDOW = ["line_chart", "line_area_chart", "bar_chart", "stacked_trend"];
+
 const CHART_INTERPOLATION_OPTIONS = [
   { value: "stepAfter", label: "Step after" },
   { value: "linear", label: "Linear" },
@@ -945,6 +947,12 @@ export function DashboardDesigner({
   const [typeGroupOpen, setTypeGroupOpen] = useState({});
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState(buildDefaultForm("line_chart"));
+  // A trigger window IS a time range, so while one is configured the Time
+  // range preset has nothing left to decide and is disabled rather than left
+  // to look as though it still works.
+  const triggerWindowOn =
+    String(form?.config?.window_mode || "count") === "trigger"
+    && !!String(form?.config?.window_tag_name || "").trim();
   const [draggingId, setDraggingId] = useState("");
   const [menuWidgetId, setMenuWidgetId] = useState("");
   const [configModalOpen, setConfigModalOpen] = useState(false);
@@ -2230,10 +2238,83 @@ export function DashboardDesigner({
   // came from re-running the collision pass 60 times a second mid-drag.
   const dragHoverCellRef = useRef(null);
   const dragHoverTargetIdRef = useRef("");
+  // Where the drop would land, drawn as a placeholder. Set only when the
+  // target CELL changes, not on every dragover event - the refs above exist
+  // precisely because re-running the collision pass 60 times a second was
+  // too expensive.
+  const [dragPreview, setDragPreview] = useState(null);
+
+  // ---- layout history -------------------------------------------------
+  // 2026-10-30, requested: "implement undo (ctrl+Z) when it broke the layout
+  // and I can revert". A rearrangement that surprises you is only tolerable
+  // if it is one keystroke away from being undone.
+  //
+  // Positions only: this is a LAYOUT history, not a config history. Pushing
+  // whole widget objects would make Ctrl+Z silently revert a tag or a colour
+  // someone edited in between, which is a worse surprise than the one it is
+  // meant to fix.
+  const layoutHistoryRef = useRef([]);
+  const [canUndoLayout, setCanUndoLayout] = useState(false);
+
+  const rememberLayout = (list) => {
+    try {
+      const snapshot = (Array.isArray(list) ? list : []).map((w) => ({
+        id: String(w.id), x: Number(w.x) || 0, y: Number(w.y) || 0,
+        w: Number(w.w) || 1, h: Number(w.h) || 1,
+      }));
+      if (!snapshot.length) return;
+      const stack = layoutHistoryRef.current;
+      const last = stack[stack.length - 1];
+      if (last && JSON.stringify(last) === JSON.stringify(snapshot)) return;
+      stack.push(snapshot);
+      // Bounded: a long editing session must not grow without limit.
+      if (stack.length > 40) stack.shift();
+      setCanUndoLayout(stack.length > 0);
+    } catch (_) { /* history is a convenience, never a failure */ }
+  };
+
+  const undoLayout = () => {
+    const stack = layoutHistoryRef.current;
+    const previous = stack.pop();
+    setCanUndoLayout(stack.length > 0);
+    if (!previous) return;
+    setWidgets((prev) => {
+      const byId = new Map(previous.map((p) => [p.id, p]));
+      return normalizeWidgets(prev).map((w) => {
+        const p = byId.get(String(w.id));
+        return p ? { ...w, x: p.x, y: p.y, w: p.w, h: p.h } : w;
+      });
+    });
+  };
+
+  const tidyLayout = () => {
+    setWidgets((prev) => {
+      const base = normalizeWidgets(prev);
+      rememberLayout(base);
+      return packWidgetsReadingOrder(base);
+    });
+  };
+
+  useEffect(() => {
+    if (!canEdit) return undefined;
+    const onKey = (e) => {
+      const z = String(e.key || "").toLowerCase() === "z";
+      if (!z || !(e.ctrlKey || e.metaKey) || e.shiftKey) return;
+      // Never steal Ctrl+Z from a field the operator is typing in.
+      const t = e.target;
+      const tag = String(t?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select" || t?.isContentEditable) return;
+      e.preventDefault();
+      undoLayout();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
 
   const onDragStart = (id) => {
     dragHoverCellRef.current = null;
     dragHoverTargetIdRef.current = "";
+    setDragPreview(null);
     setDraggingId(id);
   };
 
@@ -2255,16 +2336,23 @@ export function DashboardDesigner({
     const targetId = dragHoverTargetIdRef.current;
     setWidgets((prev) => {
       const base = normalizeWidgets(prev);
+      rememberLayout(base);
+      // 2026-10-30: NOT wrapped in compactWidgets any more. The reflow now
+      // returns a finished layout that moved as little as possible; running
+      // a second top-down compaction over it threw the same widgets around
+      // again, which is the "it messes with what was already in place" the
+      // operator reported.
       if (cell) {
-        return compactWidgets(reflowWidgetsForMoveToPoint(base, draggedId, cell.x, cell.y));
+        return reflowWidgetsForMoveToPoint(base, draggedId, cell.x, cell.y);
       }
       if (targetId) {
-        return compactWidgets(reflowWidgetsForMove(base, draggedId, targetId));
+        return reflowWidgetsForMove(base, draggedId, targetId);
       }
       return base;
     });
     dragHoverCellRef.current = null;
     dragHoverTargetIdRef.current = "";
+    setDragPreview(null);
     setDraggingId("");
   };
 
@@ -2299,13 +2387,21 @@ export function DashboardDesigner({
     const y = clamp(
       Math.floor((e.clientY - m.rect.top + m.el.scrollTop) / Math.max(1, m.rowPitch)),
       0, DASHBOARD_GRID_VIRTUAL_ROWS - 1);
+    const prevCell = dragHoverCellRef.current;
     dragHoverCellRef.current = { x, y };
+    if (!prevCell || prevCell.x !== x || prevCell.y !== y) {
+      const rect = previewDropRect(widgets, draggingId, x, y);
+      setDragPreview(rect ? { ...rect, id: draggingId } : null);
+    }
   };
 
   const onResizeStart = (e, widget) => {
     if (!canEdit) return;
     e.preventDefault();
     e.stopPropagation();
+    // Once, here - a resize fires on every mousemove, and a history full of
+    // one-pixel steps is not an undo, it is a nuisance.
+    setWidgets((prev) => { rememberLayout(normalizeWidgets(prev)); return prev; });
     const gridEl = gridRef.current;
     if (!gridEl) return;
     const m0 = gridCellMetrics();
@@ -2490,6 +2586,29 @@ export function DashboardDesigner({
           >
             <CogIcon />
           </button>
+          {/* 2026-10-30: tidying is a BUTTON, not something the board does
+              to itself. The complaint was that rearranging "goes totally
+              wrong and is really hard to organize again" - so the operator
+              decides when everything snaps into reading order, and Undo is
+              right beside it. */}
+          <button
+            className="dashboard-toolbar-icon-btn"
+            onClick={tidyLayout}
+            disabled={!canEdit}
+            title="Tidy: pack every widget left to right, top to bottom"
+            aria-label="Tidy layout"
+          >
+            <span aria-hidden="true" style={{ fontSize: 15, lineHeight: 1 }}>▦</span>
+          </button>
+          <button
+            className="dashboard-toolbar-icon-btn"
+            onClick={undoLayout}
+            disabled={!canEdit || !canUndoLayout}
+            title="Undo the last layout change (Ctrl+Z)"
+            aria-label="Undo layout change"
+          >
+            <span aria-hidden="true" style={{ fontSize: 15, lineHeight: 1 }}>↶</span>
+          </button>
           {activeProfileName ? (
             <span className="dashboard-active-profile-chip" title={`Active profile: ${activeProfileName}`}>
               {activeProfileName}
@@ -2569,6 +2688,19 @@ export function DashboardDesigner({
           gridTemplateRows: `repeat(${gridRowsNeeded}, minmax(0, 1fr))`,
         }}
       >
+        {/* Where the drop will actually land. Drawn in the same grid cells
+            the widget will occupy, so "what would happen" is literally shown
+            rather than guessed at. Requested 2026-10-30. */}
+        {dragPreview ? (
+          <div
+            className="dashboard-drop-preview"
+            aria-hidden="true"
+            style={{
+              gridColumn: `${dragPreview.x + 1} / span ${dragPreview.w}`,
+              gridRow: `${dragPreview.y + 1} / span ${dragPreview.h}`,
+            }}
+          />
+        ) : null}
         {normalizedWidgets.map((widget) => (
           <article
             key={widget.id}
@@ -2676,7 +2808,7 @@ export function DashboardDesigner({
                         onDragStart(widget.id);
                         e.dataTransfer.effectAllowed = "move";
                       }}
-                      onDragEnd={() => setDraggingId("")}
+                      onDragEnd={() => { setDragPreview(null); setDraggingId(""); }}
                     >
                       <MoveCrossIcon />
                     </button>
@@ -2788,7 +2920,7 @@ export function DashboardDesigner({
                     onDragStart(widget.id);
                     e.dataTransfer.effectAllowed = "move";
                   }}
-                  onDragEnd={() => setDraggingId("")}
+                  onDragEnd={() => { setDragPreview(null); setDraggingId(""); }}
                 >
                   <MoveCrossIcon />
                 </button>
@@ -3345,6 +3477,10 @@ export function DashboardDesigner({
                     Time range
                     <select
                       value={form.config.query_time_filter_preset || "none"}
+                      disabled={triggerWindowOn}
+                      title={triggerWindowOn
+                        ? "The trigger window below decides the X axis while it is in use."
+                        : ""}
                       onChange={(e) =>
                         setForm((p) => ({
                           ...p,
@@ -3356,7 +3492,134 @@ export function DashboardDesigner({
                         <option key={opt.value} value={opt.value}>{opt.label}</option>
                       ))}
                     </select>
+                    {triggerWindowOn ? (
+                      <span className="muted" style={{ fontSize: 11 }}>
+                        The trigger window below is deciding this.
+                      </span>
+                    ) : null}
                   </label>
+                ) : null}
+
+                {/* 2026-10-30, requested: "a chart that restarts the X
+                    timestamp when a test starts and ends, so the chart only
+                    shows data in that window".
+                    This was first built in App.jsx's widget editor - a
+                    different, legacy editor - so it never appeared in THIS
+                    dialog, the one operators actually open. Same config keys,
+                    so a widget configured either way behaves identically. */}
+                {/* 2026-10-30: when a trigger window is set it decides the
+                    X axis, so "Time range" above has nothing left to do.
+                    Leaving it live was the 2026-10-17 lesson repeating -
+                    two controls writing the same thing, and the operator
+                    pressing the one that cannot work. */}
+                {CHART_TYPES_WITH_WINDOW.includes(form.type) ? (
+                  <label>
+                    Time window
+                    <select
+                      value={form.config.window_mode || "count"}
+                      onChange={(e) => setForm((p) => ({
+                        ...p, config: { ...p.config, window_mode: e.target.value } }))}
+                    >
+                      <option value="count">Last readings (rolling)</option>
+                      <option value="trigger">From a trigger (test / batch)</option>
+                    </select>
+                  </label>
+                ) : null}
+
+                {CHART_TYPES_WITH_WINDOW.includes(form.type)
+                  && String(form.config.window_mode || "count") === "trigger" ? (
+                  <>
+                    <label>
+                      Start when (gateway)
+                      <select
+                        value={form.config.window_gateway_id || ""}
+                        onChange={(e) => setForm((p) => ({
+                          ...p, config: { ...p.config, window_gateway_id: e.target.value,
+                                          window_tag_name: "", window_stop_tag: "" } }))}
+                      >
+                        <option value="">Any gateway</option>
+                        {gatewayOptions.map((g) => (
+                          <option key={g.id} value={g.id}>{g.name || g.id}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Start tag
+                      <select
+                        value={form.config.window_tag_name || ""}
+                        onChange={(e) => setForm((p) => ({
+                          ...p, config: { ...p.config, window_tag_name: e.target.value } }))}
+                      >
+                        <option value="">Pick a tag…</option>
+                        {(gatewayOptions.find((g) => String(g.id) === String(form.config.window_gateway_id || ""))?.tags || []).map((t) => (<option key={t} value={t}>{t}</option>))}
+                      </select>
+                    </label>
+                    <label>
+                      Starts when it is
+                      <select
+                        value={form.config.window_operator || "=="}
+                        onChange={(e) => setForm((p) => ({
+                          ...p, config: { ...p.config, window_operator: e.target.value } }))}
+                      >
+                        <option value="==">equal to</option>
+                        <option value="!=">not equal to</option>
+                        <option value=">">greater than</option>
+                        <option value=">=">at least</option>
+                        <option value="<">less than</option>
+                        <option value="<=">at most</option>
+                      </select>
+                    </label>
+                    <label>
+                      Value
+                      <input
+                        value={form.config.window_value ?? ""}
+                        placeholder="1"
+                        title="The chart restarts each time this becomes true."
+                        onChange={(e) => setForm((p) => ({
+                          ...p, config: { ...p.config, window_value: e.target.value } }))}
+                      />
+                    </label>
+                    <label>
+                      End tag (optional)
+                      <select
+                        value={form.config.window_stop_tag || ""}
+                        onChange={(e) => setForm((p) => ({
+                          ...p, config: { ...p.config, window_stop_tag: e.target.value } }))}
+                      >
+                        <option value="">Runs until the next start</option>
+                        <option value="__start_condition_ends__">
+                          When the start condition ends
+                        </option>
+                        {(gatewayOptions.find((g) => String(g.id) === String(form.config.window_gateway_id || ""))?.tags || []).map((t) => (<option key={t} value={t}>{t}</option>))}
+                      </select>
+                    </label>
+                    <label hidden={!form.config.window_stop_tag
+                      || form.config.window_stop_tag === "__start_condition_ends__"}>
+                      Ends when it is
+                      <select
+                        value={form.config.window_stop_operator || "=="}
+                        onChange={(e) => setForm((p) => ({
+                          ...p, config: { ...p.config, window_stop_operator: e.target.value } }))}
+                      >
+                        <option value="==">equal to</option>
+                        <option value="!=">not equal to</option>
+                        <option value=">">greater than</option>
+                        <option value=">=">at least</option>
+                        <option value="<">less than</option>
+                        <option value="<=">at most</option>
+                      </select>
+                    </label>
+                    <label hidden={!form.config.window_stop_tag
+                      || form.config.window_stop_tag === "__start_condition_ends__"}>
+                      End value
+                      <input
+                        value={form.config.window_stop_value ?? ""}
+                        placeholder="1"
+                        onChange={(e) => setForm((p) => ({
+                          ...p, config: { ...p.config, window_stop_value: e.target.value } }))}
+                      />
+                    </label>
+                  </>
                 ) : null}
 
                 {["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(form.type) ? (

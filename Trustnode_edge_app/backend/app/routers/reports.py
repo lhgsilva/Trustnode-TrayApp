@@ -27,6 +27,47 @@ from app.tenant import get_current_tenant
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
+# Background report runs: {job_id: {state, result|error, started}}.
+# Bounded, because a dict that only grows is a leak with a nicer name.
+import threading as _threading_rpt                          # noqa: E402
+import time as _time_rpt                                    # noqa: E402
+import uuid as _uuid_rpt                                    # noqa: E402
+
+_JOBS: dict[str, dict[str, Any]] = {}
+_JOBS_LOCK = _threading_rpt.Lock()
+_JOBS_KEEP = 40
+
+
+def _start_run_job(sch: dict, email_settings: Any) -> str:
+    job_id = _uuid_rpt.uuid4().hex[:12]
+    job = {"state": "running", "started": _time_rpt.time(),
+           "started_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")}
+
+    def _work():
+        try:
+            res = report_runner.run(sch, triggered_by="manual",
+                                    email_settings=email_settings)
+            if res.get("ok"):
+                job["result"] = {k: v for k, v in res.items() if k != "ok"}
+                job["state"] = "done"
+            else:
+                job["error"] = str(res.get("error") or "Run failed")
+                job["state"] = "error"
+        except Exception as exc:                            # noqa: BLE001
+            job["error"] = "%s: %s" % (type(exc).__name__, exc)
+            job["state"] = "error"
+
+    with _JOBS_LOCK:
+        _JOBS[job_id] = job
+        # Keep the most recent few; a run nobody collected is still worth
+        # seeing for a while, but not for ever.
+        if len(_JOBS) > _JOBS_KEEP:
+            for old in sorted(_JOBS, key=lambda k: _JOBS[k].get("started", 0))[:-_JOBS_KEEP]:
+                _JOBS.pop(old, None)
+    _threading_rpt.Thread(target=_work, name="tn-report-run-%s" % job_id,
+                          daemon=True).start()
+    return job_id
+
 
 def _username_from_request(request: Request) -> str:
     payload = getattr(request.state, "user_payload", None) or {}
@@ -260,10 +301,43 @@ def run_schedule_now(
                 ),
             )
 
+    # 2026-10-31. Rendering a report took the whole request with it: the
+    # browser held one of its SIX connections per origin for up to 60
+    # seconds, and anything else the page asked for in that window queued
+    # behind it and expired on its own 12-second timeout. The customer's log
+    # shows exactly that - "Run failed" and "templates, scheduled reports
+    # could not be loaded" landing in the SAME SECOND, with the heartbeat
+    # healthy either side of it. The edge was never slow; it was busy
+    # holding a socket.
+    #
+    # The run now happens on a worker thread and the request returns a job
+    # id straight away. The page polls a cheap endpoint instead of holding a
+    # connection open. The synchronous path is kept for the scheduler and
+    # anything else that calls run() directly.
+    if isinstance(payload, dict) and payload.get("background"):
+        job_id = _start_run_job(sch, email_settings)
+        return {"ok": True, "job_id": job_id, "state": "running"}
+
     result = report_runner.run(sch, triggered_by="manual", email_settings=email_settings)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Run failed")
     return {"ok": True, **{k: v for k, v in result.items() if k != "ok"}}
+
+
+@router.get("/jobs/{job_id}")
+def report_job(job_id: str) -> dict[str, Any]:
+    """How is that run going? Cheap on purpose - the page polls it."""
+    job = _JOBS.get(str(job_id or ""))
+    if not job:
+        raise HTTPException(status_code=404, detail="No such run")
+    out = {"ok": True, "job_id": job_id, "state": job.get("state"),
+           "started_utc": job.get("started_utc"),
+           "seconds": round(_time_rpt.time() - float(job.get("started", 0)), 1)}
+    if job.get("state") == "done":
+        out["result"] = job.get("result") or {}
+    if job.get("state") == "error":
+        out["error"] = str(job.get("error") or "Run failed")
+    return out
 
 
 # --------------------------------------------------------------------------- #

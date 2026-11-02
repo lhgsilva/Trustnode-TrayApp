@@ -134,6 +134,40 @@ def ensure_certificate(regenerate: bool = False) -> Optional[Dict[str, Any]]:
         return None
 
 
+def ensure_certificate_covers_lan(regenerate_if_stale: bool = True) -> Dict[str, Any]:
+    """Keep the certificate valid for every address this machine answers on.
+
+    2026-10-27, requested: remote access must work "to any computer locally
+    lan and wifi". The SANs are written once, at generation
+    (`if cert_p.exists() and key_p.exists() and not regenerate: return`), so
+    a machine that was on Ethernet when the pair was created and later joins
+    WiFi serves a certificate that does NOT name its new address. Every
+    browser on that network then refuses the connection outright, which is
+    indistinguishable from the port being blocked - and on a laptop or a
+    dual-homed plant PC it happens on the first day.
+
+    So the cert is checked against the CURRENT addresses on every start and
+    regenerated when one is missing. Regenerating is cheap and safe: it is
+    self-signed, nothing has pinned it, and the fingerprint shown on the
+    Remote Access page updates with it.
+    """
+    info = describe() or {}
+    have = {str(x).strip().lower() for x in (info.get("sans") or [])}
+    want = [ip for ip in _lan_ips() if ip]
+    missing = [ip for ip in want if ip.lower() not in have]
+    if not info:
+        ensure_certificate()
+        return {"regenerated": True, "reason": "no certificate", "added": want}
+    if missing and regenerate_if_stale:
+        logger.info("LAN TLS: certificate does not cover %s - regenerating",
+                    ", ".join(missing))
+        ensure_certificate(regenerate=True)
+        return {"regenerated": True, "reason": "addresses missing",
+                "added": missing}
+    return {"regenerated": False, "reason": "", "added": [],
+            "covers": sorted(have)}
+
+
 def describe() -> Optional[Dict[str, Any]]:
     paths = cert_paths()
     cert_p, key_p = paths["cert"], paths["key"]
