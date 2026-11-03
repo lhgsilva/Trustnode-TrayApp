@@ -8,6 +8,7 @@ import {
   getGeneratedReportPreviewData,
   regenerateGeneratedReport,
   listGeneratedReports,
+  getReportsOverview,
   getAppStoreBootstrap,
   saveAppStoreDomain,
   listReportTemplates,
@@ -16,6 +17,7 @@ import {
   saveScheduledReport,
   validateDirectoryPath,
 } from "../../api";
+import { readReportsCache, writeReportsCache, cacheAgeLabel } from "../../reportsCache.js";
 import { ReportHtmlPreview } from "../Dashboard/DashboardWidgets.jsx";
 
 // ---------------------------------------------------------------------------
@@ -527,6 +529,7 @@ function resolveLogoSrc() {
 }
 
 export function ScheduledReportsManager({
+  changeTick = 0,
   gatewayOptions = [],
   tagsByGateway = {},
   emailSettings = null,
@@ -540,9 +543,13 @@ export function ScheduledReportsManager({
 }) {
   const showSchedule = mode === "all" || mode === "schedule";
   const showGenerated = mode === "all" || mode === "generated";
-  const [templates, setTemplates] = useState([]);
-  const [schedules, setSchedules] = useState([]);
-  const [generated, setGenerated] = useState([]);
+  // 2026-11-03: the page opens with the last known lists on screen (memory
+  // for the session, localStorage across restarts) and refreshes behind.
+  const cacheAtMountRef = useRef(readReportsCache());
+  const [templates, setTemplates] = useState(() => cacheAtMountRef.current.templates);
+  const [schedules, setSchedules] = useState(() => cacheAtMountRef.current.schedules);
+  const [generated, setGenerated] = useState(() => cacheAtMountRef.current.generated);
+  const [listsAsOf, setListsAsOf] = useState(() => Number(cacheAtMountRef.current.updatedAt) || 0);
   const [draft, setDraft] = useState(emptySchedule());
 
   // Which field the token chips write into: whichever the operator last
@@ -620,7 +627,7 @@ export function ScheduledReportsManager({
   const [filterScheduleId, setFilterScheduleId] = useState("");
   // Live "any PLC gateway currently collecting?" flag. Refreshed alongside the
   // schedule list so the "Only when running" checkbox shows live state.
-  const [anyGatewayRunning, setAnyGatewayRunning] = useState(true);
+  const [anyGatewayRunning, setAnyGatewayRunning] = useState(() => cacheAtMountRef.current.anyGatewayRunning !== false);
   const logoSrc = useMemo(resolveLogoSrc, []);
 
   // Item 9 (2026-08-22): one dropped request used to raise a red banner and
@@ -664,29 +671,60 @@ export function ScheduledReportsManager({
     // Each part now stands or falls on its own. Whatever arrives is shown,
     // and only the parts that actually failed are reported. A module this
     // important must degrade one piece at a time, never all at once.
-    const [tplR, schR, genR, statusR] = await Promise.allSettled([
-      listReportTemplates(),
-      listScheduledReports(),
-      listGeneratedReports({ limit: 200 }),
-      getReportSchedulerStatus(),
-    ]);
+    //
+    // 2026-11-03: ONE request for everything the page shows. The four
+    // separate reads are kept only as the fallback for a backend without
+    // the overview route. On success the lists go to the shared cache, so
+    // the next visit opens with them; on failure the lists on screen stay.
     const failed = [];
-    if (tplR.status === "fulfilled") {
-      setTemplates(Array.isArray(tplR.value?.templates) ? tplR.value.templates : []);
-    } else { failed.push(["templates", tplR.reason]); }
-    if (schR.status === "fulfilled") {
-      setSchedules(Array.isArray(schR.value?.schedules) ? schR.value.schedules : []);
-    } else { failed.push(["scheduled reports", schR.reason]); }
-    if (genR.status === "fulfilled") {
-      setGenerated(Array.isArray(genR.value?.generated) ? genR.value.generated : []);
-    } else { failed.push(["generated reports", genR.reason]); }
-    // The scheduler status is informational; it never counted as a failure
-    // and still does not.
-    if (statusR.status === "fulfilled"
-        && typeof statusR.value?.any_gateway_running === "boolean") {
-      setAnyGatewayRunning(statusR.value.any_gateway_running);
+    let overview = null;
+    try {
+      overview = await getReportsOverview({ limit: 200 });
+    } catch (e) {
+      overview = null;
+      if (!/HTTP 404/.test(String(e?.message || e))) failed.push(["reports", e]);
     }
-
+    if (overview && overview.ok) {
+      const tpl = Array.isArray(overview.templates) ? overview.templates : [];
+      const sch = Array.isArray(overview.schedules) ? overview.schedules : [];
+      const gen = Array.isArray(overview.generated) ? overview.generated : [];
+      const running = typeof overview.scheduler?.any_gateway_running === "boolean"
+        ? overview.scheduler.any_gateway_running : true;
+      setTemplates(tpl); setSchedules(sch); setGenerated(gen); setAnyGatewayRunning(running);
+      const now = Date.now();
+      writeReportsCache({ templates: tpl, schedules: sch, generated: gen, anyGatewayRunning: running, updatedAt: now });
+      setListsAsOf(now);
+    } else if (!failed.length) {
+      const [tplR, schR, genR, statusR] = await Promise.allSettled([
+        listReportTemplates(),
+        listScheduledReports(),
+        listGeneratedReports({ limit: 200 }),
+        getReportSchedulerStatus(),
+      ]);
+      const next = {};
+      if (tplR.status === "fulfilled") {
+        next.templates = Array.isArray(tplR.value?.templates) ? tplR.value.templates : [];
+        setTemplates(next.templates);
+      } else { failed.push(["templates", tplR.reason]); }
+      if (schR.status === "fulfilled") {
+        next.schedules = Array.isArray(schR.value?.schedules) ? schR.value.schedules : [];
+        setSchedules(next.schedules);
+      } else { failed.push(["scheduled reports", schR.reason]); }
+      if (genR.status === "fulfilled") {
+        next.generated = Array.isArray(genR.value?.generated) ? genR.value.generated : [];
+        setGenerated(next.generated);
+      } else { failed.push(["generated reports", genR.reason]); }
+      if (statusR.status === "fulfilled"
+          && typeof statusR.value?.any_gateway_running === "boolean") {
+        next.anyGatewayRunning = statusR.value.any_gateway_running;
+        setAnyGatewayRunning(statusR.value.any_gateway_running);
+      }
+      if (!failed.length) {
+        const now = Date.now();
+        writeReportsCache({ ...next, updatedAt: now });
+        setListsAsOf(now);
+      }
+    }
     if (!failed.length) {
       failuresRef.current = 0;
       // 2026-10-31: take the banner back when the retry works. This page
@@ -722,12 +760,25 @@ export function ScheduledReportsManager({
 
   useEffect(() => {
     refresh();
-    const timer = setInterval(refresh, 15000);
+    // 2026-11-03: refresh on CHANGE (the stream's reports_changed event,
+    // below) and only once a minute as the safety net, not every 15 s.
+    const timer = setInterval(refresh, 60000);
     return () => {
       clearInterval(timer);
       if (retryRef.current) clearTimeout(retryRef.current);
     };
   }, []);
+  // The backend announces every template, schedule and generated-report
+  // write on the live stream; App turns it into changeTick. One second of
+  // debounce coalesces a burst (a run writes twice) into one read.
+  const changeTimerRef = useRef(null);
+  useEffect(() => {
+    if (!changeTick) return undefined;
+    if (changeTimerRef.current) clearTimeout(changeTimerRef.current);
+    changeTimerRef.current = setTimeout(() => { changeTimerRef.current = null; refresh(); }, 1000);
+    return () => { if (changeTimerRef.current) { clearTimeout(changeTimerRef.current); changeTimerRef.current = null; } };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [changeTick]);
 
   const tagListForGateway = (gatewayId) => {
     const raw = tagsByGateway?.[String(gatewayId || "")];
@@ -1027,9 +1078,12 @@ export function ScheduledReportsManager({
       {loadState.failures > 0 ? (
         <div className={`status ${loadState.failures >= 4 ? "error" : "warn"}`} style={{ marginBottom: 8 }}>
           {loadState.failures >= 4
-            ? `${loadState.what || "Reports"} not loading (${loadState.message}). `
-              + `Everything else on this page is current. Retrying every 15 seconds.`
-            : "Reconnecting to the reports service…"}
+            ? `${loadState.what || "Reports"} could not be refreshed (${loadState.message}). `
+              + (listsAsOf ? `Showing the lists as read ${cacheAgeLabel({ updatedAt: listsAsOf })}. ` : "")
+              + `Retrying every minute.`
+            : (listsAsOf
+              ? `Refreshing the lists (showing them as read ${cacheAgeLabel({ updatedAt: listsAsOf })})…`
+              : "Loading the reports lists…")}
         </div>
       ) : null}
       {showSchedule && (

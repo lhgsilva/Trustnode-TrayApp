@@ -10104,12 +10104,25 @@ class AppStore:
                 live.extend(self.bucket_raw_historian_rows(
                     bucket=bkt, from_utc=from_txt, to_utc=oldest_agg, gateway=gw_txt,
                     tag=tag_txt, limit=lim, source=source_txt))
-            if not to_txt or newest_agg >= to_txt:
+            # 2026-11-03: the newest rollup bucket is CLOSED and complete, so
+            # the live tail starts where it ENDS. It started where it began,
+            # so the raw re-bucketing of that same hour produced a partial
+            # row with the same timestamp - and live won the merge below, so
+            # a full hour was replaced by a partial one. Measured on a 3 h
+            # hour chart: one of three rollup hours served, none when a raw
+            # sample sat exactly on the older boundary. The rollup row now
+            # wins any tie as well.
+            try:
+                newest_end = (datetime.strptime(newest_agg[:19], "%Y-%m-%d %H:%M:%S")
+                              + timedelta(seconds=res_s)).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                newest_end = newest_agg
+            if not to_txt or newest_end >= to_txt:
                 if not live:
                     return out[:lim]
                 live_from = ""
             else:
-                live_from = max(from_txt, newest_agg) if from_txt else newest_agg
+                live_from = max(from_txt, newest_end) if from_txt else newest_end
         if live_from or not newest_agg:
             live.extend(self.bucket_raw_historian_rows(
                 bucket=bkt, from_utc=live_from, to_utc=to_txt, gateway=gw_txt,
@@ -10117,9 +10130,9 @@ class AppStore:
             ))
         if live:
             merged: dict[tuple, dict[str, Any]] = {}
-            for row in out:
-                merged[(row.get("ts"), row.get("gateway_id"), row.get("tag"))] = row
             for row in live:
+                merged[(row.get("ts"), row.get("gateway_id"), row.get("tag"))] = row
+            for row in out:
                 merged[(row.get("ts"), row.get("gateway_id"), row.get("tag"))] = row
             out = sorted(merged.values(), key=lambda r: str(r.get("ts") or ""),
                          reverse=True)[:lim]

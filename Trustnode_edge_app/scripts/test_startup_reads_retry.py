@@ -41,7 +41,10 @@ check("the abort records that it was a TIMEOUT",
       "timedOut = true" in fn,
       "otherwise the caller cannot tell a timeout from a cancelled request")
 check("a timed-out read is retried",
-      "__tnTimeoutRetry" in fn and "fetchWithTimeout(" in fn.split("catch", 1)[1],
+      # 2026-11-03: the retry calls the inner _fetchWithTimeoutNow so it does
+      # not re-enter the request gate while already holding a slot.
+      "__tnTimeoutRetry" in fn and ("fetchWithTimeout(" in fn.split("catch", 1)[1]
+                                    or "_fetchWithTimeoutNow(" in fn.split("catch", 1)[1]),
       "the first wave of boot reads had no second chance")
 check("  only idempotent requests",
       'method !== "GET"' in fn,

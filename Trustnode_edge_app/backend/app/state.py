@@ -293,6 +293,23 @@ def _scheduler_live_lookup(gateway_id: str, tag_name: str) -> float | None:
     tag = (tag_name or "").strip().lower()
     if not gw or not tag:
         return None
+    # 2026-11-03: one dictionary lookup under the cache's own lock. This
+    # went through get_live_rows (a 2000-row list built on every tick, and
+    # until today behind the historian writer's lock), so a held writer
+    # stalled trigger evaluation 9-10 s. The cache is what the live view
+    # shows; the store is only consulted when the cache has nothing.
+    try:
+        tenant = str(app_store._current_tenant_id() or "")
+        with app_store._live_cache_lock:
+            items = list(app_store._local_live_latest_cache.items())
+        for (tnt, cache_gw, cache_tag), v in items:
+            if tnt == tenant and cache_gw == gw and str(cache_tag or "").strip().lower() == tag:
+                try:
+                    return float(v.get("value"))
+                except Exception:
+                    return None
+    except Exception:
+        pass
     try:
         rows = app_store.get_live_rows(limit=2000, prefer_cloud_reads=False)
     except Exception:

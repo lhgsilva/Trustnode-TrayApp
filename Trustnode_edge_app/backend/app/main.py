@@ -265,6 +265,24 @@ async def _store_busy_to_503(request, exc):  # noqa: ANN001
     return _JR(status_code=503, content={"detail": str(exc)})
 
 
+# And the raw form of the same thing from any store that is not app_store
+# (the reports store, the control plane): "database is locked" is the edge
+# being busy, not broken - say so, as a 503, not a 500.
+import sqlite3 as _sqlite3_mod  # noqa: E402
+
+
+@app.exception_handler(_sqlite3_mod.OperationalError)
+async def _sqlite_busy_to_503(request, exc):  # noqa: ANN001
+    from fastapi.responses import JSONResponse as _JR
+    low = str(exc).lower()
+    if "locked" in low or "busy" in low:
+        return _JR(status_code=503, content={"detail": (
+            "The edge's store is busy - another task has been holding its writer. "
+            "Nothing was changed; try again in a moment. If it keeps happening, the "
+            "backend.log lines tagged [trustnode][lock-watchdog] name the task holding it.")})
+    return _JR(status_code=500, content={"detail": f"Database error: {exc}"})
+
+
 # Operator 2026-06-30: TrustNode Intelligence module — bolt-on under
 # <repo>/trustnode_intelligence/. LICENSE-gated: every route depends on
 # require_intelligence_license(), which 404s when the customer's license

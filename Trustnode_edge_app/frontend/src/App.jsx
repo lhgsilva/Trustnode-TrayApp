@@ -3968,6 +3968,7 @@ function AppShell() {
   const [cloudNewestTsMs, setCloudNewestTsMs] = useState(0);
   const [bootState, setBootState] = useState("initializing");
   const [endpointMode, setEndpointMode] = useState("local");
+  const [reportsChangeTick, setReportsChangeTick] = useState(0);
   const [cloudUrl, setCloudUrl] = useState("");
   const [selectedCloudEdgeKey, setSelectedCloudEdgeKey] = useState(CLOUD_EDGE_ALL_KEY);
   const cloudEdgeApiFilter = useMemo(() => {
@@ -8964,6 +8965,9 @@ function AppShell() {
         }
         try {
           if (data.status) setStatus(data.status);
+          // 2026-11-03: the reports store announces every write; the open
+          // Reports page refreshes on it instead of polling.
+          if (data.type === "reports_changed") setReportsChangeTick((t) => t + 1);
           if (data.type === "error") {
             const gatewayId = String(data.gateway_id || "");
             const gateway = gatewayConfigsRef.current.find((g) => g.id === gatewayId) || null;
@@ -27296,6 +27300,7 @@ const getGatewayHealth = (gateway) => {
           {activePage === "generated_reports" ? (
             <div className="page-fill single">
               <ScheduledReportsManager
+                changeTick={reportsChangeTick}
                 mode="generated"
                 emailSettings={buildEmailTransportPayload(emailSettings || {})}
                 onNotify={(n) => {
@@ -27324,6 +27329,7 @@ const getGatewayHealth = (gateway) => {
           {activePage === "scheduled_reports" ? (
             <>
               <ScheduledReportsManager
+                changeTick={reportsChangeTick}
                 mode="schedule"
                 gatewayOptions={allGatewayOptions || []}
                 tagsByGateway={triggerTagsByGateway || {}}

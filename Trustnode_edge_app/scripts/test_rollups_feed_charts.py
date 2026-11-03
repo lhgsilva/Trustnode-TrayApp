@@ -124,7 +124,11 @@ def main() -> int:
           "the uncovered tail must come from raw")
     keys = [(r.get("ts"), r.get("gateway_id"), r.get("tag")) for r in after]
     check("  with no bucket served twice", len(keys) == len(set(keys)))
-    sample = next((r for r in from_rollup if r.get("tag") == "Flow"), {})
+    # 2026-11-03: a bucket from the MIDDLE of the window. The newest minute
+    # is the one the data stops in (partial by construction) and the oldest
+    # starts mid-minute; the old merge hid the newest behind a raw copy.
+    _flow = sorted((r for r in from_rollup if r.get("tag") == "Flow"), key=lambda r: str(r.get("ts") or ""))
+    sample = _flow[len(_flow) // 2] if _flow else {}
     check("  rows carry the gateway's display names", sample.get("gateway_name") == "PLC"
           and sample.get("database_name") == "db", repr(sample)[:160])
     check("  value is the bucket average with min/max and sample count",
@@ -139,6 +143,20 @@ def main() -> int:
     hours = app_store.get_historian_agg_rows(bucket="hour", from_utc=from_utc, to_utc=to_utc)
     check("an hour chart reads the hour tier", any(r.get("source") == "historian_rollup" for r in hours),
           "%d rows" % len(hours))
+    # 2026-11-03: EVERY closed hour the rollup holds inside the window is
+    # served from the rollup. The live tail used to start at the newest
+    # bucket's START and the raw copy won the merge, so a full hour was
+    # replaced by a partial one - one of three served, none when a raw
+    # sample sat on the older boundary (the flake this test had).
+    con = sqlite3.connect(os.environ["TRUSTNODE_APP_STORE_PATH"])
+    from_ms = int(time.mktime(time.strptime(from_utc[:19], "%Y-%m-%d %H:%M:%S")) - time.timezone) * 1000
+    n_hour_in_window = con.execute(
+        "SELECT COUNT(*) FROM historian_rollup WHERE resolution_s=3600 AND bucket_ms >= ?", (from_ms,)).fetchone()[0]
+    con.close()
+    served = sum(1 for r in hours if r.get("source") == "historian_rollup")
+    check("  every closed hour inside the window comes from the rollup, none replaced by raw",
+          n_hour_in_window > 0 and served == n_hour_in_window,
+          "rollup holds %d hour rows in the window, chart served %d from it" % (n_hour_in_window, served))
 
     # A second pass is idempotent and does not re-roll what is done.
     again = retention_engine.run_once(reason="test", force=True)

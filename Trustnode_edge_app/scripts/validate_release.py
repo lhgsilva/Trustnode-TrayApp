@@ -392,6 +392,13 @@ SOURCE_CHECKS = [
     # write routes had no bound. Each is a few lines; these keep them.
     ("the collection cycle never waits for the store", "test_collection_never_waits_on_store.py"),
     ("background writers yield", "test_background_writers_yield.py"),
+    # 2026-11-03, asked for directly: the Reports module never fails to load
+    # and nobody waits on a page. One overview read on a read-only handle,
+    # a cached page that renders at once, refresh on the stream's change
+    # event, writes refused with a 503 instead of hanging, triggers reading
+    # the latest-value cache, and one request gate for every background read.
+    ("the Reports module never fails to load", "test_reports_pages_never_wait.py"),
+    ("the Reports pages open with content, no page starves another", "test_reports_ui_never_waits.py"),
     # 2026-10-30, asked for directly: "every new installer can be installed
     # in existing computer with all fixes and updates". Boots the PACKAGED
     # backend on a copy of a real workspace with NO data-dir override - the

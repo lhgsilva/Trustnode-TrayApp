@@ -86,6 +86,37 @@ def list_templates() -> dict[str, Any]:
     }
 
 
+@router.get("/overview")
+def reports_overview(limit: int = Query(default=200, ge=1, le=2000)) -> dict[str, Any]:
+    """Everything the Reports pages show, in ONE read.
+
+    2026-11-03: the pages fired four requests on every mount and every 15 s.
+    The browser gives the edge six connections, so on a busy page the
+    fourth read could expire client-side with nothing wrong here. One read,
+    on one read-only handle, is one socket and one place to measure."""
+    settings = None
+    try:
+        settings = scheduler_email_settings_holder.get()
+    except Exception:
+        settings = None
+    from app.state import _is_any_gateway_running
+    try:
+        any_running = bool(_is_any_gateway_running())
+    except Exception:
+        any_running = False
+    return {
+        "ok": True,
+        "tenant_id": get_current_tenant(),
+        "templates": reports_store.list_templates(),
+        "schedules": reports_store.list_schedules(),
+        "generated": reports_store.list_generated(limit=limit),
+        "scheduler": {
+            "email_transport_configured": bool(settings),
+            "any_gateway_running": any_running,
+        },
+    }
+
+
 @router.get("/templates/{template_id}")
 def get_template(template_id: str) -> dict[str, Any]:
     tpl = reports_store.get_template(template_id)

@@ -1,3 +1,4 @@
+import * as _gate from "./requestGate.js";
 const STORAGE_MODE_KEY = "trustnode_backend_mode";
 const STORAGE_CLOUD_URL_KEY = "trustnode_backend_cloud_url";
 const AUTH_TOKEN_KEY = "trustnode_auth_token";
@@ -419,7 +420,9 @@ export function scheduleSessionRefresh() {
 /* A sleeping machine does not run timers. Coming back to the tab is the one
    moment we know time has passed, so check the token then too. */
 if (typeof document !== "undefined" && typeof window !== "undefined") {
+  try { _gate.setHidden(document.visibilityState !== "visible"); } catch (_) { /* no DOM */ }
   document.addEventListener("visibilitychange", () => {
+    try { _gate.setHidden(document.visibilityState !== "visible"); } catch (_) { /* no DOM */ }
     if (document.visibilityState !== "visible" || _sessionExpired) return;
     const expMs = _tokenExpiryMs(localStorage.getItem(AUTH_TOKEN_KEY) || "");
     if (expMs && expMs - Date.now() < 10 * 60_000) refreshSession();
@@ -459,6 +462,19 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
     err.sessionExpired = true;
     throw err;
   }
+  // 2026-11-03: reads pass through one gate (requestGate.js) so a busy page
+  // cannot occupy every socket the browser gives the edge; writes never
+  // queue behind a poll. The timeout starts when the request is SENT.
+  const _method = String((options || {}).method || "GET").toUpperCase();
+  const _release = (_method === "GET" && !options.__tnNoGate) ? await _gate.acquire() : null;
+  try {
+    return await _fetchWithTimeoutNow(url, options, timeoutMs);
+  } finally {
+    if (_release) _release();
+  }
+}
+
+async function _fetchWithTimeoutNow(url, options = {}, timeoutMs = 12000) {
   const controller = new AbortController();
   // Remember WHY we aborted. Without this the caller sees the browser's raw
   // "signal is aborted without reason", which told an operator nothing: the
@@ -498,8 +514,8 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
     if (res.status === 401 && token && !options.__tnRetry) {
       const renewed = await refreshSession();
       if (renewed) {
-        return await fetchWithTimeout(url, { ...options, __tnRetry: true },
-                                      timeoutMs);
+        return await _fetchWithTimeoutNow(url, { ...options, __tnRetry: true },
+                                          timeoutMs);
       }
     }
     return res;
@@ -591,7 +607,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
     if (method !== "GET" || options.__tnTimeoutRetry) {
       throw new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s: ${url}`);
     }
-    return await fetchWithTimeout(
+    return await _fetchWithTimeoutNow(
       url, { ...options, __tnTimeoutRetry: true }, Math.round(timeoutMs * 2));
   } finally {
     clearTimeout(timeout);
@@ -3933,6 +3949,15 @@ export async function provisionControlPlaneCustomerBundle(payload) {
 // ---------------------------------------------------------------------------
 function _reportApiBase() {
   return getAppStoreApiBase();
+}
+
+// 2026-11-03: the Reports pages read everything they show in ONE request.
+export async function getReportsOverview({ limit = 200 } = {}) {
+  const res = await fetchWithTimeout(withNoCache(`${_reportApiBase()}/api/reports/overview?limit=${encodeURIComponent(String(limit))}`), {
+    headers: { "Cache-Control": "no-store, no-cache, max-age=0" },
+  });
+  await ensureOk(res, "Reports overview failed");
+  return res.json();
 }
 
 export async function listReportTemplates() {

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -64,6 +65,47 @@ def _resolve_reports_dir() -> Path:
     return out
 
 
+class _TimedWriteLock:
+    """The reports store's write lock, with a bound and an announcement.
+
+    2026-11-03. Bound: a writer that cannot get the lock in WRITE_LOCK_WAIT_S
+    raises StoreBusy (an OperationalError, mapped to 503 by the API) instead
+    of queuing without limit on a request thread. Announcement: a block that
+    completes without an exception publishes `reports_changed` on the live
+    stream, so the Reports pages refresh when something changed rather than
+    polling every 15 s. Every template, schedule and generated-report write
+    goes through this lock, so nothing is missed and nothing is listed twice.
+    """
+    WRITE_LOCK_WAIT_S = 6.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def __enter__(self):
+        if not self._lock.acquire(timeout=self.WRITE_LOCK_WAIT_S):
+            from app.services.app_store import StoreBusy
+            raise StoreBusy(
+                "the reports store is busy - another task has been holding its writer. "
+                "Nothing was changed; try again in a moment. If it keeps happening, the "
+                "backend.log lines tagged [trustnode][lock-watchdog] name the task holding it.")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._lock.release()
+        if exc_type is None:
+            _announce_reports_changed()
+        return False
+
+
+def _announce_reports_changed() -> None:
+    """Tell every open UI that the report lists changed. Best effort."""
+    try:
+        from app.state import plc_manager
+        plc_manager.fanout_threadsafe({"type": "reports_changed", "at": time.time()})
+    except Exception:
+        pass
+
+
 class ReportsStore:
     """CRUD for templates, schedules, and generated report records.
 
@@ -89,7 +131,7 @@ class ReportsStore:
         # the `reports_dir` property. Same pattern PowerManager uses.
         self.db_path = _resolve_db_path()
         self._reports_dir: Path | None = None
-        self._write_lock = threading.Lock()
+        self._write_lock = _TimedWriteLock()
 
     @property
     def reports_dir(self) -> Path:
@@ -114,7 +156,10 @@ class ReportsStore:
 
     # --- connection ---
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+        # 2026-11-03: 4 s, not 10. A write that cannot get SQLite's lock in
+        # that time is refused with the reason (main.py maps a locked
+        # database to 503) rather than holding a request thread.
+        conn = sqlite3.connect(str(self.db_path), timeout=4.0)
         conn.row_factory = sqlite3.Row
         return conn
 
