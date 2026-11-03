@@ -288,6 +288,11 @@ class AppStore:
         self._live_fast_last_local_id = 0
         self._live_fast_pending_latest: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._local_live_latest_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+        # 2026-11-03: the cache has its OWN lock. It used to share _hist_lock
+        # with the historian writer, which holds that lock across its SQLite
+        # wait (up to 10 s when something else holds the write lock) - so the
+        # live view and the WebSocket read queued behind a blocked persist.
+        self._live_cache_lock = threading.Lock()
         self._data_sync_tick = 0
         # IMPORTANT: cache MUST be keyed by tenant_id. Previously it was a
         # single shared list, so the cloud cache loop populated it under
@@ -545,13 +550,13 @@ class AppStore:
         Used by stabilisers that need to compare new-vs-old shape before
         committing a write."""
         try:
-            with self._lock:
-                with self._connect() as conn:
-                    row = conn.execute(
-                        "SELECT payload_json FROM config_documents_scoped "
-                        "WHERE scope_key = ? AND domain = ?",
-                        (str(scope_key or ""), str(domain or "")),
-                    ).fetchone()
+            # 2026-11-03: a READ. It used to take the store's global lock, so it waited behind every write - and a write waits up to 10 s for SQLite. Reads run on the read-only handle and never wait for a writer (WAL).
+            with self._connect_readonly() as conn:
+                row = conn.execute(
+                    "SELECT payload_json FROM config_documents_scoped "
+                    "WHERE scope_key = ? AND domain = ?",
+                    (str(scope_key or ""), str(domain or "")),
+                ).fetchone()
             if not row:
                 return None
             return json.loads(str(row["payload_json"] or "null"))
@@ -949,12 +954,12 @@ class AppStore:
         name = str(domain or "").strip()
         if not name:
             return {} if default is None else default
-        with self._lock:
-            with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT payload_json FROM config_documents WHERE domain = ?",
-                    (name,),
-                ).fetchone()
+        # 2026-11-03: a READ. It used to take the store's global lock, so it waited behind every write - and a write waits up to 10 s for SQLite. Reads run on the read-only handle and never wait for a writer (WAL).
+        with self._connect_readonly() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM config_documents WHERE domain = ?",
+                (name,),
+            ).fetchone()
         if not row:
             return {} if default is None else default
         try:
@@ -2319,36 +2324,36 @@ class AppStore:
             return tenant_ok and customer_ok
 
         payloads: list[list] = []
-        with self._lock:
-            with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT payload_json FROM config_documents WHERE domain = ?",
-                    ("database_configurations",),
-                ).fetchone()
-                if row:
-                    try:
-                        p = json.loads(str(row["payload_json"] or "[]"))
-                        if isinstance(p, list):
-                            payloads.append(p)
-                    except Exception:
-                        pass
+        # 2026-11-03: a READ. It used to take the store's global lock, so it waited behind every write - and a write waits up to 10 s for SQLite. Reads run on the read-only handle and never wait for a writer (WAL).
+        with self._connect_readonly() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM config_documents WHERE domain = ?",
+                ("database_configurations",),
+            ).fetchone()
+            if row:
                 try:
-                    scoped_rows = conn.execute(
-                        "SELECT scope_key, payload_json, updated_utc FROM config_documents_scoped WHERE domain = ? ORDER BY updated_utc DESC",
-                        ("database_configurations",),
-                    ).fetchall()
+                    p = json.loads(str(row["payload_json"] or "[]"))
+                    if isinstance(p, list):
+                        payloads.append(p)
                 except Exception:
-                    scoped_rows = []
-                for srow in scoped_rows:
-                    sk = str(srow["scope_key"] or "")
-                    if not _scope_matches_active(sk):
-                        continue
-                    try:
-                        p = json.loads(str(srow["payload_json"] or "[]"))
-                        if isinstance(p, list):
-                            payloads.append(p)
-                    except Exception:
-                        continue
+                    pass
+            try:
+                scoped_rows = conn.execute(
+                    "SELECT scope_key, payload_json, updated_utc FROM config_documents_scoped WHERE domain = ? ORDER BY updated_utc DESC",
+                    ("database_configurations",),
+                ).fetchall()
+            except Exception:
+                scoped_rows = []
+            for srow in scoped_rows:
+                sk = str(srow["scope_key"] or "")
+                if not _scope_matches_active(sk):
+                    continue
+                try:
+                    p = json.loads(str(srow["payload_json"] or "[]"))
+                    if isinstance(p, list):
+                        payloads.append(p)
+                except Exception:
+                    continue
         if not payloads:
             # Cloud deployment path: no UI ever wrote a DB config row to the
             # local SQLite. Fall back to env vars before giving up.
@@ -6559,9 +6564,9 @@ class AppStore:
             except Exception:
                 pass
         out: Dict[str, Any] = {}
-        with self._lock:
-            with self._connect() as conn:
-                rows = conn.execute("SELECT domain, payload_json FROM config_documents").fetchall()
+        # 2026-11-03: a READ. It used to take the store's global lock, so it waited behind every write - and a write waits up to 10 s for SQLite. Reads run on the read-only handle and never wait for a writer (WAL).
+        with self._connect_readonly() as conn:
+            rows = conn.execute("SELECT domain, payload_json FROM config_documents").fetchall()
         # 2026-08-21: parse OUTSIDE the lock — json.loads of every document
         # (dashboards etc.) is the expensive part; the lock only guards the read.
         for row in rows:
@@ -6576,9 +6581,9 @@ class AppStore:
                 self._pull_config_from_cloud_once()
             except Exception:
                 pass
-            with self._lock:
-                with self._connect() as conn:
-                    rows = conn.execute("SELECT domain, payload_json FROM config_documents").fetchall()
+            # 2026-11-03: a READ. It used to take the store's global lock, so it waited behind every write - and a write waits up to 10 s for SQLite. Reads run on the read-only handle and never wait for a writer (WAL).
+            with self._connect_readonly() as conn:
+                rows = conn.execute("SELECT domain, payload_json FROM config_documents").fetchall()
             # 2026-08-21: parse OUTSIDE the lock — json.loads of every document
             # (dashboards etc.) is the expensive part; the lock only guards the read.
             for row in rows:
@@ -7535,123 +7540,123 @@ class AppStore:
             "logs_backlog": 0,
         }
 
-        with self._lock:
-            with self._connect() as conn:
-                table_rows = conn.execute(
-                    """
-                    SELECT name
-                    FROM sqlite_master
-                    WHERE type='table' AND name NOT LIKE 'sqlite_%'
-                    ORDER BY name
-                    """
-                ).fetchall()
-                for r in table_rows:
-                    table_name = str(r["name"])
-                    row_count = 0
-                    try:
-                        row = conn.execute(f'SELECT COUNT(*) AS c FROM "{table_name}"').fetchone()
-                        row_count = int(row["c"] if row else 0)
-                    except Exception:
-                        row_count = -1
-                    tables.append({"name": table_name, "rows": row_count})
-                    if table_name == "historian_readings":
-                        data_sync["local_historian_rows"] = max(0, row_count)
-                    if table_name == "app_logs":
-                        data_sync["local_log_rows"] = max(0, row_count)
+        # 2026-11-03: a READ. It used to take the store's global lock, so it waited behind every write - and a write waits up to 10 s for SQLite. Reads run on the read-only handle and never wait for a writer (WAL).
+        with self._connect_readonly() as conn:
+            table_rows = conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+                """
+            ).fetchall()
+            for r in table_rows:
+                table_name = str(r["name"])
+                row_count = 0
+                try:
+                    row = conn.execute(f'SELECT COUNT(*) AS c FROM "{table_name}"').fetchone()
+                    row_count = int(row["c"] if row else 0)
+                except Exception:
+                    row_count = -1
+                tables.append({"name": table_name, "rows": row_count})
+                if table_name == "historian_readings":
+                    data_sync["local_historian_rows"] = max(0, row_count)
+                if table_name == "app_logs":
+                    data_sync["local_log_rows"] = max(0, row_count)
 
-                domain_rows = conn.execute(
-                    """
-                    SELECT domain, version, updated_utc
-                    FROM config_documents
-                    ORDER BY updated_utc DESC
-                    LIMIT ?
-                    """,
-                    (lim,),
-                ).fetchall()
-                for r in domain_rows:
-                    domains.append(
-                        {
-                            "domain": str(r["domain"] or ""),
-                            "version": int(r["version"] or 0),
-                            "updated_utc": str(r["updated_utc"] or ""),
-                        }
-                    )
-
-                status_rows = conn.execute(
-                    "SELECT status, COUNT(*) AS c FROM sync_outbox GROUP BY status"
-                ).fetchall()
-                for r in status_rows:
-                    status = str(r["status"] or "").lower()
-                    count = int(r["c"] or 0)
-                    if status in outbox_status:
-                        outbox_status[status] = count
-                    else:
-                        outbox_status["other"] += count
-
-                sync_row = conn.execute(
-                    """
-                    SELECT id, name, target_type, enabled, last_sync_utc, last_error, updated_utc, config_json
-                    FROM sync_targets
-                    WHERE id = 'auto_cloud_config'
-                    """
-                ).fetchone()
-                if sync_row:
-                    cfg_raw = str(sync_row["config_json"] or "{}")
-                    try:
-                        cfg = json.loads(cfg_raw)
-                    except Exception:
-                        cfg = {}
-                    sync_target = {
-                        "id": str(sync_row["id"] or ""),
-                        "name": str(sync_row["name"] or ""),
-                        "target_type": str(sync_row["target_type"] or ""),
-                        "enabled": bool(sync_row["enabled"]),
-                        "last_sync_utc": str(sync_row["last_sync_utc"] or ""),
-                        "last_error": str(sync_row["last_error"] or ""),
-                        "updated_utc": str(sync_row["updated_utc"] or ""),
-                        "config": cfg,
+            domain_rows = conn.execute(
+                """
+                SELECT domain, version, updated_utc
+                FROM config_documents
+                ORDER BY updated_utc DESC
+                LIMIT ?
+                """,
+                (lim,),
+            ).fetchall()
+            for r in domain_rows:
+                domains.append(
+                    {
+                        "domain": str(r["domain"] or ""),
+                        "version": int(r["version"] or 0),
+                        "updated_utc": str(r["updated_utc"] or ""),
                     }
-                ds_row = conn.execute(
-                    """
-                    SELECT last_historian_id, last_log_id, last_data_sync_utc, last_data_error, total_historian_synced, total_logs_synced
-                    FROM data_sync_state
-                    WHERE id = 1
-                    """
-                ).fetchone()
-                if ds_row:
-                    data_sync.update(
-                        {
-                            "last_historian_id": int(ds_row["last_historian_id"] or 0),
-                            "last_log_id": int(ds_row["last_log_id"] or 0),
-                            "last_data_sync_utc": str(ds_row["last_data_sync_utc"] or ""),
-                            "last_data_error": str(ds_row["last_data_error"] or ""),
-                            "total_historian_synced": int(ds_row["total_historian_synced"] or 0),
-                            "total_logs_synced": int(ds_row["total_logs_synced"] or 0),
-                        }
-                    )
-                # Backlog must compare apples to apples: data_sync_state stores
-                # the LAST AUTO-INCREMENT id we pushed, not a row count. After
-                # retention deletes old rows, COUNT(*) drops below that id and
-                # the old formula went negative, getting clamped to 0 — which
-                # was the "backlog always 0" the operator saw. Use MAX(id)
-                # (the current high-water-mark on the table) instead. Cheap:
-                # SQLite reads it via the PK index in O(log N).
+                )
+
+            status_rows = conn.execute(
+                "SELECT status, COUNT(*) AS c FROM sync_outbox GROUP BY status"
+            ).fetchall()
+            for r in status_rows:
+                status = str(r["status"] or "").lower()
+                count = int(r["c"] or 0)
+                if status in outbox_status:
+                    outbox_status[status] = count
+                else:
+                    outbox_status["other"] += count
+
+            sync_row = conn.execute(
+                """
+                SELECT id, name, target_type, enabled, last_sync_utc, last_error, updated_utc, config_json
+                FROM sync_targets
+                WHERE id = 'auto_cloud_config'
+                """
+            ).fetchone()
+            if sync_row:
+                cfg_raw = str(sync_row["config_json"] or "{}")
+                try:
+                    cfg = json.loads(cfg_raw)
+                except Exception:
+                    cfg = {}
+                sync_target = {
+                    "id": str(sync_row["id"] or ""),
+                    "name": str(sync_row["name"] or ""),
+                    "target_type": str(sync_row["target_type"] or ""),
+                    "enabled": bool(sync_row["enabled"]),
+                    "last_sync_utc": str(sync_row["last_sync_utc"] or ""),
+                    "last_error": str(sync_row["last_error"] or ""),
+                    "updated_utc": str(sync_row["updated_utc"] or ""),
+                    "config": cfg,
+                }
+            ds_row = conn.execute(
+                """
+                SELECT last_historian_id, last_log_id, last_data_sync_utc, last_data_error, total_historian_synced, total_logs_synced
+                FROM data_sync_state
+                WHERE id = 1
+                """
+            ).fetchone()
+            if ds_row:
+                data_sync.update(
+                    {
+                        "last_historian_id": int(ds_row["last_historian_id"] or 0),
+                        "last_log_id": int(ds_row["last_log_id"] or 0),
+                        "last_data_sync_utc": str(ds_row["last_data_sync_utc"] or ""),
+                        "last_data_error": str(ds_row["last_data_error"] or ""),
+                        "total_historian_synced": int(ds_row["total_historian_synced"] or 0),
+                        "total_logs_synced": int(ds_row["total_logs_synced"] or 0),
+                    }
+                )
+            # Backlog must compare apples to apples: data_sync_state stores
+            # the LAST AUTO-INCREMENT id we pushed, not a row count. After
+            # retention deletes old rows, COUNT(*) drops below that id and
+            # the old formula went negative, getting clamped to 0 — which
+            # was the "backlog always 0" the operator saw. Use MAX(id)
+            # (the current high-water-mark on the table) instead. Cheap:
+            # SQLite reads it via the PK index in O(log N).
+            max_hist_id = 0
+            max_log_id = 0
+            try:
+                row_max = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM historian_readings").fetchone()
+                max_hist_id = int(row_max["m"] if row_max else 0)
+            except Exception:
                 max_hist_id = 0
+            try:
+                row_max_l = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM app_logs").fetchone()
+                max_log_id = int(row_max_l["m"] if row_max_l else 0)
+            except Exception:
                 max_log_id = 0
-                try:
-                    row_max = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM historian_readings").fetchone()
-                    max_hist_id = int(row_max["m"] if row_max else 0)
-                except Exception:
-                    max_hist_id = 0
-                try:
-                    row_max_l = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM app_logs").fetchone()
-                    max_log_id = int(row_max_l["m"] if row_max_l else 0)
-                except Exception:
-                    max_log_id = 0
-                data_sync["max_historian_id"] = max_hist_id
-                data_sync["max_log_id"] = max_log_id
-                data_sync["historian_backlog"] = max(0, max_hist_id - int(data_sync["last_historian_id"]))
-                data_sync["logs_backlog"] = max(0, max_log_id - int(data_sync["last_log_id"]))
+            data_sync["max_historian_id"] = max_hist_id
+            data_sync["max_log_id"] = max_log_id
+            data_sync["historian_backlog"] = max(0, max_hist_id - int(data_sync["last_historian_id"]))
+            data_sync["logs_backlog"] = max(0, max_log_id - int(data_sync["last_log_id"]))
 
         cloud = self._get_cloud_database_target()
         if cloud:
@@ -8743,14 +8748,15 @@ class AppStore:
                 except Exception:
                     max_local_id = 0
             if pending_live_rows:
-                for row in pending_live_rows:
-                    key = (
-                        normalize_tenant_id(str(row.get("tenant_id") or tenant_id)),
-                        str(row.get("gateway_id") or ""),
-                        str(row.get("tag_name") or ""),
-                    )
-                    if key[1] and key[2]:
-                        self._local_live_latest_cache[key] = dict(row)
+                with self._live_cache_lock:
+                    for row in pending_live_rows:
+                        key = (
+                            normalize_tenant_id(str(row.get("tenant_id") or tenant_id)),
+                            str(row.get("gateway_id") or ""),
+                            str(row.get("tag_name") or ""),
+                        )
+                        if key[1] and key[2]:
+                            self._local_live_latest_cache[key] = dict(row)
         if pending_live_rows:
             self._enqueue_live_fast_pending(pending_live_rows, max_local_id=max_local_id)
         self._sync_wakeup_event.set()
@@ -8849,16 +8855,47 @@ class AppStore:
         safe_rows = self._throttle_log_rows(safe_rows)
         if not safe_rows:
             return 0
-        with self._lock:
-            with self._connect() as conn:
-                conn.executemany(
-                    """
-                    INSERT INTO app_logs
-                    (tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    safe_rows,
-                )
+        # 2026-11-03: a log line never queues behind a wedged writer. This
+        # used to wait for the global lock without limit and then up to 10 s
+        # for SQLite - and it runs on the way OUT of every slow request and
+        # every failed save, so a held writer turned each refusal into a 20 s
+        # stall of its own. Now: two seconds for the lock, two for SQLite,
+        # and past that the line is dropped and said so on stdout (which the
+        # desktop shell keeps in backend.log).
+        if not self._lock.acquire(timeout=2.0):
+            print("[trustnode][logs] dropped %d log row(s): the store's writer has been held "
+                  "for more than 2 s (see [trustnode][lock-watchdog])" % len(safe_rows), flush=True)
+            return 0
+        try:
+            conn = self._connect()
+            try:
+                conn.execute("PRAGMA busy_timeout=2000")
+            except Exception:
+                pass
+            try:
+                with conn:
+                    conn.executemany(
+                        """
+                        INSERT INTO app_logs
+                        (tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        safe_rows,
+                    )
+            except sqlite3.OperationalError as exc:
+                low = str(exc).lower()
+                if "locked" in low or "busy" in low:
+                    print("[trustnode][logs] dropped %d log row(s): SQLite's write lock was held for "
+                          "more than 2 s (see [trustnode][lock-watchdog])" % len(safe_rows), flush=True)
+                    return 0
+                raise
+            finally:
+                try:
+                    conn.execute("PRAGMA busy_timeout=10000")
+                except Exception:
+                    pass
+        finally:
+            self._lock.release()
         self._sync_wakeup_event.set()
         return len(safe_rows)
 
@@ -10956,9 +10993,9 @@ class AppStore:
                     return self._filter_rows_by_tenant(self._filter_rows_by_edge(hist_live, edge_filter), tenant_id)[:lim]
 
         # Local fast path: serve latest-per-tag rows from in-memory cache first.
-        # _hist_lock (not self._lock) — matches the writer in append_historian_rows
-        # so this hot read never queues behind config/scope writes.
-        with self._hist_lock:
+        # 2026-11-03: under the cache's own lock, never the writer's - a persist
+        # waiting on SQLite must not stall the live view (measured: 9-10 s).
+        with self._live_cache_lock:
             cache_rows = [
                 {
                     "ts": str(v.get("ts_utc") or ""),
@@ -10983,21 +11020,21 @@ class AppStore:
             if local_rows:
                 return local_rows[:lim]
 
-        with self._lock:
-            with self._connect() as conn:
-                # ORDER BY ts_utc DESC uses idx_hist_tenant_ts; ORDER BY id DESC
-                # falls back to a temp B-tree sort over the full tenant slice.
-                rows = conn.execute(
-                    """
-                    SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                           tag_name, value, quality, quality_label
-                    FROM historian_readings
-                    WHERE tenant_id = ?
-                    ORDER BY ts_utc DESC
-                    LIMIT ?
-                    """,
-                    (tenant_id, max(fetch_lim, 20000)),
-                ).fetchall()
+        # 2026-11-03: a READ. It used to take the store's global lock, so it waited behind every write - and a write waits up to 10 s for SQLite. Reads run on the read-only handle and never wait for a writer (WAL).
+        with self._connect_readonly() as conn:
+            # ORDER BY ts_utc DESC uses idx_hist_tenant_ts; ORDER BY id DESC
+            # falls back to a temp B-tree sort over the full tenant slice.
+            rows = conn.execute(
+                """
+                SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                       tag_name, value, quality, quality_label
+                FROM historian_readings
+                WHERE tenant_id = ?
+                ORDER BY ts_utc DESC
+                LIMIT ?
+                """,
+                (tenant_id, max(fetch_lim, 20000)),
+            ).fetchall()
 
         latest: dict[tuple[str, str], dict[str, Any]] = {}
         for r in rows:
@@ -11141,19 +11178,19 @@ class AppStore:
             if cloud_rows:
                 return self._filter_rows_by_edge(cloud_rows, edge_filter)[:lim]
 
-        with self._lock:
-            with self._connect() as conn:
-                # ORDER BY ts_utc DESC walks idx_logs_tenant_ts in order.
-                rows = conn.execute(
-                    """
-                    SELECT tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name
-                    FROM app_logs
-                    WHERE tenant_id = ?
-                    ORDER BY ts_utc DESC
-                    LIMIT ?
-                    """,
-                    (tenant_id, fetch_lim),
-                ).fetchall()
+        # 2026-11-03: a READ. It used to take the store's global lock, so it waited behind every write - and a write waits up to 10 s for SQLite. Reads run on the read-only handle and never wait for a writer (WAL).
+        with self._connect_readonly() as conn:
+            # ORDER BY ts_utc DESC walks idx_logs_tenant_ts in order.
+            rows = conn.execute(
+                """
+                SELECT tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name
+                FROM app_logs
+                WHERE tenant_id = ?
+                ORDER BY ts_utc DESC
+                LIMIT ?
+                """,
+                (tenant_id, fetch_lim),
+            ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
             out.append(

@@ -377,6 +377,14 @@ SOURCE_CHECKS = [
     # and the rollup/live merge read live only the TAIL - a chart over an
     # older window started a week late. The head is read live too.
     ("a window older than the rollup keeps its head", "test_rollup_floor_keeps_old_data.py"),
+    # 2026-11-03, from a customer edge: every config save "Timed out after
+    # 20s" for six domains every 10-20 s, gateway 0/1, "reconnecting". One
+    # held SQLite write lock + one global store lock = reads and writes all
+    # queued 10 s each. Reads never wait for a writer now; a page-driven
+    # write answers inside the page's window or is refused with the reason.
+    ("a busy store writer never makes the edge look dead", "test_store_busy_never_hangs.py"),
+    ("a failed configuration save backs off", "test_failed_save_backs_off.py"),
+    ("the installer never copies a multi-GB store", "test_install_copy_is_bounded.py"),
     # 2026-10-30, asked for directly: "every new installer can be installed
     # in existing computer with all fixes and updates". Boots the PACKAGED
     # backend on a copy of a real workspace with NO data-dir override - the

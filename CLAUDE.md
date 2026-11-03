@@ -561,3 +561,43 @@ sockets with 12 s timeouts.
   "no slow request logged" ruled out the backend in one look; the UI
   process CPU pointed at the page. The screenshot of the banner alone had
   everyone looking at the wrong process for a day.
+
+## 12. One held lock makes the whole edge look dead — 2026-11-03
+
+From a customer edge: every configuration save "Timed out after 20s", six
+domains, every 10–20 s; gateway 0/1; "reconnecting"; reads 3.5–5 s. The
+customer's log could not even say which build was running (the installer
+always says 0.1.0 — boot now prints `[trustnode][boot] build: ...`).
+
+Reproduced with ONE outside connection holding SQLite's write lock
+(`scripts/test_store_busy_never_hangs.py`): the store's reads and writes
+all went through one Python lock, and a write held it while waiting up to
+10 s for SQLite. Six saves queued behind it answered at 10, 20, 30, 40, 50,
+60 s; the live view waited behind the historian writer's lock; the log
+write on the way OUT of each failed request waited another 10+ s; and the
+page re-sent every failed save on every status tick. Nothing was broken —
+everything was waiting on everything else.
+
+- **A read never takes a writer's lock.** In WAL a reader never waits for a
+  writer; the Python lock was the only thing making it wait. Polled reads
+  (live, logs, bootstrap, inspector, config domain, cloud target) run on
+  `_connect_readonly()` with no lock; the in-memory latest-rows cache has
+  its own lock, not the historian writer's.
+- **A page-driven write answers inside the page's window.** The route waits
+  6 s for the lock and 4 s for SQLite, then refuses with a 503 that names
+  `[trustnode][lock-watchdog]` (`_bounded_store_write` in
+  `routers/app_store.py`). A refusal changes nothing; a write that lands
+  AFTER the page gave up is what produced the 409 loop.
+- **A log line never queues behind a wedged writer** (2 s, then dropped and
+  said so on stdout). It ran on the way out of every slow request.
+- **A failed UI save backs off** (`SAVE_RETRY_BACKOFF_MS`): the same payload
+  is not re-sent for a minute; a changed one goes at once.
+- **The installer never copies a multi-GB store** as "insurance"
+  (`PRE_UPDATE_COPY_MAX_BYTES`). It copied 8 GB before the splash and left
+  it on the disk.
+
+What still has to come from the customer when this recurs: the lines
+tagged `[trustnode][lock-watchdog]` in
+`%APPDATA%	rustnode-edge-desktopackend.log` name the thread HOLDING
+the lock. Everything above bounds the damage; only that log names the cause.
+

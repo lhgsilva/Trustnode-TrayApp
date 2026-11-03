@@ -833,6 +833,50 @@ def _guard_not_blanking(scope_key: str, domain: str, payload: Any, actor: str, a
     raise _HTTPException_rs(status_code=409, detail=msg)
 
 
+# 2026-11-03, from a customer edge: every configuration save "Timed out
+# after 20s", six domains, every ten to twenty seconds. The store's writes
+# queue on one lock, and each waits up to 10 s for SQLite's write lock; six
+# saves behind a held writer answered at 10, 20, 30, 40, 50 and 60 s - all
+# past the page's 20 s - so the page saw a timeout, the write landed later
+# anyway, and the next save was refused as 409 for a version the page never
+# learned. A page-driven write now answers inside the page's window: the
+# lock is waited for at most _WRITE_LOCK_WAIT_S, SQLite for at most
+# _WRITE_BUSY_MS, and past that the answer is a 503 that says so. Nothing
+# is changed on a refusal; the page keeps the operator's edit and retries.
+_WRITE_LOCK_WAIT_S = 6.0
+_WRITE_BUSY_MS = 4000
+
+
+def _bounded_store_write(what: str, fn):
+    import sqlite3 as _sq
+    why = (f"{what} was not applied: the edge's configuration store is busy - another "
+           f"task has been holding its writer. Nothing was changed; try again in a moment. "
+           f"If it keeps happening, the backend.log lines tagged [trustnode][lock-watchdog] "
+           f"name the task holding it.")
+    if not app_store._lock.acquire(timeout=_WRITE_LOCK_WAIT_S):
+        raise _HTTPException_rs(status_code=503, detail=why)
+    try:
+        conn = app_store._connect()
+        try:
+            conn.execute("PRAGMA busy_timeout=%d" % int(_WRITE_BUSY_MS))
+        except Exception:
+            pass
+        try:
+            return fn()
+        except _sq.OperationalError as exc:
+            low = str(exc).lower()
+            if "locked" in low or "busy" in low:
+                raise _HTTPException_rs(status_code=503, detail=why) from exc
+            raise
+        finally:
+            try:
+                conn.execute("PRAGMA busy_timeout=10000")
+            except Exception:
+                pass
+    finally:
+        app_store._lock.release()
+
+
 @router.put("/domain")
 def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
     # Shared domains (gateway_configurations, database_configurations,
@@ -883,12 +927,12 @@ def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
     payload.payload = _preserve_omitted_keys(scope_key, str(payload.domain or "").strip(), payload.payload)
     payload.payload = _restore_domain_secrets(scope_key, str(payload.domain or "").strip(), payload.payload)
     try:
-        result = (
+        result = _bounded_store_write("The save of %r" % _domain_name, lambda: (
             app_store.upsert_domain_scoped(scope_key, payload.domain, payload.payload, actor=payload.actor,
                                            allow_replace=bool(payload.allow_replace))
             if scope_key
             else app_store.upsert_domain(payload.domain, payload.payload, actor=payload.actor)
-        )
+        ))
     except ValueError as exc:
         # The destructive-write guard refused: a save that would have dropped
         # several configured items at once. 409, not 500 - the request was

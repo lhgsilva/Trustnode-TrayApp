@@ -772,6 +772,7 @@ const GATEWAY_STATUS_POLL_MS_LOCAL = 2000;
 const GATEWAY_STATUS_POLL_MS_CLOUD = 1000;
 const CLOUD_LIVE_POLL_MS = 1000;
 const CLOUD_AUX_POLL_MS = 10000;
+const SAVE_RETRY_BACKOFF_MS = 60000; // a failed config save is not re-sent unchanged for a minute
 const CLOUD_LIVE_FETCH_LIMIT = 180;
 const CLOUD_HIST_FETCH_LIMIT = 600;
 const CLOUD_LOG_FETCH_LIMIT = 800;
@@ -5495,6 +5496,22 @@ function AppShell() {
     saveFailureCountRef.current[label] = 0;
     setError((cur) => (String(cur || "").startsWith(label) ? "" : cur));
   };
+  // 2026-11-03, from a customer edge: once a save had failed, the saver sent
+  // the SAME payload again on every state tick - a status poll refreshes the
+  // gateway array every 10 s - because the signature is recorded only on
+  // success. Six domains, one request each per tick, against an edge that
+  // was already busy: that is the storm that kept it busy ("Timed out after
+  // 20s" every 10-20 s). A payload that has just failed is not re-sent for
+  // SAVE_RETRY_BACKOFF_MS; a CHANGED payload still goes at once, and the
+  // operator's edit is never dropped - it is simply sent later.
+  const saveFailureRef = useRef({});
+  const noteSaveFailure = (key, signature) => {
+    saveFailureRef.current[key] = { signature, at: Date.now() };
+  };
+  const saveRecentlyFailed = (key, signature) => {
+    const f = saveFailureRef.current[key];
+    return Boolean(f && f.signature === signature && (Date.now() - f.at) < SAVE_RETRY_BACKOFF_MS);
+  };
 
   const gatewayBootstrapAppliedRef = useRef(false);
   const dashboardHistorySeedRef = useRef(false);
@@ -7828,11 +7845,13 @@ function AppShell() {
       // immediately on page load.
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       if (signature === appStoreLastPersistSignatureRef.current) return;
+      if (saveRecentlyFailed("appStoreLastPersistSignatureRef", signature)) return;
       appStorePersistInFlightRef.current = true;
       try {
         await saveAppStoreBootstrap(payload, currentUser?.username || "system");
         appStoreLastPersistSignatureRef.current = signature;
       } catch (_) {
+        noteSaveFailure("appStoreLastPersistSignatureRef", signature);
         // Keep app responsive on transient backend/store failure.
       } finally {
         appStorePersistInFlightRef.current = false;
@@ -7929,6 +7948,7 @@ function AppShell() {
       if (!appStorePayloadEverHydratedRef.current) return;
       if ((!Array.isArray(payload.widgets) || payload.widgets.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === dashboardDomainLastPersistSignatureRef.current) return;
+      if (saveRecentlyFailed("dashboardDomainLastPersistSignatureRef", signature)) return;
       // An empty widget list is only persisted when the operator actually
       // emptied it (removeDashboardWidget / clear). Any other route to an empty
       // list — a render that produced nothing, a filtered normalisation — is
@@ -7957,6 +7977,7 @@ function AppShell() {
         dashboardDomainLastPersistSignatureRef.current = signature;
         if (emptyIsIntentional) dashboardUserEmptiedRef.current = false;
       } catch (err) {
+        noteSaveFailure("dashboardDomainLastPersistSignatureRef", signature);
         // SAY IT. This used to swallow the error with "bootstrap save loop
         // remains fallback persistence path" - and that fallback no longer
         // writes this domain, so a failed save meant the operator's
@@ -8018,6 +8039,7 @@ function AppShell() {
       if (!appStorePayloadEverHydratedRef.current) return;
       if ((!Array.isArray(payload.alarms) || payload.alarms.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === alarmsDomainLastPersistSignatureRef.current) return;
+      if (saveRecentlyFailed("alarmsDomainLastPersistSignatureRef", signature)) return;
       // Same shape as dashboard_configurations above: an empty list is only
       // persisted when the operator actually emptied it. Any other route to
       // an empty list is refused by the server, which keeps the stored log.
@@ -8037,6 +8059,7 @@ function AppShell() {
         alarmsDomainLastPersistSignatureRef.current = signature;
         if (emptyIsIntentional) alarmsClearIntentRef.current = false;
       } catch (err) {
+        noteSaveFailure("alarmsDomainLastPersistSignatureRef", signature);
         // SAY IT. This used to swallow the error with "bootstrap save loop
         // still tries periodically", and that is exactly how twelve refusals
         // went unnoticed from 2026-08-26 to today. The signature is
@@ -8092,11 +8115,12 @@ function AppShell() {
         !appStorePayloadEverHydratedRef.current
       ) return;
       if (signature === triggersDomainLastPersistSignatureRef.current) return;
+      if (saveRecentlyFailed("triggersDomainLastPersistSignatureRef", signature)) return;
       triggersDomainPersistInFlightRef.current = true;
       try {
         await saveAppStoreDomain("triggers_limits", payload, currentUser?.username || "system");
         triggersDomainLastPersistSignatureRef.current = signature;
-      } catch (_) {}
+      } catch (_) { noteSaveFailure("triggersDomainLastPersistSignatureRef", signature); }
       finally {
         triggersDomainPersistInFlightRef.current = false;
       }
@@ -8161,6 +8185,7 @@ function AppShell() {
       if (!appStorePayloadEverHydratedRef.current) return;
       if ((!Array.isArray(payload) || payload.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === gatewayConfigsLastPersistSignatureRef.current) return;
+      if (saveRecentlyFailed("gatewayConfigsLastPersistSignatureRef", signature)) return;
       gatewayConfigsPersistInFlightRef.current = true;
       try {
         const _res = await saveAppStoreDomain(
@@ -8174,6 +8199,7 @@ function AppShell() {
         gatewayConfigsLastPersistSignatureRef.current = signature;
         noteSaveOk('Gateway configuration');
       } catch (err) {
+        noteSaveFailure("gatewayConfigsLastPersistSignatureRef", signature);
         // Surfaced, not swallowed. A save that fails silently is
         // indistinguishable from one that worked - which is how a
         // configured gateway can simply never exist. Still no throw:
@@ -8230,6 +8256,7 @@ function AppShell() {
       if (!appStorePayloadEverHydratedRef.current) return;
       if ((!Array.isArray(payload) || payload.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === devicesLastPersistSignatureRef.current) return;
+      if (saveRecentlyFailed("devicesLastPersistSignatureRef", signature)) return;
       devicesPersistInFlightRef.current = true;
       try {
         const _res = await saveAppStoreDomain(
@@ -8243,6 +8270,7 @@ function AppShell() {
         devicesLastPersistSignatureRef.current = signature;
         noteSaveOk('Devices');
       } catch (err) {
+        noteSaveFailure("devicesLastPersistSignatureRef", signature);
         // Surfaced, not swallowed. A save that fails silently is
         // indistinguishable from one that worked - which is how a
         // configured gateway can simply never exist. Still no throw:
@@ -8301,6 +8329,7 @@ function AppShell() {
       if (!appStorePayloadEverHydratedRef.current) return;
       if ((!Array.isArray(payload) || payload.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === dbConnectionsLastPersistSignatureRef.current) return;
+      if (saveRecentlyFailed("dbConnectionsLastPersistSignatureRef", signature)) return;
       dbConnectionsPersistInFlightRef.current = true;
       try {
         const _res = await saveAppStoreDomain(
@@ -8314,6 +8343,7 @@ function AppShell() {
         dbConnectionsLastPersistSignatureRef.current = signature;
         noteSaveOk('Database connections');
       } catch (err) {
+        noteSaveFailure("dbConnectionsLastPersistSignatureRef", signature);
         // Surfaced, not swallowed. A save that fails silently is
         // indistinguishable from one that worked - which is how a
         // configured gateway can simply never exist. Still no throw:
@@ -8372,6 +8402,7 @@ function AppShell() {
       if (!appStorePayloadEverHydratedRef.current) return;
       if (signature === "{}" && !appStorePayloadEverHydratedRef.current) return;
       if (signature === powerConfigLastPersistSignatureRef.current) return;
+      if (saveRecentlyFailed("powerConfigLastPersistSignatureRef", signature)) return;
       powerConfigPersistInFlightRef.current = true;
       try {
         const _res = await saveAppStoreDomain(
@@ -8385,6 +8416,7 @@ function AppShell() {
         powerConfigLastPersistSignatureRef.current = signature;
         noteSaveOk('Power configuration');
       } catch (err) {
+        noteSaveFailure("powerConfigLastPersistSignatureRef", signature);
         // Surfaced, not swallowed. A save that fails silently is
         // indistinguishable from one that worked - which is how a
         // configured gateway can simply never exist. Still no throw:

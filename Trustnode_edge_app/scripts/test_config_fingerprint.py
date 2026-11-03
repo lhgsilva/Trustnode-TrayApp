@@ -67,8 +67,13 @@ print(f"     while the store lock is HELD: fingerprint {fp_locked_ms:.1f} ms, "
       f"get_bootstrap {'BLOCKED' if full_blocked else 'completed'}")
 check("fingerprint answers while the store lock is held", fp_locked_ms < 500 and bool(fp_val),
       f"{fp_locked_ms:.1f}ms")
-check("the full read DOES block on that lock (so avoiding it is the win)", full_blocked,
-      "get_bootstrap returned while the lock was held")
+# 2026-11-03: the full read no longer takes the store's global lock either
+# (a read never waits for a writer - see test_store_busy_never_hangs.py), so
+# this asserts the new truth: it answers while the lock is held. The
+# fingerprint still earns its keep by reading one row instead of every
+# document on every telemetry cycle.
+check("the full read also answers while that lock is held", not full_blocked,
+      "get_bootstrap did not return within 1 s while the lock was held")
 
 # --- the behaviour that must NOT break: telemetry still sees every change ---
 applied = []

@@ -76,6 +76,29 @@ from app.routers.notifications import send_email_request
 # customer machine produces a log that pinpoints WHICH service init blocked.
 # Previously the only boot print was app_store_db; anything wedging between
 # that and uvicorn binding looked identical from the outside.
+# 2026-11-03: a customer log could not tell us WHICH build was running - the
+# installer always says 0.1.0. The backend's own file time and the frontend
+# bundle's hash identify a build exactly.
+def _build_stamp() -> str:
+    import glob as _glob
+    import time as _t
+    from pathlib import Path as _P
+    try:
+        here = _P(__file__).resolve()
+        backend = _t.strftime("%Y-%m-%d %H:%M UTC", _t.gmtime(os.path.getmtime(str(here))))
+    except Exception:
+        backend = "?"
+    front = "?"
+    for cand in (here.parent.parent.parent / "frontend" / "dist",
+                 here.parent.parent.parent.parent / "frontend" / "dist"):
+        hits = sorted(_glob.glob(str(cand / "assets" / "index-*.js")))
+        if hits:
+            front = os.path.basename(hits[-1])
+            break
+    return f"backend {backend}, frontend {front}"
+
+
+print(f"[trustnode][boot] build: {_build_stamp()}", flush=True)
 print("[trustnode][boot] state: instantiating TelemetryService", flush=True)
 telemetry_service = TelemetryService()
 print("[trustnode][boot] state: instantiating IngestStore", flush=True)

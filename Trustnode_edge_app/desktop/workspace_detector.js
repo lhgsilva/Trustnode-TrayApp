@@ -153,8 +153,23 @@ function timestampSlug() {
   ].join("");
 }
 
+// 2026-11-03: "cheap insurance" is not cheap on a customer edge. The store
+// holds the readings - gigabytes at 1 Hz - and this copied ALL of it,
+// synchronously, before the splash, on every install that kept the
+// workspace, and left the copy on the disk that is already the tightest
+// resource. Above this size nothing is copied; configuration is covered by
+// the backend's own small config backups.
+const PRE_UPDATE_COPY_MAX_BYTES =
+  Number(process.env.TRUSTNODE_PRE_UPDATE_COPY_MAX_MB || 256) * 1024 * 1024;
+
 function makeSnapshotCopy(dbPath, suffix) {
   try {
+    const size = fs.statSync(dbPath).size;
+    if (size > PRE_UPDATE_COPY_MAX_BYTES) {
+      console.log(`[workspace] not copying ${dbPath} (${(size / 1048576).toFixed(0)} MB) before the update: `
+        + `larger than ${(PRE_UPDATE_COPY_MAX_BYTES / 1048576).toFixed(0)} MB`);
+      return null;
+    }
     const dir = path.dirname(dbPath);
     const base = path.basename(dbPath, path.extname(dbPath));
     const target = path.join(dir, `${base}.${suffix}-${timestampSlug()}.db`);
@@ -344,4 +359,5 @@ module.exports = {
   detectAndChooseWorkspace,
   resetCurrentWorkspace,
   detectWorkspaces,
+  makeSnapshotCopy,
 };
