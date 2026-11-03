@@ -15,6 +15,7 @@ from urllib.parse import quote_plus
 #: time.monotonic() alone counts from SYSTEM boot, so it cannot distinguish a
 #: freshly-launched app from one running on a machine that has been up a week.
 _MODULE_LOAD_MONO = time.monotonic()
+from contextlib import contextmanager
 from datetime import timedelta
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,6 +30,12 @@ from app.tenant import get_current_tenant, normalize_tenant_id
 #: closing-every-time was trying to achieve, without paying the open cost on
 #: every query.
 _CONN_TLS = threading.local()
+
+
+class StoreBusy(sqlite3.OperationalError):
+    """A write could not reach the store's writer within the time a caller
+    can wait. An OperationalError, so every existing handler still catches
+    it; the API maps it to a 503 that names the lock watchdog."""
 
 
 def _thread_connection(db_path: str, *, readonly: bool = False,
@@ -1410,6 +1417,45 @@ class AppStore:
             # A pragma that will not apply is not a reason to fail the write.
             pass
         return conn
+
+    #: 2026-11-03: a configuration write waits this long for the global lock
+    #: and this long per statement for SQLite's write lock, then refuses.
+    #: Six saves queued behind a held writer used to answer at 10, 20, 30,
+    #: 40, 50 and 60 s - and the page had given up at 20.
+    WRITE_LOCK_WAIT_S = 6.0
+    WRITE_BUSY_MS = 4000
+
+    @contextmanager
+    def _bounded_write(self, what: str):
+        why = (f"{what} was not applied: the edge's configuration store is busy - another "
+               f"task has been holding its writer. Nothing was changed; try again in a moment. "
+               f"If it keeps happening, the backend.log lines tagged [trustnode][lock-watchdog] "
+               f"name the task holding it.")
+        if not self._lock.acquire(timeout=self.WRITE_LOCK_WAIT_S):
+            raise StoreBusy(why)
+        try:
+            conn = self._connect()
+            try:
+                conn.execute("PRAGMA busy_timeout=%d" % int(self.WRITE_BUSY_MS))
+            except Exception:
+                pass
+            try:
+                with conn:
+                    yield conn
+            except StoreBusy:
+                raise
+            except sqlite3.OperationalError as exc:
+                low = str(exc).lower()
+                if "locked" in low or "busy" in low:
+                    raise StoreBusy(why) from exc
+                raise
+            finally:
+                try:
+                    conn.execute("PRAGMA busy_timeout=10000")
+                except Exception:
+                    pass
+        finally:
+            self._lock.release()
 
     def _connect_readonly(self) -> sqlite3.Connection:
         # Invariant B (2026-06-23): the Historian Export tab MUST NOT
@@ -4502,7 +4548,14 @@ class AppStore:
                 # next SUCCESSFUL sync actually pushes rows, otherwise it
                 # vanishes within a second and operators can't see why
                 # their backlog isn't draining.
-                self._set_data_sync_state(last_data_sync_utc=self._utc_now())
+                # 2026-11-03: nothing to send is not worth a write. This ran
+                # on every 80 ms tick AND on every historian append - five
+                # or more fsyncs a second under the global lock on an idle
+                # forwarder, competing with collection for the write lock.
+                now_mono = time.monotonic()
+                if now_mono - float(getattr(self, "_idle_sync_stamp_mono", 0.0) or 0.0) >= 60.0:
+                    self._idle_sync_stamp_mono = now_mono
+                    self._set_data_sync_state(last_data_sync_utc=self._utc_now())
                 return 0
 
             try:
@@ -7867,154 +7920,154 @@ class AppStore:
         payload_to_store = payload
         if domain_name == "users_access":
             payload_to_store = self._normalize_users_access_payload(payload)
-        with self._lock:
-            with self._connect() as conn:
-                prev = conn.execute(
-                    "SELECT version, payload_json, updated_utc FROM config_documents WHERE domain = ?",
-                    (domain,),
-                ).fetchone()
-                old_version = int(prev["version"]) if prev else 0
-                prev_payload_obj: Any = None
-                if prev and prev["payload_json"] is not None:
-                    try:
-                        prev_payload_obj = json.loads(str(prev["payload_json"] or "null"))
-                    except Exception:
-                        prev_payload_obj = None
-                if domain_name == "database_configurations":
-                    prev_payload: Any = prev_payload_obj if isinstance(prev_payload_obj, list) else []
-                    payload_to_store = self._normalize_database_configurations_payload(payload_to_store, prev_payload)
-                elif domain_name == "app_settings":
-                    payload_to_store = self._normalize_app_settings_payload(payload_to_store, prev_payload_obj)
-                    self._app_settings_cache = None      # readers see this save at once
-                elif domain_name in {
-                    "metadata",
-                    "devices",
+        # 2026-11-03: bounded - see _bounded_write. Twenty routes write through here.
+        with self._bounded_write("the save of %r" % domain_name) as conn:
+            prev = conn.execute(
+                "SELECT version, payload_json, updated_utc FROM config_documents WHERE domain = ?",
+                (domain,),
+            ).fetchone()
+            old_version = int(prev["version"]) if prev else 0
+            prev_payload_obj: Any = None
+            if prev and prev["payload_json"] is not None:
+                try:
+                    prev_payload_obj = json.loads(str(prev["payload_json"] or "null"))
+                except Exception:
+                    prev_payload_obj = None
+            if domain_name == "database_configurations":
+                prev_payload: Any = prev_payload_obj if isinstance(prev_payload_obj, list) else []
+                payload_to_store = self._normalize_database_configurations_payload(payload_to_store, prev_payload)
+            elif domain_name == "app_settings":
+                payload_to_store = self._normalize_app_settings_payload(payload_to_store, prev_payload_obj)
+                self._app_settings_cache = None      # readers see this save at once
+            elif domain_name in {
+                "metadata",
+                "devices",
+                "gateway_configurations",
+                "database_configurations",
+                "power_management_config",
+            }:
+                payload_to_store = self._strip_runtime_fields_for_config_sync(payload_to_store)
+            if domain_name == "gateway_configurations":
+                # Same stabiliser as scoped path: re-create at same plc_ip
+                # keeps the previous gateway id so widgets/alarms/triggers
+                # don't go blank.
+                try:
+                    payload_to_store = self._stabilise_gateway_ids_by_plc_ip(
+                        new_payload=payload_to_store,
+                        prev_payload=prev_payload_obj,
+                    )
+                except Exception:
+                    pass
+            payload_json = self._canonical_json(payload_to_store)
+            prev_payload_json = ""
+            if prev:
+                prev_raw = str(prev["payload_json"] or "")
+                try:
+                    prev_payload_json = self._canonical_json(json.loads(prev_raw))
+                except Exception:
+                    prev_payload_json = prev_raw
+            # No-op write: avoid audit/outbox churn when payload is unchanged.
+            if prev and prev_payload_json == payload_json:
+                # Still fire the cloud mirror even on no-op — same
+                # reason as the scoped path above. Older edges saved
+                # configs to the unscoped table before the mirror
+                # existed; once they upgrade, every save is a no-op
+                # and nothing reaches Lite. Synthesize a scope_key
+                # from app_settings so the mirror lands in a row
+                # Lite can actually read.
+                if domain in (
+                    "dashboard_configurations",
+                    "alarms_setup",
+                    "triggers_limits",
                     "gateway_configurations",
-                    "database_configurations",
+                    "devices",
                     "power_management_config",
-                }:
-                    payload_to_store = self._strip_runtime_fields_for_config_sync(payload_to_store)
-                if domain_name == "gateway_configurations":
-                    # Same stabiliser as scoped path: re-create at same plc_ip
-                    # keeps the previous gateway id so widgets/alarms/triggers
-                    # don't go blank.
+                ):
                     try:
-                        payload_to_store = self._stabilise_gateway_ids_by_plc_ip(
-                            new_payload=payload_to_store,
-                            prev_payload=prev_payload_obj,
+                        settings_row = conn.execute(
+                            "SELECT payload_json FROM config_documents WHERE domain='app_settings'"
+                        ).fetchone()
+                        settings = {}
+                        if settings_row and settings_row["payload_json"]:
+                            settings = json.loads(str(settings_row["payload_json"] or "{}")) or {}
+                        edge_profile = settings.get("edge_profile") if isinstance(settings.get("edge_profile"), dict) else {}
+                        edge_id = (
+                            str(edge_profile.get("edge_id") or "").strip().lower()
+                            or str(settings.get("edge_id") or "").strip().lower()
+                            or str(getattr(self, "_local_edge_id", "") or "").strip().lower()
                         )
+                        tenant_id = str(settings.get("tenant_id") or "default").strip().lower() or "default"
+                        customer_id = (
+                            str(edge_profile.get("linked_customer_id") or "").strip().lower()
+                            or str(settings.get("customer_id") or "").strip().lower()
+                            or "-"
+                        )
+                        if edge_id:
+                            synthetic_scope = f"{tenant_id}|{customer_id}|{edge_id}"
+                            self._mirror_config_doc_to_cloud(
+                                domain,
+                                tenant_id=tenant_id,
+                                scope_key=synthetic_scope,
+                                payload_json=str(prev["payload_json"] or "null"),
+                                version=int(old_version),
+                                updated_utc=str(prev["updated_utc"] or now),
+                            )
                     except Exception:
                         pass
-                payload_json = self._canonical_json(payload_to_store)
-                prev_payload_json = ""
-                if prev:
-                    prev_raw = str(prev["payload_json"] or "")
-                    try:
-                        prev_payload_json = self._canonical_json(json.loads(prev_raw))
-                    except Exception:
-                        prev_payload_json = prev_raw
-                # No-op write: avoid audit/outbox churn when payload is unchanged.
-                if prev and prev_payload_json == payload_json:
-                    # Still fire the cloud mirror even on no-op — same
-                    # reason as the scoped path above. Older edges saved
-                    # configs to the unscoped table before the mirror
-                    # existed; once they upgrade, every save is a no-op
-                    # and nothing reaches Lite. Synthesize a scope_key
-                    # from app_settings so the mirror lands in a row
-                    # Lite can actually read.
-                    if domain in (
-                        "dashboard_configurations",
-                        "alarms_setup",
-                        "triggers_limits",
-                        "gateway_configurations",
-                        "devices",
-                        "power_management_config",
-                    ):
-                        try:
-                            settings_row = conn.execute(
-                                "SELECT payload_json FROM config_documents WHERE domain='app_settings'"
-                            ).fetchone()
-                            settings = {}
-                            if settings_row and settings_row["payload_json"]:
-                                settings = json.loads(str(settings_row["payload_json"] or "{}")) or {}
-                            edge_profile = settings.get("edge_profile") if isinstance(settings.get("edge_profile"), dict) else {}
-                            edge_id = (
-                                str(edge_profile.get("edge_id") or "").strip().lower()
-                                or str(settings.get("edge_id") or "").strip().lower()
-                                or str(getattr(self, "_local_edge_id", "") or "").strip().lower()
-                            )
-                            tenant_id = str(settings.get("tenant_id") or "default").strip().lower() or "default"
-                            customer_id = (
-                                str(edge_profile.get("linked_customer_id") or "").strip().lower()
-                                or str(settings.get("customer_id") or "").strip().lower()
-                                or "-"
-                            )
-                            if edge_id:
-                                synthetic_scope = f"{tenant_id}|{customer_id}|{edge_id}"
-                                self._mirror_config_doc_to_cloud(
-                                    domain,
-                                    tenant_id=tenant_id,
-                                    scope_key=synthetic_scope,
-                                    payload_json=str(prev["payload_json"] or "null"),
-                                    version=int(old_version),
-                                    updated_utc=str(prev["updated_utc"] or now),
-                                )
-                        except Exception:
-                            pass
-                    return {
-                        "domain": domain,
-                        "tenant_id": self._current_tenant_id(),
-                        "version": old_version,
-                        "updated_utc": str(prev["updated_utc"] or now),
-                        "unchanged": True,
-                    }
-                new_version = old_version + 1
-                conn.execute(
+                return {
+                    "domain": domain,
+                    "tenant_id": self._current_tenant_id(),
+                    "version": old_version,
+                    "updated_utc": str(prev["updated_utc"] or now),
+                    "unchanged": True,
+                }
+            new_version = old_version + 1
+            conn.execute(
+                """
+                INSERT INTO config_documents(domain, payload_json, version, updated_utc)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(domain) DO UPDATE SET
+                  payload_json = excluded.payload_json,
+                  version = excluded.version,
+                  updated_utc = excluded.updated_utc
+                """,
+                (domain, payload_json, new_version, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO config_audit(domain, actor, old_version, new_version, changed_utc)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (domain, actor, old_version if old_version > 0 else None, new_version, now),
+            )
+            if not self._disable_config_push:
+                pending_row = conn.execute(
                     """
-                    INSERT INTO config_documents(domain, payload_json, version, updated_utc)
-                    VALUES(?, ?, ?, ?)
-                    ON CONFLICT(domain) DO UPDATE SET
-                      payload_json = excluded.payload_json,
-                      version = excluded.version,
-                      updated_utc = excluded.updated_utc
+                    SELECT id
+                    FROM sync_outbox
+                    WHERE domain = ? AND status IN ('pending', 'failed')
+                    ORDER BY id DESC
+                    LIMIT 1
                     """,
-                    (domain, payload_json, new_version, now),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO config_audit(domain, actor, old_version, new_version, changed_utc)
-                    VALUES(?, ?, ?, ?, ?)
-                    """,
-                    (domain, actor, old_version if old_version > 0 else None, new_version, now),
-                )
-                if not self._disable_config_push:
-                    pending_row = conn.execute(
+                    (domain,),
+                ).fetchone()
+                if pending_row:
+                    conn.execute(
                         """
-                        SELECT id
-                        FROM sync_outbox
-                        WHERE domain = ? AND status IN ('pending', 'failed')
-                        ORDER BY id DESC
-                        LIMIT 1
+                        UPDATE sync_outbox
+                        SET payload_json = ?, status = 'pending', retries = 0, last_error = NULL, updated_utc = ?
+                        WHERE id = ?
                         """,
-                        (domain,),
-                    ).fetchone()
-                    if pending_row:
-                        conn.execute(
-                            """
-                            UPDATE sync_outbox
-                            SET payload_json = ?, status = 'pending', retries = 0, last_error = NULL, updated_utc = ?
-                            WHERE id = ?
-                            """,
-                            (payload_json, now, int(pending_row["id"])),
-                        )
-                    else:
-                        conn.execute(
-                            """
-                            INSERT INTO sync_outbox(domain, entity_key, payload_json, status, retries, last_error, created_utc, updated_utc)
-                            VALUES(?, ?, ?, 'pending', 0, NULL, ?, ?)
-                            """,
-                            (domain, domain, payload_json, now, now),
-                        )
+                        (payload_json, now, int(pending_row["id"])),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO sync_outbox(domain, entity_key, payload_json, status, retries, last_error, created_utc, updated_utc)
+                        VALUES(?, ?, ?, 'pending', 0, NULL, ?, ?)
+                        """,
+                        (domain, domain, payload_json, now, now),
+                    )
         self._sync_wakeup_event.set()
         if domain == "database_configurations":
             self._invalidate_cloud_target_cache()
@@ -8514,76 +8567,76 @@ class AppStore:
         # `allow_replace` is kept in the signature for callers that still pass
         # it; it is now a no-op.
         payload_json = self._canonical_json(payload_to_store)
-        with self._lock:
-            with self._connect() as conn:
-                prev = conn.execute(
-                    "SELECT version, payload_json, updated_utc FROM config_documents_scoped WHERE scope_key = ? AND domain = ?",
-                    (skey, domain_name),
-                ).fetchone()
-                old_version = int(prev["version"]) if prev else 0
-                prev_payload_json = ""
-                if prev:
-                    prev_raw = str(prev["payload_json"] or "")
+        # 2026-11-03: bounded - see _bounded_write. Twenty routes write through here.
+        with self._bounded_write("the save of %r" % domain_name) as conn:
+            prev = conn.execute(
+                "SELECT version, payload_json, updated_utc FROM config_documents_scoped WHERE scope_key = ? AND domain = ?",
+                (skey, domain_name),
+            ).fetchone()
+            old_version = int(prev["version"]) if prev else 0
+            prev_payload_json = ""
+            if prev:
+                prev_raw = str(prev["payload_json"] or "")
+                try:
+                    prev_payload_json = self._canonical_json(json.loads(prev_raw))
+                except Exception:
+                    prev_payload_json = prev_raw
+            if prev and prev_payload_json == payload_json:
+                # No-op local write — BUT we still need to fire the
+                # cloud mirror for Lite-visible domains. Older edges
+                # saved dashboards locally before the mirror code
+                # existed; once they upgraded, every save was a no-op
+                # and the dashboard never reached cloud because the
+                # mirror was wired AFTER this early-return. The mirror
+                # is itself idempotent (versioned UPSERT), so firing
+                # it here is safe and finally lets historical edges
+                # backfill on the next operator save.
+                if domain_name in (
+                    "dashboard_configurations",
+                    "alarms_setup",
+                    "triggers_limits",
+                    "gateway_configurations",
+                    "devices",
+                ):
                     try:
-                        prev_payload_json = self._canonical_json(json.loads(prev_raw))
+                        tenant_from_scope = (skey.split("|") or ["default"])[0] or "default"
+                        self._mirror_config_doc_to_cloud(
+                            domain_name,
+                            tenant_id=tenant_from_scope,
+                            scope_key=skey,
+                            payload_json=str(prev["payload_json"] or "null"),
+                            version=int(old_version),
+                            updated_utc=str(prev["updated_utc"] or now),
+                        )
                     except Exception:
-                        prev_payload_json = prev_raw
-                if prev and prev_payload_json == payload_json:
-                    # No-op local write — BUT we still need to fire the
-                    # cloud mirror for Lite-visible domains. Older edges
-                    # saved dashboards locally before the mirror code
-                    # existed; once they upgraded, every save was a no-op
-                    # and the dashboard never reached cloud because the
-                    # mirror was wired AFTER this early-return. The mirror
-                    # is itself idempotent (versioned UPSERT), so firing
-                    # it here is safe and finally lets historical edges
-                    # backfill on the next operator save.
-                    if domain_name in (
-                        "dashboard_configurations",
-                        "alarms_setup",
-                        "triggers_limits",
-                        "gateway_configurations",
-                        "devices",
-                    ):
-                        try:
-                            tenant_from_scope = (skey.split("|") or ["default"])[0] or "default"
-                            self._mirror_config_doc_to_cloud(
-                                domain_name,
-                                tenant_id=tenant_from_scope,
-                                scope_key=skey,
-                                payload_json=str(prev["payload_json"] or "null"),
-                                version=int(old_version),
-                                updated_utc=str(prev["updated_utc"] or now),
-                            )
-                        except Exception:
-                            pass
-                    return {
-                        "domain": domain_name,
-                        "scope_key": skey,
-                        "tenant_id": self._current_tenant_id(),
-                        "version": old_version,
-                        "updated_utc": str(prev["updated_utc"] or now),
-                        "unchanged": True,
-                    }
-                new_version = old_version + 1
-                conn.execute(
-                    """
-                    INSERT INTO config_documents_scoped(scope_key, domain, payload_json, version, updated_utc)
-                    VALUES(?, ?, ?, ?, ?)
-                    ON CONFLICT(scope_key, domain) DO UPDATE SET
-                      payload_json = excluded.payload_json,
-                      version = excluded.version,
-                      updated_utc = excluded.updated_utc
-                    """,
-                    (skey, domain_name, payload_json, new_version, now),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO config_audit(domain, actor, old_version, new_version, changed_utc)
-                    VALUES(?, ?, ?, ?, ?)
-                    """,
-                    (f"{domain_name}#{skey}", actor, old_version if old_version > 0 else None, new_version, now),
-                )
+                        pass
+                return {
+                    "domain": domain_name,
+                    "scope_key": skey,
+                    "tenant_id": self._current_tenant_id(),
+                    "version": old_version,
+                    "updated_utc": str(prev["updated_utc"] or now),
+                    "unchanged": True,
+                }
+            new_version = old_version + 1
+            conn.execute(
+                """
+                INSERT INTO config_documents_scoped(scope_key, domain, payload_json, version, updated_utc)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(scope_key, domain) DO UPDATE SET
+                  payload_json = excluded.payload_json,
+                  version = excluded.version,
+                  updated_utc = excluded.updated_utc
+                """,
+                (skey, domain_name, payload_json, new_version, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO config_audit(domain, actor, old_version, new_version, changed_utc)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (f"{domain_name}#{skey}", actor, old_version if old_version > 0 else None, new_version, now),
+            )
         if domain_name == "database_configurations":
             self._invalidate_cloud_target_cache()
             try:

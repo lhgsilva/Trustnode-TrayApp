@@ -175,18 +175,18 @@ def _latest_values(tags: List[str]) -> Dict[str, Any]:
         import sqlite3 as _sql
         # Reuse the scope helper from the intelligence module which
         # already knows every candidate workspace DB.
-        try:
-            from trustnode_intelligence.backend.tools._scope import all_db_paths
-            paths = all_db_paths()
-        except Exception:
-            # Fallback to the single primary db from app_store.
-            from app.state import app_store as _store  # type: ignore
-            paths = [getattr(_store, "_db_path", "")] if getattr(_store, "_db_path", "") else []
+        # 2026-11-03: THIS edge's store and THIS tenant only (CLAUDE.md 1b -
+        # it used to read every workspace file it could find, unscoped), and
+        # with tenant_id in the WHERE the newest-first walk uses
+        # idx_hist_tenant_ts instead of sorting the whole table every 2 s.
+        from app.state import app_store as _store  # type: ignore
+        paths = [getattr(_store, "_db_path", "")] if getattr(_store, "_db_path", "") else []
+        tenant_id = str(_store._current_tenant_id() or "")
         placeholders = ",".join(["?"] * len(tags))
         sql = (
             f"SELECT tag_name, value, ts_utc FROM historian_readings "
-            f"WHERE tag_name IN ({placeholders}) "
-            f"ORDER BY ts_utc DESC"
+            f"WHERE tenant_id = ? AND tag_name IN ({placeholders}) "
+            f"ORDER BY ts_utc DESC LIMIT ?"
         )
         for db_path in paths:
             try:
@@ -194,7 +194,7 @@ def _latest_values(tags: List[str]) -> Dict[str, Any]:
             except Exception:
                 continue
             try:
-                for r in con.execute(sql, tags):
+                for r in con.execute(sql, [tenant_id, *tags, max(200, 50 * len(tags))]):
                     name = str(r[0] or "")
                     if name and name not in out:
                         out[name] = r[1]

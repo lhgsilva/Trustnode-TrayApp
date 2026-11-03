@@ -51,6 +51,17 @@ def main() -> int:
               for n in os.listdir(d)), str(os.listdir(d)))
     src = open(os.path.join(ROOT, "desktop", "workspace_detector.js"), encoding="utf-8").read()
     check("the shipped default cap is 256 MB", "TRUSTNODE_PRE_UPDATE_COPY_MAX_MB || 256" in src)
+    # 2026-11-03 installer review: three more things an install must get right.
+    main_js = open(os.path.join(ROOT, "desktop", "main.js"), encoding="utf-8").read()
+    check("the writable-dir fallback is persisted (no workspace dialog on the second launch)",
+          'workspaceDetector.writePersistedChoice(app.getPath("userData"), fallback)' in main_js
+          and "writePersistedChoice," in src)
+    state_py = open(os.path.join(ROOT, "backend", "app", "state.py"), encoding="utf-8").read()
+    check("the boot build stamp uses the exe's time when packaged",
+          'sys.executable if getattr(sys, "frozen", False)' in state_py)
+    build_ps1 = open(os.path.join(ROOT, "scripts", "build-release.ps1"), encoding="utf-8").read()
+    check("the release build refuses an artifact older than the run",
+          "$distStartedAt" in build_ps1 and "a stale artifact, do not ship" in build_ps1)
 
     print()
     print("  %d passed, %d failed" % (len(PASS), len(FAIL)))

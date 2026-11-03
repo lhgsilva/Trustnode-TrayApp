@@ -254,6 +254,17 @@ _init_sentry()
 app = FastAPI(title="Trustnode Edge API", version="0.1.0")
 
 
+# 2026-11-03: a configuration write that could not reach the store's writer
+# in time (app_store.StoreBusy) is a 503 with the reason, on every route.
+from app.services.app_store import StoreBusy as _StoreBusy  # noqa: E402
+
+
+@app.exception_handler(_StoreBusy)
+async def _store_busy_to_503(request, exc):  # noqa: ANN001
+    from fastapi.responses import JSONResponse as _JR
+    return _JR(status_code=503, content={"detail": str(exc)})
+
+
 # Operator 2026-06-30: TrustNode Intelligence module — bolt-on under
 # <repo>/trustnode_intelligence/. LICENSE-gated: every route depends on
 # require_intelligence_license(), which 404s when the customer's license

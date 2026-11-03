@@ -4491,6 +4491,11 @@ class PLCManager:
         self._historian_buffer_dropped: int = 0
         self._historian_buffer_last_drain_mono: float = 0.0
         self._historian_buffer_lock = threading.Lock()
+        # 2026-11-03: how many historian flushes are running right now (all
+        # gateways). The rollup and other background writers step aside
+        # while it is non-zero or the buffer holds cycles.
+        self._historian_writes_inflight: int = 0
+        self._historian_inflight_lock = threading.Lock()
 
     def _normalize_tag(self, raw: str) -> str:
         return str(raw or "").strip().lower()
@@ -4958,14 +4963,13 @@ class PLCManager:
                     # no series/limits/charts/KPIs. Run the write on the owning
                     # worker's dedicated collection executor (keeping the
                     # thread-pool isolation), falling back to a plain thread.
-                    if worker is not None and hasattr(worker, "_run_collection_io"):
-                        await worker._run_collection_io(
-                            self._flush_historian_buffer_then_write, rows, worker
-                        )
-                    else:
-                        await asyncio.to_thread(
-                            self._flush_historian_buffer_then_write, rows, worker
-                        )
+                    #
+                    # 2026-11-03: and the cycle no longer WAITS for that write.
+                    # Measured: an outside connection holding SQLite's write
+                    # lock for 3 s held this cycle for 2.86 s (up to the 10 s
+                    # busy timeout). The rows go to the gateway's persist pool
+                    # and the scan carries on; see _schedule_historian_write.
+                    self._schedule_historian_write(rows, worker)
         except Exception as exc:
             # We must NEVER drop rows silently here. If we reached this
             # point with a non-empty rows list it means the helper above
@@ -5036,6 +5040,67 @@ class PLCManager:
         except Exception:
             pass
 
+    def historian_write_pending(self) -> bool:
+        """True while a historian write is in flight or cycles wait in the
+        buffer. Background writers (the rollup above all) yield on it."""
+        if self._historian_writes_inflight > 0:
+            return True
+        with self._historian_buffer_lock:
+            return len(self._historian_buffer) > 0
+
+    def _schedule_historian_write(self, rows: list[dict[str, Any]], worker: Any = None) -> bool:
+        """Hand this cycle's rows to the gateway's persist pool and return
+        at once. Store-and-forward collectors never wait for their store:
+        the scan continues and a slow store grows the queue.
+
+        One flush per gateway at a time. A cycle that arrives while one is
+        in flight goes into the FIFO buffer, and the running flush drains
+        the buffer before it returns, so order is kept and nothing waits
+        for the next cycle. Returns False when the cycle was buffered
+        rather than submitted. Without a worker (no persist pool) the
+        write runs on a plain thread, still without waiting."""
+        executor = None
+        try:
+            getter = getattr(worker, "_get_persist_executor", None) if worker is not None else None
+            executor = getter() if callable(getter) else None
+        except Exception:
+            executor = None
+        if executor is None:
+            threading.Thread(target=self._flush_historian_buffer_then_write, args=(rows, worker),
+                             daemon=True, name="tn-hist-flush").start()
+            return True
+        gate = getattr(worker, "_historian_flush_gate", None)
+        if gate is None:
+            gate = threading.Lock()
+            try:
+                worker._historian_flush_gate = gate
+            except Exception:
+                pass
+        if not gate.acquire(blocking=False):
+            self._buffer_historian_rows(rows, reason="write-in-flight")
+            return False
+        with self._historian_inflight_lock:
+            self._historian_writes_inflight += 1
+
+        def _run() -> None:
+            try:
+                self._flush_historian_buffer_then_write(rows, worker)
+                # Cycles buffered while that ran: drain them now, in order,
+                # rather than leaving them for the next cycle.
+                for _ in range(3):
+                    with self._historian_buffer_lock:
+                        more = len(self._historian_buffer) > 0
+                    if not more:
+                        break
+                    self._flush_historian_buffer_then_write([], worker)
+            finally:
+                with self._historian_inflight_lock:
+                    self._historian_writes_inflight -= 1
+                gate.release()
+
+        executor.submit(_run)
+        return True
+
     def _flush_historian_buffer_then_write(
         self,
         current_rows: list[dict[str, Any]],
@@ -5066,7 +5131,8 @@ class PLCManager:
             self._historian_buffer.clear()
             self._historian_buffer_total_rows = 0
 
-        pending.append(list(current_rows))
+        if current_rows:
+            pending.append(list(current_rows))
 
         written_cycles = 0
         for idx, cycle_rows in enumerate(pending):

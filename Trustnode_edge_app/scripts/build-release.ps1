@@ -116,12 +116,23 @@ Invoke-TrustNodeSign @(
 )
 
 Write-Host "Building full Windows installer (frontend + backend + desktop)..."
+$distStartedAt = Get-Date
 & $npmCmd run dist
 if ($LASTEXITCODE -ne 0) {
     Pop-Location
     throw "Release build failed (exit code: $LASTEXITCODE)."
 }
 Pop-Location
+# 2026-11-03: exit code 0 has shipped a stale artifact before (CLAUDE.md 8).
+# The outputs must exist and be newer than this packaging step started.
+foreach ($out in @("TrustNode-Setup-0.1.0.exe", "TrustNode-0.1.0-portable.exe", "win-unpacked\TrustNode.exe")) {
+    $p = Join-Path (Join-Path $desktopRoot "dist") $out
+    if (-not (Test-Path $p)) { throw "Release build produced no $out - do not ship." }
+    if ((Get-Item $p).LastWriteTime -lt $distStartedAt) {
+        throw "$out is older than this build (written $((Get-Item $p).LastWriteTime), build started $distStartedAt) - a stale artifact, do not ship."
+    }
+    Write-Host ("  fresh: {0} ({1:yyyy-MM-dd HH:mm:ss})" -f $out, (Get-Item $p).LastWriteTime)
+}
 
 Write-Host "Done. Outputs are in: $desktopRoot\\dist"
 Write-Host "Expected files:"

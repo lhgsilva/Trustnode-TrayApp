@@ -601,3 +601,41 @@ tagged `[trustnode][lock-watchdog]` in
 `%APPDATA%	rustnode-edge-desktopackend.log` name the thread HOLDING
 the lock. Everything above bounds the damage; only that log names the cause.
 
+### Same day, the architecture review: one file, many writers
+
+Everything lives in `trustnode_app_store.db`: the collection writer (one
+commit per gateway cycle), the rollup (3 s of chunks a minute), the cloud
+forwarder (bursts of 2000 rows), config saves, logs, reports, control
+plane. SQLite has ONE writer, and its busy wait is a sleep-poll lottery,
+not a queue — under contention one waiter can lose every retry. The rules
+that keep the collector first:
+
+- **The collector never waits for the store.** The cycle hands its rows to
+  the gateway's persist pool and carries on (`_schedule_historian_write`);
+  one flush per gateway at a time, later cycles go into the FIFO buffer and
+  the running flush drains them in order. Measured before: a 3 s outside
+  hold stalled the cycle 2.86 s.
+- **Background writers yield to it, and the signal must be real.**
+  `_collection_writer_busy` asks `plc_manager.historian_write_pending()`;
+  the earlier queue check was on a pool the write never used, so the hook
+  was still always False with it "wired".
+- **A background writer reads outside the write lock.** The rollup chunk's
+  aggregation runs on a read-only handle; `BEGIN IMMEDIATE` wraps only the
+  upsert of its result rows (worst outside-writer wait measured: 28 ms).
+- **No write for nothing.** The idle forwarder stamped `data_sync_state`
+  every 80 ms tick and on every append; now once a minute.
+- **Every configuration write is bounded in one place**
+  (`AppStore._bounded_write`, raising `StoreBusy`, mapped to 503 in
+  `main.py`) — not one wrapped route out of twenty.
+- **A module reads its own scope from its own store.** The batch trigger
+  reader walked every workspace file it could find, unscoped and unindexed,
+  every 2 s.
+
+What comparable products (Ignition, PI, Telegraf) do and we now match:
+the scan never blocks on storage; one writer owns the history file and
+everyone else yields; rollups feed reports. What they also do and we do
+not yet: keep configuration in a separate small file from the history
+(a 2 KB save should never queue behind a 7 GB table). That is the one
+structural change worth planning; a time-series DB, a message bus or more
+processes are not.
+

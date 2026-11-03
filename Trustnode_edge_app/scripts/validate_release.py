@@ -385,6 +385,13 @@ SOURCE_CHECKS = [
     ("a busy store writer never makes the edge look dead", "test_store_busy_never_hangs.py"),
     ("a failed configuration save backs off", "test_failed_save_backs_off.py"),
     ("the installer never copies a multi-GB store", "test_install_copy_is_bounded.py"),
+    # 2026-11-03 architecture review: the cycle awaited its own store write
+    # (2.86 s stall measured with a 3 s outside hold), the rollup's busy
+    # signal watched a queue the write never used, a rollup chunk held the
+    # write lock across its read, the idle forwarder wrote 5x/s, and twenty
+    # write routes had no bound. Each is a few lines; these keep them.
+    ("the collection cycle never waits for the store", "test_collection_never_waits_on_store.py"),
+    ("background writers yield", "test_background_writers_yield.py"),
     # 2026-10-30, asked for directly: "every new installer can be installed
     # in existing computer with all fixes and updates". Boots the PACKAGED
     # backend on a copy of a real workspace with NO data-dir override - the

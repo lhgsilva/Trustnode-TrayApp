@@ -832,6 +832,16 @@ ON CONFLICT(resolution_s, tenant_id, gateway_id, tag_name, bucket_ms) DO UPDATE 
   q_min = excluded.q_min, q_max = excluded.q_max, q_bad_n = excluded.q_bad_n
 """
 
+# 2026-11-03: the raw aggregation is READ on a read-only handle first and only
+# the upsert of its result rows runs under BEGIN IMMEDIATE. As one
+# INSERT ... SELECT the write lock was held for the whole index read of a
+# 300 s chunk - seconds on a customer's disk, three of them every minute,
+# and the collection writer waited behind each one.
+_ROLLUP_RAW_SELECT = _ROLLUP_FROM_RAW[_ROLLUP_FROM_RAW.index("SELECT"):_ROLLUP_FROM_RAW.index("ON CONFLICT")]
+_ROLLUP_UPSERT = (_ROLLUP_FROM_RAW[:_ROLLUP_FROM_RAW.index("SELECT")]
+                  + "VALUES (" + ", ".join(["?"] * 18) + ")\n"
+                  + _ROLLUP_FROM_RAW[_ROLLUP_FROM_RAW.index("ON CONFLICT"):])
+
 _TEXT_EVENTS_SQL = f"""
 INSERT INTO historian_text_events (tenant_id, gateway_id, tag_name, ts_ms, value_text)
 SELECT tenant_id, COALESCE(gateway_id,''), tag_name, {_TS_S} * 1000, value_text
@@ -841,6 +851,10 @@ WHERE tenant_id = :tenant AND ts_utc >= :from_ts AND ts_utc < :to_ts
 GROUP BY tenant_id, COALESCE(gateway_id,''), tag_name, value_text, ({_TS_S} / 60) * 60
 ON CONFLICT(tenant_id, gateway_id, tag_name, ts_ms) DO NOTHING
 """
+_TEXT_EVENTS_SELECT = _TEXT_EVENTS_SQL[_TEXT_EVENTS_SQL.index("SELECT"):_TEXT_EVENTS_SQL.index("ON CONFLICT")]
+_TEXT_EVENTS_UPSERT = (_TEXT_EVENTS_SQL[:_TEXT_EVENTS_SQL.index("SELECT")]
+                       + "VALUES (?, ?, ?, ?, ?)\n"
+                       + _TEXT_EVENTS_SQL[_TEXT_EVENTS_SQL.index("ON CONFLICT"):])
 
 
 # --------------------------------------------------------------------------
@@ -1844,22 +1858,33 @@ class RetentionEngine:
                 continue
             chunk_end = min(cursor + chunk_ms, end_ms)
             t0 = time.time()
+            agg_rows: List[Tuple[Any, ...]] = []
+            text_rows: List[Tuple[Any, ...]] = []
+            if src_res is None:
+                # The read, on its own read-only handle: no write lock held.
+                params = {"res": res_s, "tenant": tenant,
+                          "from_ts": _ms_to_sql(cursor), "to_ts": _ms_to_sql(chunk_end)}
+                ro = self.store.connect(readonly=True)
+                try:
+                    agg_rows = [tuple(r) for r in ro.execute(_ROLLUP_RAW_SELECT, params).fetchall()]
+                    try:
+                        text_rows = [tuple(r) for r in ro.execute(_TEXT_EVENTS_SELECT, params).fetchall()]
+                    except Exception:
+                        text_rows = []
+                finally:
+                    ro.close()
             conn = self.store.connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 if src_res is None:
-                    cur = conn.execute(_ROLLUP_FROM_RAW, {
-                        "res": res_s, "tenant": tenant,
-                        "from_ts": _ms_to_sql(cursor), "to_ts": _ms_to_sql(chunk_end),
-                    })
-                    rows = max(0, int(cur.rowcount or 0))
-                    try:
-                        conn.execute(_TEXT_EVENTS_SQL, {
-                            "tenant": tenant,
-                            "from_ts": _ms_to_sql(cursor), "to_ts": _ms_to_sql(chunk_end),
-                        })
-                    except Exception:
-                        pass
+                    if agg_rows:
+                        conn.executemany(_ROLLUP_UPSERT, agg_rows)
+                    rows = len(agg_rows)
+                    if text_rows:
+                        try:
+                            conn.executemany(_TEXT_EVENTS_UPSERT, text_rows)
+                        except Exception:
+                            pass
                 else:
                     cur = conn.execute(_ROLLUP_FROM_TIER, {
                         "res": res_s, "src_res": src_res, "tenant": tenant,

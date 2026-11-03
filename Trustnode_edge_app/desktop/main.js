@@ -448,6 +448,11 @@ function ensureWritableDataDir(dir) {
   if (dirIsWritable(fallback)) {
     logBackend(`data dir ${dir} is not writable by this user (installer ACL); using ${fallback} instead`);
     chosenWorkspaceDataDir = fallback;
+    // 2026-11-03: remember it. Unpersisted, the next launch found no store in
+    // the chosen dir, detected yesterday's store in the fallback, and showed
+    // the "workspace detected" dialog - whose second button renames the live
+    // database - on every new PC's second start.
+    try { workspaceDetector.writePersistedChoice(app.getPath("userData"), fallback); } catch (_) {}
     return fallback;
   }
   logBackend(`WARNING: neither ${dir} nor ${fallback} is writable - the backend cannot store anything`);

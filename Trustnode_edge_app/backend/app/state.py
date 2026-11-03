@@ -1,4 +1,5 @@
 import os
+import sys
 import threading
 from typing import Any
 
@@ -85,7 +86,10 @@ def _build_stamp() -> str:
     from pathlib import Path as _P
     try:
         here = _P(__file__).resolve()
-        backend = _t.strftime("%Y-%m-%d %H:%M UTC", _t.gmtime(os.path.getmtime(str(here))))
+        # Packaged: the bundle keeps no app/*.py on disk, so the exe's own
+        # time is the build time. From source: this file's last edit.
+        stamp_of = sys.executable if getattr(sys, "frozen", False) else str(here)
+        backend = _t.strftime("%Y-%m-%d %H:%M UTC", _t.gmtime(os.path.getmtime(stamp_of)))
     except Exception:
         backend = "?"
     front = "?"
@@ -224,6 +228,11 @@ def _collection_writer_busy() -> bool:
     2026-11-02: the engine always had this hook and nothing ever supplied
     it, so `_writer_busy()` was permanently False."""
     try:
+        # 2026-11-03: the historian write never used the persist queue this
+        # looked at, so the signal was still always False. The manager
+        # knows: a flush in flight, or cycles waiting in its buffer.
+        if plc_manager.historian_write_pending():
+            return True
         for w in list(getattr(plc_manager, "workers", {}).values()):
             ex = getattr(w, "_persist_executor", None)
             if ex is not None and ex._work_queue.qsize() > 0:

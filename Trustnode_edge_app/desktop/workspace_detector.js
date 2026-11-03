@@ -360,4 +360,5 @@ module.exports = {
   resetCurrentWorkspace,
   detectWorkspaces,
   makeSnapshotCopy,
+  writePersistedChoice,
 };
