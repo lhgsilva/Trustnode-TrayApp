@@ -399,6 +399,7 @@ SOURCE_CHECKS = [
     # the latest-value cache, and one request gate for every background read.
     ("the Reports module never fails to load", "test_reports_pages_never_wait.py"),
     ("the Reports pages open with content, no page starves another", "test_reports_ui_never_waits.py"),
+    ("other pages open with content; the census never counts the historian", "test_pages_open_with_content.py"),
     # 2026-10-30, asked for directly: "every new installer can be installed
     # in existing computer with all fixes and updates". Boots the PACKAGED
     # backend on a copy of a real workspace with NO data-dir override - the

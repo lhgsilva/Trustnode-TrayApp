@@ -31,6 +31,7 @@ import {
   listBatches,
   listBatchTypes,
 } from "../../api";
+import { readReportsCache, writeReportsCache, cacheAgeLabel } from "../../reportsCache.js";
 
 // ---------------------------------------------------------------------------
 // section presets / option lists
@@ -3804,13 +3805,19 @@ function ComputedRulesEditor({ rules, gatewayOptions, tagsByGateway, formatTagFo
 // Top-level component
 // ---------------------------------------------------------------------------
 export function ReportTemplateDesigner({
+  changeTick = 0,
   gatewayOptions = [],
   tagsByGateway = {},
   emailSettings = null,
   formatTagForDisplay = (x) => x,
   onNotify = () => {},
 }) {
-  const [templates, setTemplates] = useState([]);
+  // 2026-11-03: the page opens with the last known templates on screen -
+  // the same shared cache the schedules and generated pages use - and
+  // refreshes behind. A failed read keeps them and says how old they are.
+  const cacheAtMountRef = useRef(readReportsCache());
+  const [templates, setTemplates] = useState(() => cacheAtMountRef.current.templates);
+  const [listsAsOf, setListsAsOf] = useState(() => Number(cacheAtMountRef.current.updatedAt) || 0);
   const [selectedId, setSelectedId] = useState("");
   const [draft, setDraft] = useState({
     id: "",
@@ -3833,6 +3840,9 @@ export function ReportTemplateDesigner({
       const res = await listReportTemplates();
       const list = Array.isArray(res?.templates) ? res.templates : [];
       setTemplates(list);
+      const now = Date.now();
+      writeReportsCache({ templates: list, updatedAt: now });
+      setListsAsOf(now);
       setLoadError("");
       // Take the banner back. The retry loop below already recovers from a
       // first read that lands while the backend is still starting; without
@@ -3890,6 +3900,16 @@ export function ReportTemplateDesigner({
     tick();
     return () => { cancelled = true; if (timer) clearTimeout(timer); };
   }, []);
+  // 2026-11-03: the reports store announces every template write on the
+  // live stream (App turns it into changeTick); a save on another page or
+  // another browser shows up here without a reload. One second of debounce.
+  const changeTimerRef = useRef(null);
+  useEffect(() => {
+    if (!changeTick) return undefined;
+    if (changeTimerRef.current) clearTimeout(changeTimerRef.current);
+    changeTimerRef.current = setTimeout(() => { changeTimerRef.current = null; refreshRef.current?.(); }, 1000);
+    return () => { if (changeTimerRef.current) { clearTimeout(changeTimerRef.current); changeTimerRef.current = null; } };
+  }, [changeTick]);
 
   const loadTemplate = (id) => {
     const tpl = templates.find((t) => String(t.id) === String(id));
@@ -4266,8 +4286,10 @@ export function ReportTemplateDesigner({
             templates". Say which it is, and let the operator retry now
             instead of waiting out the backoff (2026-10-07). */}
         {loadError ? (
-          <div className="error" role="alert" style={{ marginBottom: 8 }}>
-            Could not load the saved templates: {loadError}
+          <div className={listsAsOf ? "status warn" : "error"} role="alert" style={{ marginBottom: 8 }}>
+            {listsAsOf
+              ? `The templates could not be refreshed (${loadError}). Showing them as read ${cacheAgeLabel({ updatedAt: listsAsOf })}.`
+              : `Could not load the saved templates: ${loadError}`}
             <button className="btn btn-secondary btn-sm" style={{ marginLeft: 8 }}
                     onClick={() => refreshTemplates()}>
               Try again

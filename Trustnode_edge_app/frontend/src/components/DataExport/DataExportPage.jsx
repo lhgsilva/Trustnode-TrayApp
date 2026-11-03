@@ -23,6 +23,7 @@
 // historian read path that every chart and widget shares.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./dataExport.css";
+import { readPageCache, writePageCache } from "../../pageCache.js";
 
 const QUALITY_OPTIONS = [
   { value: "all", label: "All readings" },
@@ -69,8 +70,10 @@ function FilterSelect({ label, options, value, onChange, allLabel, disabled }) {
 
 export default function DataExportPage({ api, isCloudClient = false, onError }) {
   const [spec, setSpec] = useState(EMPTY_SPEC);
-  const [options, setOptions] = useState(null);
-  const [sources, setSources] = useState(null);
+  // 2026-11-03: the page opens with the last known options and sources
+  // (the filter lists) and refreshes behind; a failed read keeps them.
+  const [options, setOptions] = useState(() => readPageCache("data_export.options")?.value ?? null);
+  const [sources, setSources] = useState(() => readPageCache("data_export.sources")?.value ?? null);
   const [preview, setPreview] = useState(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
@@ -91,6 +94,8 @@ export default function DataExportPage({ api, isCloudClient = false, onError }) 
       apiRef.current.exportOptions(), apiRef.current.exportSources()]);
     setOptions(opt || null);
     setSources(src || null);
+    if (opt) writePageCache("data_export.options", opt);
+    if (src) writePageCache("data_export.sources", src);
     setLoadError("");
     if (opt?.default_columns?.length) patchRef.current({ columns: opt.default_columns });
   }, []);

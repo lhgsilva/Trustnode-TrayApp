@@ -1407,12 +1407,20 @@ class RetentionEngine:
         try:
             conn = self.store.connect(readonly=True)
             try:
-                rows = int(conn.execute(
-                    "SELECT COUNT(*) FROM historian_readings").fetchone()[0] or 0)
+                # 2026-11-03: COUNT(*) walked the whole index of an 8 GB table
+                # (seconds, and a long reader holds the WAL checkpoint back
+                # while it runs) every time the Retention page was open. The
+                # id range is two index seeks; it over-counts only by rows a
+                # prune has removed from the middle, which is what the page
+                # is there to show anyway.
+                lo, hi = conn.execute(
+                    "SELECT MIN(id), MAX(id) FROM historian_readings").fetchone()
+                rows = int(hi) - int(lo) + 1 if (lo is not None and hi is not None) else 0
             finally:
                 conn.close()
             with self._db_stats_lock:
-                self._db_stats = {"raw_rows": rows, "measured_mono": time.monotonic(),
+                self._db_stats = {"raw_rows": rows, "raw_rows_estimated": True,
+                                  "measured_mono": time.monotonic(),
                                   "measured_utc": _utc_now_text(), "measuring": False}
         except Exception as exc:
             log.debug("retention row census failed: %s", exc)

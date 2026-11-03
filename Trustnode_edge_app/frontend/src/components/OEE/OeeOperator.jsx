@@ -10,13 +10,15 @@ import {
   oeeMachinesLive, oeeList, oeeCycleStart, oeeCycleStop, oeeAddCount,
   oeeAddQuality, oeeConfirmDowntime, oeeSetState,
 } from "../../api";
+import { readPageCache, writePageCache } from "../../pageCache.js";
 import {
   StatePill, ConfidencePill, duration, num, pct, EmptyState, usePoll,
   STATE_LABELS, SOURCE_LABELS, DOWNTIME_STATES,
 } from "./OeeShared";
 
 export default function OeeOperatorPage({ canEdit = true }) {
-  const [machines, setMachines] = useState([]);
+  // 2026-11-03: opens with the last known machine list; refreshed behind.
+  const [machines, setMachines] = useState(() => readPageCache("oee.operator.machines")?.value ?? []);
   const [selectedId, setSelectedId] = useState("");
   const [reasons, setReasons] = useState([]);
   const [qualityReasons, setQualityReasons] = useState([]);
@@ -48,6 +50,7 @@ export default function OeeOperatorPage({ canEdit = true }) {
       const r = await oeeMachinesLive();
       const rows = r.machines || [];
       setMachines(rows);
+      writePageCache("oee.operator.machines", rows);
       setSelectedId((prev) => prev || (rows[0]?.machine_id || ""));
       setError("");
     } catch (e) {

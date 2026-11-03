@@ -29915,6 +29915,7 @@ const getGatewayHealth = (gateway) => {
           {activePage === "reporting" ? (
             <div className="page-fill single reporting-page-flat">
               <ReportTemplateDesigner
+                changeTick={reportsChangeTick}
                 gatewayOptions={allGatewayOptions || []}
                 tagsByGateway={triggerTagsByGateway || {}}
                 emailSettings={buildEmailTransportPayload(emailSettings || {})}

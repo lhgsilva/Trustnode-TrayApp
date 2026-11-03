@@ -92,9 +92,15 @@ console.log(JSON.stringify([a, b]));
     check("  a failed refresh keeps the lists and says how old they are",
           "Showing the lists as read" in page and "Reconnecting to the reports service" not in page)
 
+    designer = open(os.path.join(SRC, "components", "Reports", "ReportTemplateDesigner.jsx"), encoding="utf-8").read()
+    check("the Templates page mounts with the cached templates",
+          "useState(() => cacheAtMountRef.current.templates)" in designer
+          and "writeReportsCache({ templates: list, updatedAt: now })" in designer)
+    check("  keeps them on a failed read and says how old they are",
+          "Showing them as read" in designer and "[changeTick]" in designer)
     app = open(os.path.join(SRC, "App.jsx"), encoding="utf-8").read()
-    check("App turns reports_changed into changeTick for both Reports pages",
-          'data.type === "reports_changed"' in app and app.count("changeTick={reportsChangeTick}") == 2)
+    check("App turns reports_changed into changeTick for all three Reports pages",
+          'data.type === "reports_changed"' in app and app.count("changeTick={reportsChangeTick}") == 3)
 
     api = open(os.path.join(SRC, "api.js"), encoding="utf-8").read()
     m = re.search(r"async function fetchWithTimeout\(url, options = \{\}, timeoutMs = 12000\) \{(.*?)\n\}\n", api, re.S)

@@ -1160,7 +1160,10 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
     // interval is unknown (gatewayConfigs may not be loaded yet) — the in-flight
     // busy-guard in refreshCharts prevents overlap, so 1s is safe and keeps the
     // view live at the typical gateway rate.
-    return iv ? Math.max(1000, iv) : 1000;
+    // 2026-11-03: a 2 s floor. This read is a 20,000-row matrix; at the
+    // gateway's own interval (1 s) it was the heaviest poller in the app
+    // and sat in the same socket budget as every other page.
+    return iv ? Math.max(2000, iv) : 2000;
   }, [batch?.equipment_id, tags, gatewayConfigs]);
   const isLive = batch && !["completed", "aborted", "invalid"].includes(batch.status);
   // Fast beat: charts (trends + matrix) at the gateway interval.
