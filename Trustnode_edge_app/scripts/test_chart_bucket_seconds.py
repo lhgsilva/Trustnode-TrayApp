@@ -162,9 +162,11 @@ def main() -> int:
         lu = fh.read()
     with open(os.path.join(fe, "App.jsx"), encoding="utf-8") as fh:
         appjs = fh.read()
-    check("chart widgets send their bucket on every series fetch",
-          w.count("bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg)") >= 6,
-          "%d sites" % w.count("bucketSeconds: bucketSecondsFor(cfg)"))
+    # 2026-11-04: the server-query fetches send the EFFECTIVE bucket (the
+    # explicit one, or the window-derived one when none is set).
+    _sites = (w.count("bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg)")
+              + w.count("bucketSeconds: effectiveBucketSeconds, bucketAgg: bucketAggFor(cfg)"))
+    check("chart widgets send their bucket on every series fetch", _sites >= 6, "%d sites" % _sites)
     check("  a bucketed widget is served from the store, not the 1 Hz stream",
           "bucketSecondsFor(cfg) <= 0" in w)
     check("  the two keys survive the widget allowlist (the normalise trap)",

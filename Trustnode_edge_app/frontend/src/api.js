@@ -4191,6 +4191,32 @@ export async function regenerateGeneratedReport(generatedId) {
   return res.json();
 }
 
+export async function getGeneratedReport(generatedId) {
+  const res = await fetchWithTimeout(withNoCache(`${_reportApiBase()}/api/reports/generated/${encodeURIComponent(generatedId)}`), {
+    headers: { "Cache-Control": "no-store" },
+  });
+  await ensureOk(res, "Generated report fetch failed");
+  return res.json();
+}
+
+// 2026-11-04: a preview render answers at once with a PENDING record and
+// renders behind; wait here until it is ready or failed (bounded), so no
+// request ever sits on a render.
+export async function waitForGeneratedReady(generatedId, { timeoutMs = 180000, onTick = null } = {}) {
+  const started = Date.now();
+  let last = null;
+  while (Date.now() - started < timeoutMs) {
+    const res = await getGeneratedReport(generatedId);
+    last = res?.generated || null;
+    const state = String(last?.render_state || "ready");
+    if (state === "ready") return last;
+    if (state === "failed") throw new Error(String(last?.render_error || "Render failed"));
+    if (typeof onTick === "function") onTick(Math.round((Date.now() - started) / 1000));
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  throw new Error(`The preview is still being generated after ${Math.round(timeoutMs / 1000)} s - it will appear in Generated reports when it finishes.`);
+}
+
 export async function deleteGeneratedReport(generatedId) {
   const res = await fetchWithTimeout(`${_reportApiBase()}/api/reports/generated/${encodeURIComponent(generatedId)}`, {
     method: "DELETE",

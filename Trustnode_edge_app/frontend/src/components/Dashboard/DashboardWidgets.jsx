@@ -809,6 +809,25 @@ export const BUCKET_INTERVAL_SECONDS = {
 export function bucketSecondsFor(cfg) {
   return Number(BUCKET_INTERVAL_SECONDS[String(cfg?.bucket_interval || "none")] || 0);
 }
+// 2026-11-04, reported: "when I set more period of time to show the data it
+// still shows only a few" points. A time window was applied as a FILTER, but
+// the request still asked for the newest N rows - so an 8 h window drew the
+// last two minutes. With no explicit bucket, the window is now divided into
+// the reading count: the bucket is the smallest step that keeps the point
+// count within readings_count. Raw stays raw when it already fits.
+const AUTO_BUCKET_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 86400];
+export function autoBucketSecondsFor(windowSeconds, readingsCount, pollSeconds) {
+  const span = Number(windowSeconds) || 0;
+  const points = Math.max(5, Number(readingsCount) || 120);
+  const poll = Math.max(0.1, Number(pollSeconds) || 1);
+  if (span <= 0) return 0;
+  if (span / poll <= points) return 0;          // the raw samples already fit
+  const need = span / points;
+  for (const step of AUTO_BUCKET_STEPS) {
+    if (step >= need && step > poll) return step;
+  }
+  return AUTO_BUCKET_STEPS[AUTO_BUCKET_STEPS.length - 1];
+}
 export function bucketAggFor(cfg) {
   const a = String(cfg?.bucket_aggregation || "avg");
   return ["avg", "min", "max", "last"].includes(a) ? a : "avg";
@@ -2401,6 +2420,13 @@ function DashboardWidgetCardImpl({
     queryRowsReqKeyRef.current = paramsKey;
     queryRowsInFlightRef.current = true;
     const chartReads = cfgReadingsCount;
+    // 2026-11-04: a time window with no explicit bucket is bucketed to the
+    // reading count (see autoBucketSecondsFor); explicit buckets win.
+    const _spanS = (range?.fromUtc && range?.toUtc)
+      ? Math.max(0, (Date.parse(range.toUtc) - Date.parse(range.fromUtc)) / 1000) : 0;
+    const effectiveBucketSeconds = bucketSecondsFor(cfg) > 0
+      ? bucketSecondsFor(cfg)
+      : (isTrendWidget ? autoBucketSecondsFor(_spanS, cfgReadingsCount, Math.max(0.2, Number(gatewayIntervalMs || 1000) / 1000)) : 0);
     const rowTagFilter =
       isComputedPie
         ? (() => {
@@ -2438,7 +2464,7 @@ function DashboardWidgetCardImpl({
             tag: rowTagFilter,
             timeoutMs: 12000,
             maxAttempts: 2,
-            bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg),
+            bucketSeconds: effectiveBucketSeconds, bucketAgg: bucketAggFor(cfg),
           });
           const safeFirst = Array.isArray(rows) ? rows : [];
           // Backward-compat fallback: some saved widgets may carry stale gateway ids.
@@ -2453,7 +2479,7 @@ function DashboardWidgetCardImpl({
               tag: rowTagFilter,
               timeoutMs: 12000,
               maxAttempts: 2,
-              bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg),
+              bucketSeconds: effectiveBucketSeconds, bucketAgg: bucketAggFor(cfg),
             });
           }
         } else {

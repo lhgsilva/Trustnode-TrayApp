@@ -1289,6 +1289,13 @@ def pill_position(section: dict[str, Any]) -> str:
     return _ALIGNMENTS.get(want, "LEFT")
 
 
+#: A fitted pill is sized to its text plus this slack (points, and a share of
+#: the text width); below this font size the text is shrunk no further.
+_PILL_SLACK_PT = 1.5
+_PILL_SLACK_FRAC = 0.02
+_PILL_MIN_PT = 7.0
+
+
 def pill_band(text: str, styles, *, background: Any = None, color: Any = None,
               corners: str = "both", radius: Any = None, align: str = "left",
               font_size: Any = None, bold: bool = True, width: float = 0.0,
@@ -1345,10 +1352,24 @@ def pill_band(text: str, styles, *, background: Any = None, color: Any = None,
     # leaving the width unset does not shrink the band, it fills the page and
     # leaves hAlign nothing to move.
     if str(fit or "fill").strip().lower() == "content":
+        # 2026-11-04, reported: "fit the text" wrapped and cut the text.
+        # Measured at 28 pt: the band's inner width EQUALLED the text width,
+        # and ReportLab wraps on a rounding hair - so a title that fitted
+        # the page came out on two lines. A fitted pill is one line by
+        # definition: a little slack, and when the text is wider than the
+        # page the FONT shrinks to fit rather than the text wrapping.
         pad = size * 0.9
         text_w = max((stringWidth(line, para.fontName, size)
                       for line in raw.splitlines() or [""]), default=0.0)
-        band_w = text_w + 2 * pad
+        slack = _PILL_SLACK_PT + text_w * _PILL_SLACK_FRAC
+        if width and text_w + slack + 2 * pad > width and text_w > 0:
+            shrink = max(_PILL_MIN_PT, (width - 2 * pad) / (text_w * (1 + _PILL_SLACK_FRAC) + _PILL_SLACK_PT) * size)
+            size = max(_PILL_MIN_PT, min(size, shrink))
+            para = ParagraphStyle("PillBandFit", parent=para, fontSize=size, leading=size * 1.25)
+            text_w = max((stringWidth(line, para.fontName, size)
+                          for line in raw.splitlines() or [""]), default=0.0)
+            slack = _PILL_SLACK_PT + text_w * _PILL_SLACK_FRAC
+        band_w = text_w + slack + 2 * pad
         if width:
             band_w = min(band_w, width)          # never wider than the page
         band_w = max(band_w, size * 3)           # a readable minimum
@@ -1780,7 +1801,19 @@ def _section_pill_card(section: dict[str, Any], styles, story: list) -> None:
                     out_row.append("")        # the padding of a short last row
                     continue
                 txt, font, pt = measure[i]
-                inner_w = min(stringWidth(txt, font, pt) + 2 * pad, per)
+                # 2026-11-04: slack, and shrink the font when the text is
+                # wider than its column - see pill_band for the measurement.
+                text_w = stringWidth(txt, font, pt)
+                want_w = text_w * (1 + _PILL_SLACK_FRAC) + _PILL_SLACK_PT + 2 * pad
+                if want_w > per and text_w > 0:
+                    fit_pt = max(_PILL_MIN_PT, (per - 2 * pad) / (text_w * (1 + _PILL_SLACK_FRAC) + _PILL_SLACK_PT) * pt)
+                    if fit_pt < pt:
+                        fit_style = ParagraphStyle("PillFit%d" % i, parent=cell.style,
+                                                   fontSize=fit_pt, leading=fit_pt * 1.2)
+                        cell = Paragraph(cell.text if hasattr(cell, "text") else txt, fit_style)
+                        text_w = stringWidth(txt, font, fit_pt)
+                        want_w = text_w * (1 + _PILL_SLACK_FRAC) + _PILL_SLACK_PT + 2 * pad
+                inner_w = min(want_w, per)
                 inner = Table([[cell]], colWidths=[inner_w])
                 icmds = [
                     ("VALIGN", (0, 0), (0, 0), "MIDDLE"),

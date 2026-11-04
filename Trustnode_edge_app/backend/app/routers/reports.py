@@ -791,10 +791,36 @@ def render_inline(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="template payload is required")
     if not template.get("id"):
         template["id"] = "preview"
-    record = _render_into_record(template, triggered_by="manual")
-    if record.get("render_state") == "failed":
-        raise HTTPException(status_code=500, detail=f"Render failed: {record.get('render_error')}")
-    return {"ok": True, "generated": record}
+    # 2026-11-04, reported: the preview "failed, time out after 60 s". The
+    # request rendered the whole PDF before answering, so a slow render on a
+    # loaded edge hit the page's timeout and the operator saw nothing - not
+    # even that it was being made. Record first, PDF second, like a
+    # scheduled run: the PENDING record is returned at once and the page
+    # polls it until it is ready or failed. No request waits on a render.
+    tenant = get_current_tenant()
+    pending = reports_store.insert_generated({
+        "template_id": template.get("id"),
+        "template_name": template.get("name"),
+        "triggered_by": "manual",
+        "file_path": "", "file_name": "", "file_bytes": 0, "file_sha256": "",
+        "meta": {"window_from": "", "window_to": "", "segments": [], "segment_count": 0,
+                 "trigger": "manual", "render_state": "pending"},
+    })
+    gid = str((pending or {}).get("id") or "")
+
+    def _work():
+        from app.tenant import set_current_tenant
+        set_current_tenant(tenant)
+        try:
+            _render_into_record(template, triggered_by="manual", generated_id=gid)
+        except Exception as exc:                            # noqa: BLE001
+            try:
+                reports_store.update_generated_render(gid, render_state="failed",
+                                                      render_error="Render failed: %s" % exc)
+            except Exception:
+                pass
+    _threading_rpt.Thread(target=_work, name="tn-report-preview-%s" % gid[:8], daemon=True).start()
+    return {"ok": True, "generated": pending}
 
 
 # --------------------------------------------------------------------------- #

@@ -27,6 +27,7 @@ import {
   importReportTemplates,
   listReportTemplates,
   renderReportPreview,
+  waitForGeneratedReady,
   saveReportTemplate,
   listBatches,
   listBatchTypes,
@@ -4115,6 +4116,10 @@ export function ReportTemplateDesigner({
       const res = await renderReportPreview(draft);
       const generated = res?.generated;
       if (!generated?.id) throw new Error("Renderer did not return a report id");
+      // 2026-11-04: the render runs behind; wait for the record, not the request.
+      await waitForGeneratedReady(generated.id, {
+        onTick: (secs) => setPreviewState({ rendering: true, generatedId: "", error: "", seconds: secs }),
+      });
       const blobUrl = await fetchPreviewBlob(generated.id);
       if (previewBlobUrl) {
         try { URL.revokeObjectURL(previewBlobUrl); } catch (_) {}
@@ -4135,6 +4140,7 @@ export function ReportTemplateDesigner({
         const res = await renderReportPreview(draft);
         generatedId = res?.generated?.id;
         if (!generatedId) throw new Error("Render did not return a report id");
+        await waitForGeneratedReady(generatedId);
         setPreviewState({ rendering: false, generatedId, error: "" });
       }
       const blob = await downloadGeneratedReportBlob(generatedId);

@@ -400,6 +400,11 @@ SOURCE_CHECKS = [
     ("the Reports module never fails to load", "test_reports_pages_never_wait.py"),
     ("the Reports pages open with content, no page starves another", "test_reports_ui_never_waits.py"),
     ("other pages open with content; the census never counts the historian", "test_pages_open_with_content.py"),
+    # 2026-11-04, five things reported: a fitted pill wrapped (zero slack), a
+    # preview blocked its request, a time window drew the newest N rows, the
+    # trigger window read a key the rows do not carry, and destination rules
+    # (which do work end to end - the test proves it through the scheduler).
+    ("the five things reported on 2026-11-04", "test_report_fixes_2026_11_04.py"),
     # 2026-10-30, asked for directly: "every new installer can be installed
     # in existing computer with all fixes and updates". Boots the PACKAGED
     # backend on a copy of a real workspace with NO data-dir override - the

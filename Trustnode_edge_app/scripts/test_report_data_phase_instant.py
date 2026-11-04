@@ -207,9 +207,14 @@ def main() -> int:
              "series": [ser("T7"), ser("T0")]},
         ]}}
         rr.render_template_to_pdf(tpl)                      # warm the fonts
-        t0 = time.perf_counter()
-        path, n, _ = rr.render_template_to_pdf(tpl)
-        render_s = time.perf_counter() - t0
+        # 2026-11-04: best of three. One sample on a machine that is also
+        # building or collecting measured 2.9 s with the same code that
+        # measures 0.8 s idle; a real slowdown is slow three times.
+        render_s = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            path, n, _ = rr.render_template_to_pdf(tpl)
+            render_s = min(render_s, time.perf_counter() - t0)
         # 2.5 s: measured 0.8-1.2 s here, 1.5 s while an installer build shared
         # the CPU; the regression this guards was 7.0 s.
         check("a 2-chart/9-KPI/pie/table report renders in under 2.5 s with collection running",

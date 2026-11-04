@@ -1267,13 +1267,18 @@ def get_historian_trigger_window(
             edge_id="",
         ) or []
         # Oldest -> newest, so a transition is row[i-1] False and row[i] True.
-        rows = sorted(rows, key=lambda r: str(r.get("ts_utc") or ""))
+        # 2026-11-04: the rows carry `ts`, not `ts_utc`. Reading the wrong key
+        # sorted blank stamps and returned "" for every edge, so no trigger
+        # window was EVER found and the dashboard fell back to its reading
+        # count - "nothing was working". Both keys are read now.
+        _stamp = lambda r: str(r.get("ts_utc") or r.get("ts") or "")  # noqa: E731
+        rows = sorted(rows, key=_stamp)
         last_true_start = ""
         prev = False
         for r in rows:
             now_true = _holds(r, op, val)
             if now_true and not prev:
-                last_true_start = str(r.get("ts_utc") or "")
+                last_true_start = _stamp(r)
             prev = now_true
         return last_true_start
 
@@ -1287,12 +1292,12 @@ def get_historian_trigger_window(
             offset=0, prefer_cloud_reads=False,
             gateway=(stop_gateway or gateway), device="", tag=stop_tag, edge_id="",
         ) or []
-        rows = sorted(rows, key=lambda r: str(r.get("ts_utc") or ""))
+        rows = sorted(rows, key=lambda r: str(r.get("ts_utc") or r.get("ts") or ""))
         prev = False
         for r in rows:
             now_true = _holds(r, stop_operator, stop_value)
             if now_true and not prev:
-                stop_at = str(r.get("ts_utc") or "")
+                stop_at = str(r.get("ts_utc") or r.get("ts") or "")
                 break
             prev = now_true
     return {"ok": True, "found": bool(start_at), "from_utc": start_at,
