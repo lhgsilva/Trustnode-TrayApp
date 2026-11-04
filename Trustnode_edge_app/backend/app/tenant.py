@@ -103,6 +103,51 @@ def _tenant_from_configured_domains(host_txt: str) -> Optional[str]:
     return mapping.get(host_txt)
 
 
+ADMIN_ROLES = ("admin", "super")
+
+
+def edge_session_decision(user_tenant: str, role: str, configured_tenant: str,
+                          *, recovery: bool = False) -> tuple:
+    """(allowed, tenant_to_run_as, reason) for a sign-in on this edge.
+
+    2026-11-04, from the owner: "we never should use the developer tenant on
+    local edges; the edge is linked to a customer and licences and the LAN
+    should only see this; the developer tenant should never be linked to a
+    local edge customer" - and do not move admin accounts into the customer.
+
+    On an edge ACTIVATED into a customer tenant:
+      * an account of that tenant signs in as it is;
+      * a NON-admin account still filed under `default` (an operator or
+        viewer created before the 2026-11-02 fix) signs in as the edge's
+        tenant - it was always this edge's own account;
+      * an ADMIN account under `default` is a developer account: refused;
+      * an account of another customer's tenant: refused;
+      * the local recovery login (`recovery`) runs as the edge's tenant.
+    An edge with no identity (the portal, a fresh install) decides nothing.
+    """
+    conf = normalize_tenant_id(str(configured_tenant or ""))
+    tok = normalize_tenant_id(str(user_tenant or "")) or "default"
+    if not conf or conf == "default":
+        return True, tok, ""
+    if tok == conf:
+        return True, tok, ""
+    if tok == "default":
+        if recovery:
+            return True, conf, ""
+        if str(role or "").strip().lower() in ADMIN_ROLES:
+            return False, "", "developer_account"
+        return True, conf, ""
+    return False, "", "other_customer"
+
+
+def edge_session_refusal_text(reason: str, user_tenant: str, configured_tenant: str) -> str:
+    if reason == "developer_account":
+        return ("This is a TrustNode developer account. It cannot sign in to a customer edge - "
+                "sign in with an account of this edge.")
+    return ("This account belongs to another customer (%s). This edge belongs to %s - sign in "
+            "with an account of this edge." % (user_tenant or "?", configured_tenant or "?"))
+
+
 def session_tenant(token_tenant: str, configured_tenant: str) -> str:
     """The tenant a SIGNED-IN session runs as.
 

@@ -189,6 +189,33 @@ def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _edge_session(user_public: Dict[str, Any], *, recovery: bool = False,
+                  username: str = "", client_host: str = "") -> Dict[str, Any]:
+    """Apply tenant.edge_session_decision to a session about to be issued.
+
+    Returns the session with the tenant it runs as, or raises 403 with the
+    reason. Called wherever this router mints a token (2026-11-04)."""
+    from app.tenant import edge_session_decision, edge_session_refusal_text
+    try:
+        from app.state import app_store as _st
+        conf = _st._configured_tenant_id()                     # noqa: SLF001
+    except Exception:                                          # noqa: BLE001
+        conf = ""
+    ok, tenant, why = edge_session_decision(user_public.get("tenant_id"),
+                                            str(user_public.get("role") or ""),
+                                            conf, recovery=recovery)
+    if ok:
+        user_public["tenant_id"] = tenant
+        return user_public
+    try:
+        auth_store.record_login(username or str(user_public.get("username") or ""), ok=False,
+                                remote_ip=client_host, detail="edge_tenant:%s" % why)
+    except Exception:                                          # noqa: BLE001
+        pass
+    raise HTTPException(status_code=403, detail=edge_session_refusal_text(
+        why, str(user_public.get("tenant_id") or ""), conf))
+
+
 def _cp_row_usable_here(row: Any) -> bool:
     """2026-11-02: a control-plane row under tenant `default` belongs to the
     developer tenant - the portal's own users. On an edge activated into a
@@ -300,7 +327,8 @@ def login(payload: LoginRequest, request: Request, response: Response) -> Dict[s
             except Exception:
                 pass
             raise HTTPException(status_code=403, detail="The master account with its default password cannot be used from the network. Set TRUSTNODE_MASTER_ADMIN_PASSWORD or sign in with a named admin account.")
-        user_public = _public_user(_master_admin_user_row())
+        user_public = _edge_session(_public_user(_master_admin_user_row()), recovery=True,
+                                    username=username, client_host=client_host)
         _ttl = 4 * 3600 if _remote else 12 * 3600
         token = create_access_token(user_public, expires_seconds=_ttl)
         try:
@@ -433,7 +461,7 @@ def login(payload: LoginRequest, request: Request, response: Response) -> Dict[s
                 raise HTTPException(status_code=423, detail=f"Account temporarily locked after repeated failures. Try again after {_until} UTC.")
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    user_public = _public_user(hit)
+    user_public = _edge_session(_public_user(hit), username=username, client_host=client_host)
     # Operator 2026-06-23: enforce `max_view_users` for view-role logins.
     # Admins, engineers, and master-admin are NOT counted. Failure of
     # the helper itself fails OPEN (login proceeds).
@@ -571,6 +599,7 @@ def refresh(request: Request, response: Response) -> Dict[str, Any]:
         "tenant_id": payload.get("tenant_id") or get_current_tenant(),
     }
     client_host = str(getattr(request.client, "host", "") or "unknown")
+    user_public = _edge_session(user_public, username=username, client_host=client_host)
     _ttl = 4 * 3600 if _client_is_remote(client_host) else 12 * 3600
     fresh = create_access_token(user_public, expires_seconds=_ttl)
     try:
@@ -675,6 +704,7 @@ def change_password(payload: ChangePasswordRequest, request: Request) -> Dict[st
         "tenant_id": tenant_id,
         "must_change_password": False,
     }
+    new_user = _edge_session(new_user, username=username)
     new_token = create_access_token(new_user)
     return {"ok": True, "token": new_token, "user": new_user}
 
@@ -1013,7 +1043,8 @@ def login_code_verify(payload: _CodeVerifyPayload, request: Request,
             pass
         # Same answer as a wrong password, for the same reason.
         raise HTTPException(status_code=401, detail="That code is not valid")
-    user_public = _public_user(user)
+    user_public = _edge_session(_public_user(user), username=str(user.get("username") or ""),
+                                client_host=client_host)
     # Recovery is deliberately short-lived and carries `pwreset`, which is
     # the ONLY thing that lets /change-password accept a blank current
     # password. The user came here because they cannot sign in; the session

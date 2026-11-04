@@ -415,6 +415,10 @@ SOURCE_CHECKS = [
     # 2026-11-04: accounts created before the tenant fix carry `default` and
     # saw none of the edge's reports, on the desktop and over LAN.
     ("an account filed under default sees this edge", "test_default_account_sees_edge.py"),
+    # 2026-11-04: a permission ticked on the Users page must open its pages -
+    # the page rule never read the catalogue (Scheduled Reports checked
+    # "Users and access"; OEE, batch and power configuration were dead keys).
+    ("a ticked permission opens exactly its pages", "test_permissions_open_pages.py"),
     # 2026-10-30, asked for directly: "every new installer can be installed
     # in existing computer with all fixes and updates". Boots the PACKAGED
     # backend on a copy of a real workspace with NO data-dir override - the

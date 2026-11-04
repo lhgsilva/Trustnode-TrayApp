@@ -441,8 +441,18 @@ cp_users                     : (default, admin), (tenant-cust-11e164d2, admin)
   — ran as the developer tenant. Now `tenant.effective_tenant()` resolves a
   request with no tenant of its own to the tenant the edge was ACTIVATED
   into (`app_store._configured_tenant_id()`, cached 15 s in `main.py`).
-  The strict token-vs-host 403 keys on the HOST alone: a user whose row
-  still says `default` keeps signing in. A lock-out is not a fix.
+  The strict token-vs-host 403 keys on the HOST alone.
+- **2026-11-04, the owner tightened this:** "the developer tenant should
+  never be linked to a local edge customer" - and admin accounts are NOT
+  moved. One rule decides every session on an activated edge
+  (`tenant.edge_session_decision`, applied wherever a token is minted and
+  in the request middleware): this edge's accounts as they are; a NON-admin
+  `default` row runs as the edge and is moved into it at boot; an ADMIN
+  `default` row (a developer account) and another customer's account are
+  REFUSED with the reason; the local recovery login runs as the edge.
+  Content seeded under `default` before activation moves into the edge at
+  boot in small batches (`AppStore.rehome_default_content`; cp_* tables are
+  the portal's and are left alone). `test_default_account_sees_edge.py`.
 - **`ControlPlaneStore._seed_defaults` inserted `cp_users (default, admin,
   hash("admin"))` into every store** — every customer edge included — and
   the login's any-tenant fallback accepted it. `admin/admin` opened any

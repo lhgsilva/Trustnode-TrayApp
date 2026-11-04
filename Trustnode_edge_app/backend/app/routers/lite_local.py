@@ -135,9 +135,11 @@ def _verify_session_jwt(jwt: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _lite_session_tenant(token_tenant: str, edge_tenant: str) -> str:
-    from app.tenant import session_tenant
-    return session_tenant(token_tenant, edge_tenant) or "default"
+def _lite_session_tenant(token_tenant: str, edge_tenant: str, role: str = "") -> str:
+    """tenant.edge_session_decision; a refused session keeps its own tenant."""
+    from app.tenant import edge_session_decision
+    ok, tenant, _why = edge_session_decision(token_tenant, role, edge_tenant)
+    return (tenant if ok else str(token_tenant or "")) or "default"
 
 
 def _extract_session(request: Request, token_qs: Optional[str]) -> Dict[str, Any]:
@@ -178,7 +180,7 @@ def _extract_session(request: Request, token_qs: Optional[str]) -> Dict[str, Any
                     # reads THIS edge's tenant (tenant.session_tenant).
                     "tenant_id": _lite_session_tenant(
                         str(jwt_body.get("tenant_id") or s.get("tenant_id") or "default"),
-                        str(s.get("tenant_id") or "")),
+                        str(s.get("tenant_id") or ""), str(jwt_body.get("role") or "")),
                     "edge_id": str(s.get("edge_id") or ""),
                     "customer_id": str(jwt_body.get("customer_id") or s.get("customer_id") or ""),
                     "user_id": str(jwt_body.get("sub") or jwt_body.get("username") or ""),
@@ -354,7 +356,12 @@ def post_validate(payload: ValidateRequest, request: Request) -> dict:
                     "tenant_id": str(row.get("tenant_id") or "default"),
                     "customer_id": str(row.get("customer_id") or ""),
                 }
-            auth_jwt = create_access_token(user_public)
+            from app.tenant import edge_session_decision as _esd
+            _ok, _tid, _why = _esd(user_public.get("tenant_id"), str(user_public.get("role") or ""),
+                                   app_store._configured_tenant_id())   # noqa: SLF001
+            if _ok:
+                user_public["tenant_id"] = _tid
+                auth_jwt = create_access_token(user_public)
         except Exception as exc:
             logger.exception("lite-local validate: auth-jwt mint failed (continuing)")
     return {

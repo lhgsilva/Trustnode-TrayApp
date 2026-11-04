@@ -1,4 +1,5 @@
 import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { cataloguePageOpen, cataloguePageEdit } from "./permissionCatalog.js";
 import { Login } from "./components/Login/Login";
 import { DashboardDesigner } from "./components/Dashboard/DashboardDesigner";
 import IfmPortMapper from "./components/Gateways/IfmPortMapper";
@@ -2533,7 +2534,32 @@ function compareByOperator(value, operator, threshold) {
   return false;
 }
 
+// 2026-11-04: catalogue permissions the role templates below never set, so
+// a new engineer or operator had no way into OEE, batches or power
+// configuration, and an engineer started without Scheduled Reports or
+// E-mail. Applied on top of the template; an admin can still untick any.
+const ROLE_PERMISSION_ADDITIONS = {
+  admin: {
+    custom_dashboards: true, power_management: true, historian_export: true,
+    report_templates: true, batch_management: true, batch_definitions: true,
+    oee: true, oee_configuration: true, oee_planning: true,
+  },
+  engineer: {
+    custom_dashboards: true, power_management: true, historian_export: true,
+    report_templates: true, scheduled_reports: true, email_and_notifications: true,
+    batch_management: true, batch_definitions: true,
+    oee: true, oee_configuration: true, oee_planning: true,
+  },
+  operator: {
+    historian_export: true, batch_management: true, oee: true,
+  },
+};
+
 function buildRolePermissions(role) {
+  return { ..._baseRolePermissions(role), ...(ROLE_PERMISSION_ADDITIONS[String(role || "").toLowerCase()] || {}) };
+}
+
+function _baseRolePermissions(role) {
   if (role === "admin") {
     return {
       // 2026-10-27, reported: "users created locally cannot access the LAN".
@@ -2747,6 +2773,12 @@ function buildRolePermissions(role) {
     users_and_access_control: false
   };
 }
+// 2026-11-04: pages whose edit right follows the permission catalogue.
+const CATALOGUE_EDIT_PAGES = new Set([
+  "scheduled_reports", "email_and_notifications", "power_configuration",
+  "oee_overview", "oee_operator", "oee_machine_detail", "oee_configuration", "oee_planning",
+]);
+
 function normalizePermissions(rawPermissions, role) {
   return {
     ...buildRolePermissions(role),
@@ -12534,6 +12566,14 @@ function AppShell() {
     if (isReadOnlySession()) return false;
     if (!currentUser) return false;
     if (currentUser.role === "admin") return true;
+    // 2026-11-04: these pages checked "Users and access" (Scheduled Reports,
+    // E-mail) or a key the Users page never offers (OEE, power configuration).
+    // They follow the catalogue: the page's own permission, and a change only
+    // for the roles the backend lets change it.
+    if (CATALOGUE_EDIT_PAGES.has(page)) {
+      const _edit = cataloguePageEdit(page, currentUser.permissions, currentUser.role);
+      if (_edit !== null) return _edit;
+    }
     const mapped =
       page === "dashboard"
         ? "dashboard"
@@ -12735,6 +12775,15 @@ function AppShell() {
     // a per-user permission so an admin can block specific users.
     if (page === "trustnode_intelligence") {
       return Boolean(currentUser?.permissions?.trustnode_intelligence);
+    }
+    // 2026-11-04, reported: users given a permission on the Users page did not
+    // get the page (Scheduled Reports above all). For a non-admin, the
+    // permission catalogue - the same table the Users page is drawn from -
+    // decides which permission opens which page, and admin-only pages stay
+    // closed. Pages the catalogue does not cover keep the rule below.
+    if (!isAdmin) {
+      const _byCatalogue = cataloguePageOpen(page, currentUser?.permissions);
+      if (_byCatalogue !== null) return _byCatalogue;
     }
     return canEditPage(page);
   }, [currentUser, isPortalOnly, isClientView, isPageLicensed, canEditPage, hasLicenseModule, licensedModuleKeys, edgeLicenseSnapshot?.ok, licenseTampered]);

@@ -1,5 +1,6 @@
 from app import boot_clock as _boot_clock  # noqa: E402  (BOOT-HEALTH: capture T0 first)
 import asyncio
+import threading
 import json
 import math
 import logging
@@ -173,12 +174,22 @@ from app.tenant import (effective_tenant, resolve_request_tenant,
 _CONFIGURED_TENANT_CACHE = {"value": "", "ts": 0.0}
 
 
-def _session_tenant(token_tenant: str) -> str:
-    """A signed-in session's tenant - see tenant.session_tenant (2026-11-04)."""
-    if not str(token_tenant or "").strip():
+def _session_tenant(payload) -> str:
+    """A signed-in session's tenant (2026-11-04, tenant.edge_session_decision).
+
+    An allowed session runs as the tenant the rule gives it. A refused one -
+    a developer admin, another customer - keeps its OWN tenant, which holds
+    nothing of this edge: it is never handed this customer's data. (Sign-in
+    and refresh refuse such accounts outright; this covers a token issued
+    before the rule.)"""
+    payload = payload if isinstance(payload, dict) else {}
+    token_tenant = str(payload.get("tenant_id") or "").strip()
+    if not token_tenant:
         return ""
-    from app.tenant import session_tenant
-    return session_tenant(token_tenant, _configured_tenant())
+    from app.tenant import edge_session_decision
+    ok, tenant, _why = edge_session_decision(token_tenant, str(payload.get("role") or ""),
+                                             _configured_tenant())
+    return tenant if ok else token_tenant
 
 
 def _configured_tenant() -> str:
@@ -388,7 +399,7 @@ class CloudLiveAuthMiddleware:
             host_tenant = resolve_request_tenant(_FakeRequest(scope))
         except Exception:
             host_tenant = "default"
-        token_tenant = _session_tenant(str(payload.get("tenant_id") or "").strip())
+        token_tenant = _session_tenant(payload)
         if token_tenant:
             normalized = set_current_tenant(token_tenant)
             if host_tenant and host_tenant != "default" and normalized != host_tenant:
@@ -1150,6 +1161,29 @@ async def _deferred_startup() -> None:
             print(f"[trustnode][boot] AuthStore migration: {counts}", flush=True)
     except Exception as exc:
         print(f"[trustnode][boot] AuthStore migration skipped: {exc!r}", flush=True)
+    # 2026-11-04, from the owner: the developer tenant is never linked to a
+    # customer edge. On an activated edge, non-admin accounts and content
+    # still filed under `default` move into the edge's tenant (admin accounts
+    # stay where they are and cannot sign in here). Background, small
+    # batches, idempotent - an edge that is already clean does nothing.
+    try:
+        _edge_tid = app_store._configured_tenant_id()           # noqa: SLF001
+        if _edge_tid and _edge_tid != "default":
+            def _rehome():
+                try:
+                    from app.state import auth_store as _as
+                    _u = _as.rehome_default_non_admins(_edge_tid)
+                    if _u:
+                        print("[trustnode][boot] tenant rehome: %d non-admin account(s) moved into %s: %s"
+                              % (len(_u), _edge_tid, ", ".join(_u)[:300]), flush=True)
+                except Exception as _exc:                       # noqa: BLE001
+                    print("[trustnode][boot] tenant rehome: accounts skipped (%r)" % (_exc,), flush=True)
+                _m = app_store.rehome_default_content(_edge_tid)
+                if _m:
+                    print("[trustnode][boot] tenant rehome: content moved into %s: %s" % (_edge_tid, _m), flush=True)
+            threading.Thread(target=_rehome, name="tn-tenant-rehome", daemon=True).start()
+    except Exception as exc:
+        print(f"[trustnode][boot] tenant rehome skipped: {exc!r}", flush=True)
     try:
         if isinstance(bootstrap, dict):
             reports_store.migrate_from_bootstrap(bootstrap, tenant_id="default")
@@ -1787,7 +1821,7 @@ async def auth_middleware(request: Request, call_next):
     try:
         payload = decode_access_token(token)
         request.state.user_payload = payload
-        token_tenant = _session_tenant(str(payload.get("tenant_id") or "").strip())
+        token_tenant = _session_tenant(payload)
         if token_tenant:
             normalized_token_tenant = set_current_tenant(token_tenant)
             # Strict mismatch only when the HOST names a tenant (a hosted
@@ -1882,7 +1916,7 @@ async def websocket_stream(websocket: WebSocket) -> None:
         return
     try:
         payload = decode_access_token(token)
-        token_tenant = _session_tenant(str(payload.get("tenant_id") or "").strip())
+        token_tenant = _session_tenant(payload)
         if token_tenant:
             normalized_token_tenant = set_current_tenant(token_tenant)
             if host_tenant != "default" and normalized_token_tenant != host_tenant:
@@ -2036,7 +2070,7 @@ async def websocket_cloud_stream(websocket: WebSocket) -> None:
         return
     try:
         payload = decode_access_token(token)
-        token_tenant = _session_tenant(str(payload.get("tenant_id") or "").strip())
+        token_tenant = _session_tenant(payload)
         if token_tenant:
             normalized_token_tenant = set_current_tenant(token_tenant)
             if host_tenant != "default" and normalized_token_tenant != host_tenant:

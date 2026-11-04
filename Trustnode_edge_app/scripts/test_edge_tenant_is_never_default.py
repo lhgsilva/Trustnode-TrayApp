@@ -159,13 +159,13 @@ def main() -> int:
 
     r = client.post("/api/auth/login", json={"username": "olduser", "password": "old-pw"},
                     headers={"Host": "127.0.0.1:8000"})
-    tok2 = (r.json() or {}).get("token", "") if r.status_code == 200 else ""
-    check("a user whose row still says `default` still signs in", r.status_code == 200,
+    # 2026-11-04, from the owner: the developer tenant is never linked to a
+    # customer edge and admin accounts are not moved into it. An ADMIN row
+    # still under `default` is a developer account: refused here, with the
+    # reason (non-admin rows sign in as the edge - test_default_account_sees_edge).
+    check("an ADMIN whose row still says `default` is refused on a customer edge",
+          r.status_code == 403 and "developer" in r.text.lower(),
           "%s %s" % (r.status_code, r.text[:160]))
-    r = client.get("/api/app-store/bootstrap", headers={"Authorization": "Bearer " + tok2,
-                                                        "Host": "127.0.0.1:8000"})
-    check("  and is not refused with 'Token tenant mismatch'", r.status_code == 200,
-          "%s %s - the strict check must key on the host" % (r.status_code, r.text[:120]))
 
     r = client.post("/api/auth/login", json={"username": "admin", "password": "admin"},
                     headers={"Host": "127.0.0.1:8000"})

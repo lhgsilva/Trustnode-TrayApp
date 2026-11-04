@@ -1457,6 +1457,86 @@ class AppStore:
         finally:
             self._lock.release()
 
+    #: Tables whose `default` rows are developer/portal data, never this edge's.
+    _REHOME_SKIP = ("tenant_aliases", "retention_runs")
+
+    def rehome_default_content(self, tenant: str, *, batch: int = 20000, budget_s: float = 600.0) -> dict:
+        """Move rows filed under `default` into this edge's tenant.
+
+        2026-11-04, from the owner: the developer tenant is never linked to a
+        customer edge. Content seeded before activation (the built-in report
+        templates, OEE reasons) and rows written before the 2026-11-02 fix
+        stayed under `default` for good, invisible to the customer. Control-
+        plane tables (cp_*) are left alone - they are the portal's.
+
+        Small batches, each its own short transaction with a pause at least
+        as long as it held the lock, so collection is never held up (see
+        CLAUDE.md 11). A row that would collide with one the edge already
+        has is left where it is; a template whose NAME the edge already has
+        is skipped. Nothing is deleted. Returns {table: rows_moved}."""
+        tid = str(tenant or "").strip()
+        if not tid or tid == "default":
+            return {}
+        moved: dict = {}
+        deadline = time.time() + float(budget_s)
+        try:
+            con = self._connect_readonly()
+            tables = [str(r[0]) for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()]
+            todo = []
+            for t in tables:
+                if t.startswith("cp_") or t in self._REHOME_SKIP:
+                    continue
+                cols = [str(c[1]) for c in con.execute('PRAGMA table_info("%s")' % t).fetchall()]
+                if "tenant_id" not in cols:
+                    continue
+                if con.execute('SELECT 1 FROM "%s" WHERE tenant_id = \'default\' LIMIT 1' % t).fetchone():
+                    ddl = con.execute("SELECT sql FROM sqlite_master WHERE name = ?", (t,)).fetchone()
+                    no_rowid = "WITHOUT ROWID" in str((ddl or [""])[0] or "").upper()
+                    todo.append((t, "name" in cols, no_rowid))
+        except Exception as exc:                                  # noqa: BLE001
+            print("[trustnode][boot] tenant rehome: could not list tables (%r)" % (exc,), flush=True)
+            return {}
+        for t, has_name, no_rowid in todo:
+            n_total = 0
+            while time.time() < deadline:
+                where = "tenant_id = 'default'"
+                params: tuple = (tid,)
+                if t == "report_templates" and has_name:
+                    where += " AND name NOT IN (SELECT name FROM report_templates WHERE tenant_id = ?)"
+                    params = (tid, tid)
+                t0 = time.time()
+                try:
+                    with self._bounded_write("moving %s into this edge" % t) as conn:
+                        if no_rowid:
+                            # A WITHOUT ROWID table (historian_rollup) cannot be
+                            # batched by rowid; its `default` rows are pre-fix
+                            # leftovers, so one statement is small.
+                            cur = conn.execute('UPDATE OR IGNORE "%s" SET tenant_id = ? WHERE %s'
+                                               % (t, where), params)
+                        else:
+                            cur = conn.execute(
+                                'UPDATE OR IGNORE "%s" SET tenant_id = ? WHERE rowid IN '
+                                '(SELECT rowid FROM "%s" WHERE %s LIMIT %d)' % (t, t, where, int(batch)),
+                                params)
+                        n = int(cur.rowcount or 0)
+                except StoreBusy as exc:
+                    # The writer is busy: wait, then try this batch again.
+                    print("[trustnode][boot] tenant rehome: %s waiting for the writer (%s)" % (t, exc), flush=True)
+                    time.sleep(5.0)
+                    continue
+                except Exception as exc:                          # noqa: BLE001
+                    # Anything else will not fix itself by retrying: skip the table.
+                    print("[trustnode][boot] tenant rehome: %s skipped (%r)" % (t, exc), flush=True)
+                    break
+                n_total += n
+                time.sleep(max(0.05, min(5.0, time.time() - t0)))
+                if no_rowid or n < batch:
+                    break
+            if n_total:
+                moved[t] = n_total
+        return moved
+
     def _connect_readonly(self) -> sqlite3.Connection:
         # Invariant B (2026-06-23): the Historian Export tab MUST NOT
         # be able to slow or stop the gateway. In WAL mode, readers

@@ -287,14 +287,20 @@ def login_backoff(username, password, tries=25):
     return st, r
 
 
-for who, body in (("first", BAY), ("second", GLASS)):
-    st, r = login_backoff("admin", body["admin_password"])
-    tid = (((r or {}).get("user") or {}) if isinstance(r, dict) else {}).get("tenant_id")
-    check("  the {0} customer's admin CAN LOG IN".format(who), st == 200,
-          "status={0}".format(st))
-    check("    and lands in their OWN tenant", tid == body["tenant_id"],
-          "{0} (wanted {1}) - customers must never share an account"
-          .format(tid, body["tenant_id"]))
+# 2026-11-04, from the owner: an edge belongs to ONE customer and only that
+# customer signs in. This machine is now activated into the SECOND customer,
+# so the first customer's admin is another customer's account here: refused,
+# with the reason - never signed in, never sharing an account.
+st, r = login_backoff("admin", BAY["admin_password"])
+check("  the first customer's admin is refused once the edge belongs to the second",
+      st == 403 and "another customer" in str(r).lower(),
+      "status={0} {1}".format(st, str(r)[:110]))
+st, r = login_backoff("admin", GLASS["admin_password"])
+tid = (((r or {}).get("user") or {}) if isinstance(r, dict) else {}).get("tenant_id")
+check("  the second customer's admin CAN LOG IN", st == 200, "status={0}".format(st))
+check("    and lands in their OWN tenant", tid == GLASS["tenant_id"],
+      "{0} (wanted {1}) - customers must never share an account"
+      .format(tid, GLASS["tenant_id"]))
 
 st, r = login_backoff("admin", "NotAnyonesPassword!9")
 check("  a wrong password is still refused", st not in (200, 429),

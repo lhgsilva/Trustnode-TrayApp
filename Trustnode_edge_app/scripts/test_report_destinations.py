@@ -322,7 +322,9 @@ check("the list shows them", "extraColumns.map" in SRM
 print()
 print("[a user created on the edge can open the LAN view]")
 import re as _re
-_start = APPJSX.index("function buildRolePermissions(role)")
+# 2026-11-04: the role templates live in _baseRolePermissions; buildRolePermissions
+# now adds the catalogue keys on top (ROLE_PERMISSION_ADDITIONS).
+_start = APPJSX.index("function _baseRolePermissions(role)") if "function _baseRolePermissions(role)" in APPJSX     else APPJSX.index("function buildRolePermissions(role)")
 _body = APPJSX[_start:APPJSX.index(chr(10) + "function ", _start + 10)]
 
 

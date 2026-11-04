@@ -454,6 +454,30 @@ class AuthStore:
                 conn.commit()
         return self.get_user(uname) or {}
 
+    def rehome_default_non_admins(self, tenant: str) -> list:
+        """Move NON-admin accounts filed under `default` into `tenant`.
+
+        2026-11-04, from the owner: the developer tenant is never linked to a
+        customer edge, and admin accounts are NOT moved. Operators and viewers
+        created before the 2026-11-02 fix were this edge's own accounts; they
+        keep their name, password and role and now belong to the edge.
+        Returns the usernames moved. Idempotent."""
+        tid = str(tenant or "").strip()
+        if not tid or tid == "default":
+            return []
+        with self._write_lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT username FROM users WHERE tenant_id = 'default' "
+                    "AND LOWER(COALESCE(role, '')) NOT IN ('admin', 'super')").fetchall()
+                names = [str(r[0]) for r in rows]
+                if names:
+                    conn.execute(
+                        "UPDATE OR IGNORE users SET tenant_id = ? WHERE tenant_id = 'default' "
+                        "AND LOWER(COALESCE(role, '')) NOT IN ('admin', 'super')", (tid,))
+                    conn.commit()
+                return names
+
     def delete_user(self, username: str) -> bool:
         uname = str(username or "").strip()
         if not uname:
