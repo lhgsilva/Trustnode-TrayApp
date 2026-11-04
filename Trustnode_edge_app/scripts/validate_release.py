@@ -419,6 +419,9 @@ SOURCE_CHECKS = [
     # the page rule never read the catalogue (Scheduled Reports checked
     # "Users and access"; OEE, batch and power configuration were dead keys).
     ("a ticked permission opens exactly its pages", "test_permissions_open_pages.py"),
+    # 2026-11-04: a 3-series chart on "Last 6 hours" drew 30 seconds - the
+    # extra series fetched the newest raw rows and the merge kept the newest N.
+    ("every chart series shows the chosen window", "test_dashboard_charts_follow_window.py"),
     # 2026-10-30, asked for directly: "every new installer can be installed
     # in existing computer with all fixes and updates". Boots the PACKAGED
     # backend on a copy of a real workspace with NO data-dir override - the

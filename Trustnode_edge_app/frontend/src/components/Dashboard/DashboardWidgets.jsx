@@ -828,6 +828,74 @@ export function autoBucketSecondsFor(windowSeconds, readingsCount, pollSeconds) 
   }
   return AUTO_BUCKET_STEPS[AUTO_BUCKET_STEPS.length - 1];
 }
+// 2026-11-04 (second pass), reported with a screenshot: a 3-series chart set
+// to "Last 6 hours", 100 points, drew 30 seconds. The first series was
+// fetched over 6 h; the OTHER series were fetched as the newest 100 raw
+// readings; live raw rows were appended to both; and the chart then kept the
+// newest 100 timestamps of the merge - the last seconds. One bucket now
+// governs every series of a widget, the live tail is folded into that same
+// bucket, and a chart with a time window keeps the whole window.
+
+/** Seconds spanned by {fromUtc, toUtc}; 0 when either end is open. */
+export function windowSpanSeconds(range) {
+  const a = Date.parse(String(range?.fromUtc || ""));
+  const b = Date.parse(String(range?.toUtc || ""));
+  return Number.isFinite(a) && Number.isFinite(b) && b > a ? (b - a) / 1000 : 0;
+}
+
+/** The bucket every series of a trend widget uses: explicit wins, else derived from the window. */
+export function effectiveBucketSeconds(cfg, range, readingsCount, gatewayIntervalMs) {
+  return effectiveBucketSeconds_(cfg, range, readingsCount, gatewayIntervalMs);
+}
+function effectiveBucketSeconds_(cfg, range, readingsCount, gatewayIntervalMs) {
+  const explicit = bucketSecondsFor(cfg);
+  if (explicit > 0) return explicit;
+  return autoBucketSecondsFor(windowSpanSeconds(range), readingsCount,
+    Math.max(0.2, Number(gatewayIntervalMs || 1000) / 1000));
+}
+
+/** Fold raw live rows into buckets of `bucketSeconds` - one row per (gateway, tag, bucket). */
+export function bucketLiveTail(rows, bucketSeconds, agg = "avg") {
+  const ms = Number(bucketSeconds) * 1000;
+  if (!(ms > 0)) return Array.isArray(rows) ? rows : [];
+  const groups = new Map();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    const ts = toTsMs(r?.ts || r?.ts_utc);
+    const v = Number(r?.value);
+    if (!Number.isFinite(ts) || !Number.isFinite(v)) continue;
+    const start = Math.floor(ts / ms) * ms;
+    const key = `${r?.gateway_id || ""}|${r?.tag || r?.tag_name || ""}|${start}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = { start, gateway_id: r?.gateway_id || "", tag: r?.tag || r?.tag_name || "",
+            n: 0, sum: 0, min: v, max: v, last: v, lastTs: ts };
+      groups.set(key, g);
+    }
+    g.n += 1; g.sum += v;
+    if (v < g.min) g.min = v;
+    if (v > g.max) g.max = v;
+    if (ts >= g.lastTs) { g.last = v; g.lastTs = ts; }
+  }
+  const pick = { min: "min", max: "max", last: "last" }[String(agg || "avg")] || "avg";
+  return Array.from(groups.values()).sort((a, b) => a.start - b.start).map((g) => ({
+    ts: new Date(g.start).toISOString(),
+    gateway_id: g.gateway_id, tag: g.tag, tag_name: g.tag,
+    value: pick === "avg" ? g.sum / g.n : g[pick],
+    value_min: g.min, value_max: g.max, value_last: g.last, sample_count: g.n,
+  }));
+}
+
+/** At most `max` timestamps, evenly spaced, both ends kept - so a long window stays light to draw. */
+export function thinTimestamps(sortedTs, max) {
+  const list = Array.isArray(sortedTs) ? sortedTs : [];
+  const cap = Math.max(2, Number(max) || 2);
+  if (list.length <= cap) return list;
+  const out = [];
+  const step = (list.length - 1) / (cap - 1);
+  for (let i = 0; i < cap; i += 1) out.push(list[Math.round(i * step)]);
+  return out;
+}
+
 export function bucketAggFor(cfg) {
   const a = String(cfg?.bucket_aggregation || "avg");
   return ["avg", "min", "max", "last"].includes(a) ? a : "avg";
@@ -1169,18 +1237,32 @@ function LiveTagChart({
     // is fast; even 4 series × 60 rows = 240 rows total comes back in
     // well under 200 ms on a populated edge.
     let cancelled = false;
+    // 2026-11-04: once the trigger window is known, its history is loaded
+    // FROM THE TRIGGER START (to its end, or now), bucketed to the reading
+    // count - a test longer than the newest 5000 readings no longer starts
+    // late. Live readings keep arriving on top, as before.
+    const trigStart = trigCfg ? Number(trigWin?.start || 0) : 0;
+    const trigEnd = trigCfg ? Number(trigWin?.end || 0) : 0;
+    const trigSpanS = trigStart > 0 ? Math.max(1, ((trigEnd > 0 ? trigEnd : Date.now()) - trigStart) / 1000) : 0;
+    const trigBucket = trigStart > 0
+      ? (bucketSecondsFor(cfg) > 0 ? bucketSecondsFor(cfg)
+        : autoBucketSecondsFor(trigSpanS, capacity, Math.max(0.2, pollMs / 1000)))
+      : bucketSecondsFor(cfg);
+    const trigLimit = trigStart > 0
+      ? (trigBucket > 0 ? Math.min(20000, Math.ceil(trigSpanS / trigBucket) + 20) : 20000)
+      : seedLimit;
     Promise.all(seriesDefs.map(async (s) => {
       try {
         const rows = await fetcher({
-          fromUtc: "",
-          toUtc: "",
-          limit: seedLimit,
+          fromUtc: trigStart > 0 ? new Date(trigStart).toISOString() : "",
+          toUtc: trigEnd > 0 ? new Date(trigEnd).toISOString() : "",
+          limit: trigLimit,
           offset: 0,
           gateway: s.gatewayId || "",
           tag: s.tagName,
           timeoutMs: 8000,
           maxAttempts: 2,
-          bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg),
+          bucketSeconds: trigBucket, bucketAgg: bucketAggFor(cfg),
         });
         if (cancelled) return;
         const buf = buffersRef.current?.get(s.id);
@@ -1213,7 +1295,7 @@ function LiveTagChart({
   // The fetcher is read from a ref so its unstable identity doesn't
   // restart the seed on every parent render.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [seriesKey, capacity, groupBucketMs, pollMs, trigCfg]);
+  }, [seriesKey, capacity, groupBucketMs, pollMs, trigCfg, trigWin?.start, trigWin?.end]);
 
   // Ingest WS samples: append rows from dataLogView whose ts is strictly
   // newer than the last seen ts for that series. Runs on every parent
@@ -2204,6 +2286,9 @@ function DashboardWidgetCardImpl({
     [rules]
   );
   const [serverQueryRows, setServerQueryRows] = useState(null);
+  // 2026-11-04: the bucket the primary rows were fetched with (0 = raw); the
+  // live tail is folded into the same bucket so it cannot crowd out history.
+  const [serverQueryBucket, setServerQueryBucket] = useState(0);
   const [lastGoodServerQueryRows, setLastGoodServerQueryRows] = useState(null);
   const [serverQueryError, setServerQueryError] = useState("");
   const [serverQueryStats, setServerQueryStats] = useState(null);
@@ -2422,11 +2507,9 @@ function DashboardWidgetCardImpl({
     const chartReads = cfgReadingsCount;
     // 2026-11-04: a time window with no explicit bucket is bucketed to the
     // reading count (see autoBucketSecondsFor); explicit buckets win.
-    const _spanS = (range?.fromUtc && range?.toUtc)
-      ? Math.max(0, (Date.parse(range.toUtc) - Date.parse(range.fromUtc)) / 1000) : 0;
-    const effectiveBucketSeconds = bucketSecondsFor(cfg) > 0
-      ? bucketSecondsFor(cfg)
-      : (isTrendWidget ? autoBucketSecondsFor(_spanS, cfgReadingsCount, Math.max(0.2, Number(gatewayIntervalMs || 1000) / 1000)) : 0);
+    const effectiveBucketSeconds = isTrendWidget
+      ? effectiveBucketSeconds_(cfg, range, cfgReadingsCount, gatewayIntervalMs)
+      : bucketSecondsFor(cfg);
     const rowTagFilter =
       isComputedPie
         ? (() => {
@@ -2529,6 +2612,7 @@ function DashboardWidgetCardImpl({
         if (queryRowsReqKeyRef.current !== paramsKey) return;
         const safeRows = Array.isArray(rows) ? rows : [];
         setServerQueryRows(safeRows);
+        setServerQueryBucket(Number(effectiveBucketSeconds) || 0);
         if (safeRows.length > 0) {
           setLastGoodServerQueryRows(safeRows);
           const wid = String(widget?.id || "");
@@ -2805,13 +2889,19 @@ function DashboardWidgetCardImpl({
       if (Number.isFinite(ts) && ts > newestTs) newestTs = ts;
     }
     const append = [];
+    // A bucketed history is joined by BUCKETS: live rows after the newest
+    // server bucket ends, folded into the same bucket. Raw rows here would
+    // be hundreds of points per bucket and push the history out.
+    const bucketMs = Number(serverQueryBucket) * 1000;
+    const after = bucketMs > 0 && Number.isFinite(newestTs) ? newestTs + bucketMs : newestTs;
     for (let i = 0; i < live.length; i += 1) {
       const r = live[i];
       const ts = toTsMs(r?.ts || r?.ts_utc);
-      if (Number.isFinite(ts) && ts > newestTs) append.push(r);
+      if (Number.isFinite(ts) && ts > after) append.push(r);
     }
-    return append.length ? baseRows.concat(append) : baseRows;
-  }, [serverQueryRows, serverQueryError, lastGoodServerQueryRows, dataLogView, widget?.id]);
+    if (!append.length) return baseRows;
+    return baseRows.concat(bucketMs > 0 ? bucketLiveTail(append, serverQueryBucket, bucketAggFor(cfg)) : append);
+  }, [serverQueryRows, serverQueryError, lastGoodServerQueryRows, dataLogView, widget?.id, serverQueryBucket, cfg?.bucket_aggregation]);
 
   const directScopedRows = useMemo(
     () => {
@@ -2880,7 +2970,10 @@ function DashboardWidgetCardImpl({
     return Number.isFinite(o) ? o : 0;
   }, [cfg?.offset]);
   const series = useMemo(() => {
-    const raw = getTagSeriesFiltered(directScopedRowsAggregated, resolvedGatewayId, tagName, cfgReadingsCount);
+    // 2026-11-04: bucketed rows already ARE the window at the right
+    // resolution; cutting them to the newest N would cut the window.
+    const raw = getTagSeriesFiltered(directScopedRowsAggregated, resolvedGatewayId, tagName,
+      serverQueryBucket > 0 ? Math.max(cfgReadingsCount, 5000) : cfgReadingsCount);
     const scaled = (primaryMultiplier === 1 && primaryOffset === 0)
       ? raw
       : raw.map((p) => {
@@ -2907,7 +3000,7 @@ function DashboardWidgetCardImpl({
       }
     }
     return out;
-  }, [directScopedRowsAggregated, resolvedGatewayId, tagName, cfgReadingsCount, primaryMultiplier, primaryOffset, gatewayIntervalMs]);
+  }, [directScopedRowsAggregated, resolvedGatewayId, tagName, cfgReadingsCount, primaryMultiplier, primaryOffset, gatewayIntervalMs, serverQueryBucket]);
 
   // -------- multi-series support --------------------------------------------
   // Additional series for trend charts. Each extra entry is rendered alongside
@@ -2964,6 +3057,8 @@ function DashboardWidgetCardImpl({
 
   // Server-fetched rows for each extra series, keyed by series id.
   const [extraSeriesServerRowsByDef, setExtraSeriesServerRowsByDef] = useState({});
+  // 2026-11-04: the bucket the extra series were fetched with (0 = raw).
+  const [extraSeriesBucket, setExtraSeriesBucket] = useState(0);
 
   useEffect(() => {
     if (!extraSeriesDefs.length) {
@@ -3010,18 +3105,27 @@ function DashboardWidgetCardImpl({
             : Number(cfgReadingsCount || 200),
         ),
       );
+      // 2026-11-04: the same bucket as the primary, over the whole window -
+      // not the newest N raw readings.
+      const extraBucket = ["line_chart", "line_area_chart", "bar_chart", "table_list"].includes(widgetType)
+        ? effectiveBucketSeconds_(cfg, localRange, cfgReadingsCount, gatewayIntervalMs)
+        : bucketSecondsFor(cfg);
+      const extraSpan = windowSpanSeconds(localRange);
+      const extraLimit = extraBucket > 0 && extraSpan > 0
+        ? Math.min(20000, Math.ceil(extraSpan / extraBucket) + 20)
+        : reads;
       for (const def of extraSeriesDefs) {
         try {
           let rows = await fetcher({
             fromUtc: localRange?.fromUtc || "",
             toUtc: localRange?.toUtc || "",
-            limit: reads,
+            limit: extraLimit,
             offset: 0,
             gateway: String(def.gateway_id || resolvedGatewayId || ""),
             tag: def.tag_name,
             timeoutMs: 12000,
             maxAttempts: 1,
-            bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg),
+            bucketSeconds: extraBucket, bucketAgg: bucketAggFor(cfg),
           });
           if (!Array.isArray(rows) || rows.length === 0) {
             // Fallback: drop gateway scope (handles tags emitted under a
@@ -3029,13 +3133,13 @@ function DashboardWidgetCardImpl({
             rows = await fetcher({
               fromUtc: localRange?.fromUtc || "",
               toUtc: localRange?.toUtc || "",
-              limit: reads,
+              limit: extraLimit,
               offset: 0,
               gateway: "",
               tag: def.tag_name,
               timeoutMs: 12000,
               maxAttempts: 1,
-              bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg),
+              bucketSeconds: extraBucket, bucketAgg: bucketAggFor(cfg),
             });
           }
           if (cancelled) return;
@@ -3044,7 +3148,10 @@ function DashboardWidgetCardImpl({
           next[def.id] = [];
         }
       }
-      if (!cancelled) setExtraSeriesServerRowsByDef(next);
+      if (!cancelled) {
+        setExtraSeriesServerRowsByDef(next);
+        setExtraSeriesBucket(Number(extraBucket) || 0);
+      }
     };
     fetchAll();
     return () => {
@@ -3080,11 +3187,22 @@ function DashboardWidgetCardImpl({
         return String(r?.gateway_id || "").trim() === targetGw;
       });
       const fromServer = Array.isArray(extraSeriesServerRowsByDef[def.id]) ? extraSeriesServerRowsByDef[def.id] : [];
-      // De-duplicate by ts+tag so live additions augment the server batch
-      // instead of producing twin entries.
+      // 2026-11-04: a bucketed series is joined by buckets after its newest
+      // server bucket, exactly like the primary.
+      let liveTail = filteredLive;
+      if (extraSeriesBucket > 0) {
+        let newest = -Infinity;
+        for (const r of fromServer) {
+          const t = toTsMs(r?.ts || r?.ts_utc);
+          if (Number.isFinite(t) && t > newest) newest = t;
+        }
+        const after = Number.isFinite(newest) ? newest + extraSeriesBucket * 1000 : -Infinity;
+        liveTail = bucketLiveTail(filteredLive.filter((r) => toTsMs(r?.ts || r?.ts_utc) > after),
+          extraSeriesBucket, bucketAggFor(cfg));
+      }
       const seen = new Set();
       const merged = [];
-      for (const r of [...fromServer, ...filteredLive]) {
+      for (const r of [...fromServer, ...liveTail]) {
         const k = `${String(r?.ts || r?.ts_utc || "")}|${String(r?.tag || r?.tag_name || "")}`;
         if (seen.has(k)) continue;
         seen.add(k);
@@ -3093,7 +3211,7 @@ function DashboardWidgetCardImpl({
       out[def.id] = applyWidgetTimeFilter(merged, cfg);
     }
     return out;
-  }, [extraSeriesDefs, extraSeriesServerRowsByDef, dataLogView, cfgTimePreset, cfgTimeFrom, cfgTimeTo]);
+  }, [extraSeriesDefs, extraSeriesServerRowsByDef, dataLogView, cfgTimePreset, cfgTimeFrom, cfgTimeTo, extraSeriesBucket, cfg?.bucket_aggregation]);
 
   // Build a combined dataset on the **union of all sample timestamps** from
   // every series. Each timestamp becomes one row; series that don't have a
@@ -3213,9 +3331,6 @@ function DashboardWidgetCardImpl({
     // producing a 7-hour chart from a "120 readings" widget.
     let sortedTs = Array.from(byTs.keys()).sort((a, b) => a - b);
     const readingsCap = Math.max(10, Number(cfgReadingsCount || 120));
-    if (sortedTs.length > readingsCap) {
-      sortedTs = sortedTs.slice(-readingsCap);
-    }
     // 2026-07-27 BLANK-WINDOW FIX (live mode): the extras merge keeps the
     // server SEED batch from widget mount while the rolling live buffer
     // evicts its middle — leaving an OLD cluster + a NEW cluster with a
@@ -3226,7 +3341,16 @@ function DashboardWidgetCardImpl({
     const hasExplicitWindow =
       String(cfg?.query_time_filter_preset || "none") !== "none"
       || String(cfg?.query_time_filter_from || "").trim() !== ""
-      || String(cfg?.query_time_filter_to || "").trim() !== "";
+      || String(cfg?.query_time_filter_to || "").trim() !== ""
+      || Boolean(historicalMode);
+    // 2026-11-04: with a time window the chart shows the WHOLE window -
+    // keeping the newest N timestamps is what cut 6 hours to 30 seconds.
+    // A very long window is thinned evenly instead, so it stays light.
+    if (hasExplicitWindow) {
+      sortedTs = thinTimestamps(sortedTs, Math.max(readingsCap * 4, 1500));
+    } else if (sortedTs.length > readingsCap) {
+      sortedTs = sortedTs.slice(-readingsCap);
+    }
     if (!hasExplicitWindow && sortedTs.length > 1) {
       const newest = sortedTs[sortedTs.length - 1];
       const tickForWindow = Math.max(500, Number(gatewayIntervalMs || 1000));
@@ -3273,7 +3397,7 @@ function DashboardWidgetCardImpl({
       }
     }
     return out;
-  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length, cfgReadingsCount, gatewayIntervalMs, cfg?.show_gaps, cfg?.query_time_filter_preset, cfg?.query_time_filter_from, cfg?.query_time_filter_to]);
+  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length, cfgReadingsCount, gatewayIntervalMs, cfg?.show_gaps, cfg?.query_time_filter_preset, cfg?.query_time_filter_from, cfg?.query_time_filter_to, historicalMode]);
 
   const hasMultiSeries = extraSeriesDefs.length > 0 || resolvedLimitLines.length > 0;
   const anyRightAxis =

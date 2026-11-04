@@ -165,7 +165,9 @@ def main() -> int:
     # 2026-11-04: the server-query fetches send the EFFECTIVE bucket (the
     # explicit one, or the window-derived one when none is set).
     _sites = (w.count("bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg)")
-              + w.count("bucketSeconds: effectiveBucketSeconds, bucketAgg: bucketAggFor(cfg)"))
+              + w.count("bucketSeconds: effectiveBucketSeconds, bucketAgg: bucketAggFor(cfg)")
+              + w.count("bucketSeconds: extraBucket, bucketAgg: bucketAggFor(cfg)")
+              + w.count("bucketSeconds: trigBucket, bucketAgg: bucketAggFor(cfg)"))
     check("chart widgets send their bucket on every series fetch", _sites >= 6, "%d sites" % _sites)
     check("  a bucketed widget is served from the store, not the 1 Hz stream",
           "bucketSecondsFor(cfg) <= 0" in w)
