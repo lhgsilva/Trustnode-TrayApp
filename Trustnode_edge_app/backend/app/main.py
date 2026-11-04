@@ -173,6 +173,14 @@ from app.tenant import (effective_tenant, resolve_request_tenant,
 _CONFIGURED_TENANT_CACHE = {"value": "", "ts": 0.0}
 
 
+def _session_tenant(token_tenant: str) -> str:
+    """A signed-in session's tenant - see tenant.session_tenant (2026-11-04)."""
+    if not str(token_tenant or "").strip():
+        return ""
+    from app.tenant import session_tenant
+    return session_tenant(token_tenant, _configured_tenant())
+
+
 def _configured_tenant() -> str:
     """The tenant this edge was activated into, cached 15 s.
 
@@ -380,7 +388,7 @@ class CloudLiveAuthMiddleware:
             host_tenant = resolve_request_tenant(_FakeRequest(scope))
         except Exception:
             host_tenant = "default"
-        token_tenant = str(payload.get("tenant_id") or "").strip()
+        token_tenant = _session_tenant(str(payload.get("tenant_id") or "").strip())
         if token_tenant:
             normalized = set_current_tenant(token_tenant)
             if host_tenant and host_tenant != "default" and normalized != host_tenant:
@@ -1779,7 +1787,7 @@ async def auth_middleware(request: Request, call_next):
     try:
         payload = decode_access_token(token)
         request.state.user_payload = payload
-        token_tenant = str(payload.get("tenant_id") or "").strip()
+        token_tenant = _session_tenant(str(payload.get("tenant_id") or "").strip())
         if token_tenant:
             normalized_token_tenant = set_current_tenant(token_tenant)
             # Strict mismatch only when the HOST names a tenant (a hosted
@@ -1874,7 +1882,7 @@ async def websocket_stream(websocket: WebSocket) -> None:
         return
     try:
         payload = decode_access_token(token)
-        token_tenant = str(payload.get("tenant_id") or "").strip()
+        token_tenant = _session_tenant(str(payload.get("tenant_id") or "").strip())
         if token_tenant:
             normalized_token_tenant = set_current_tenant(token_tenant)
             if host_tenant != "default" and normalized_token_tenant != host_tenant:
@@ -2028,7 +2036,7 @@ async def websocket_cloud_stream(websocket: WebSocket) -> None:
         return
     try:
         payload = decode_access_token(token)
-        token_tenant = str(payload.get("tenant_id") or "").strip()
+        token_tenant = _session_tenant(str(payload.get("tenant_id") or "").strip())
         if token_tenant:
             normalized_token_tenant = set_current_tenant(token_tenant)
             if host_tenant != "default" and normalized_token_tenant != host_tenant:

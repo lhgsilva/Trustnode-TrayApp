@@ -103,6 +103,31 @@ def _tenant_from_configured_domains(host_txt: str) -> Optional[str]:
     return mapping.get(host_txt)
 
 
+def session_tenant(token_tenant: str, configured_tenant: str) -> str:
+    """The tenant a SIGNED-IN session runs as.
+
+    2026-11-04, reported: "when the LAN connection is opened by other users
+    the reports generated are not showing". Every account created on an edge
+    before the 2026-11-02 tenant fix was filed under `default`, the developer
+    tenant, and its token carries that. The request then ran as `default`,
+    where none of this edge's reports, templates or configuration live -
+    measured: the same admin request returned 1 report for an account under
+    the edge's tenant and 0 for one under `default`, on the desktop and over
+    LAN alike.
+
+    On an ACTIVATED edge such an account is this edge's own local account,
+    so its session runs as the edge's tenant. A token that names a real
+    customer tenant is never changed, and an edge with no identity (the
+    portal, a fresh install) keeps `default`, because that is where its own
+    data lives.
+    """
+    tok = normalize_tenant_id(str(token_tenant or ""))
+    conf = normalize_tenant_id(str(configured_tenant or ""))
+    if (not tok or tok == "default") and conf and conf != "default":
+        return conf
+    return tok
+
+
 def effective_tenant(token_tenant: str, host_tenant: str, configured_tenant: str) -> str:
     """Which tenant a request runs as.
 

@@ -47,22 +47,29 @@ env.setdefault("PYTHONIOENCODING", "utf-8")
 # Checked HERE, before anything runs: the credential is not needed until
 # the 10-minute full-system stage, and discovering it is missing after ten
 # minutes of source checks is its own small cruelty.
-if not env.get("VAL_PASS"):
-    _dotenv = os.path.join(os.path.dirname(HERE), ".env")
-    try:
-        with open(_dotenv, encoding="utf-8") as _fh:
-            for _line in _fh:
-                _line = _line.strip()
-                if _line.startswith("VAL_PASS=") and not _line.startswith("#"):
-                    env["VAL_PASS"] = _line.split("=", 1)[1].strip().strip("'\"")
-                    break
-    except OSError:
-        pass
-if not env.get("VAL_PASS"):
+# 2026-11-04, from the owner: "the gate should be running to the current
+# installation, edge and tenant, using the admin users in place for this
+# edge". VAL_USER is read from .env as well (it used to be ignored there and
+# default to admin-mari, an account of ANOTHER customer on the dev PC - its
+# data was pruned and the gate failed for reasons unrelated to the build).
+_dotenv = os.path.join(os.path.dirname(HERE), ".env")
+try:
+    with open(_dotenv, encoding="utf-8") as _fh:
+        for _line in _fh:
+            _line = _line.strip()
+            if _line.startswith("#") or "=" not in _line:
+                continue
+            _k, _v = _line.split("=", 1)
+            if _k in ("VAL_PASS", "VAL_USER") and not env.get(_k):
+                env[_k] = _v.strip().strip("'\"")
+except OSError:
+    pass
+env.setdefault("VAL_USER", "admin")
+if False:  # 2026-11-04: no VAL_PASS -> the gate uses a temporary admin of this edge
     print("RELEASE GATE: cannot run - no VAL_PASS.", flush=True)
     print("  The full-system stage signs in to the running app. Put the", flush=True)
     print("  password in .env (gitignored) as  VAL_PASS=...  or set it in", flush=True)
-    print("  the environment. VAL_USER defaults to admin-mari.", flush=True)
+    print("  the environment. VAL_USER (default admin) must be an admin of THIS edge.", flush=True)
     sys.exit(2)
 
 SOURCE_CHECKS = [
@@ -405,6 +412,9 @@ SOURCE_CHECKS = [
     # trigger window read a key the rows do not carry, and destination rules
     # (which do work end to end - the test proves it through the scheduler).
     ("the five things reported on 2026-11-04", "test_report_fixes_2026_11_04.py"),
+    # 2026-11-04: accounts created before the tenant fix carry `default` and
+    # saw none of the edge's reports, on the desktop and over LAN.
+    ("an account filed under default sees this edge", "test_default_account_sees_edge.py"),
     # 2026-10-30, asked for directly: "every new installer can be installed
     # in existing computer with all fixes and updates". Boots the PACKAGED
     # backend on a copy of a real workspace with NO data-dir override - the
@@ -553,8 +563,160 @@ for label, script in SOURCE_CHECKS:
                   script, "node" if script.endswith(".mjs") else "python"), flush=True)
         sys.exit(2)
 
+
+_TEMP_ADMIN = {"db": "", "user": ""}
+
+
+def _create_temp_admin(auth_db: str, tenant: str):
+    """(username, password) of a new admin in `tenant`, or None.
+
+    Uses the app's own user store (auth_store imports only the standard
+    library, so the app is not loaded and nothing else is migrated) and the
+    app's pbkdf2 format, so it is a real account the login accepts.
+    """
+    import atexit
+    import base64
+    import hashlib
+    import secrets
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "backend"))
+    try:
+        from app.services.auth_store import AuthStore
+    except Exception as exc:                                  # noqa: BLE001
+        print("  cannot load the user store: %s" % exc, flush=True)
+        return None
+    user = "gate-admin-" + secrets.token_hex(3)
+    pw = secrets.token_urlsafe(18)
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 120_000)
+    b64 = lambda raw: base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")  # noqa: E731
+    try:
+        store = AuthStore(auth_db)
+        store.upsert_user(username=user, password_hash="pbkdf2_sha256$120000$%s$%s" % (b64(salt), b64(digest)),
+                          role="admin", tenant_id=tenant, status="active")
+    except Exception as exc:                                  # noqa: BLE001
+        print("  could not create the temporary admin: %s" % exc, flush=True)
+        return None
+    _TEMP_ADMIN.update(db=auth_db, user=user)
+    atexit.register(_remove_temp_admin)
+    return user, pw
+
+
+def _remove_temp_admin() -> None:
+    if not _TEMP_ADMIN.get("user"):
+        return
+    try:
+        from app.services.auth_store import AuthStore
+        gone = AuthStore(_TEMP_ADMIN["db"]).delete_user(_TEMP_ADMIN["user"])
+        print("RELEASE GATE: temporary admin %r %s" % (
+            _TEMP_ADMIN["user"], "removed" if gone else "was already gone"), flush=True)
+    except Exception as exc:                                  # noqa: BLE001
+        print("RELEASE GATE: could not remove the temporary admin %r: %s - delete it on "
+              "Users & Access" % (_TEMP_ADMIN["user"], exc), flush=True)
+    _TEMP_ADMIN["user"] = ""
+
+
+def _edge_account_preflight() -> str:
+    """'' when VAL_USER is an admin of the edge under test, else why not.
+
+    The edge's activated tenant is read from the running app's own store,
+    read-only (the path comes from /api/health -> workspace.db_path), the
+    same rule the backend applies. The account must sign in, be an admin
+    and carry that tenant - otherwise every data check reads another
+    customer's (or the developer tenant's) data and measures nothing.
+    """
+    import base64
+    import json as _json
+    import sqlite3
+    import urllib.request
+    api = env.get("API") or "http://127.0.0.1:8000"
+    try:
+        with urllib.request.urlopen(api + "/api/health", timeout=10) as r:
+            health = _json.loads(r.read() or b"{}")
+    except Exception as exc:                                  # noqa: BLE001
+        return "the app is not running at %s (%s) - launch it first" % (api, exc)
+    db_path = str(((health.get("workspace") or {}).get("db_path")) or "")
+    edge_tenant = ""
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db_path.replace("\\", "/"), uri=True, timeout=3)
+        row = con.execute("SELECT payload_json FROM config_documents WHERE domain='app_settings' LIMIT 1").fetchone()
+        con.close()
+        settings = _json.loads(row[0]) if row else {}
+        edge_tenant = str(settings.get("tenant_login_realm") or settings.get("tenant_id") or "").strip()
+    except Exception as exc:                                  # noqa: BLE001
+        return "could not read this edge's tenant from %s (%s)" % (db_path, exc)
+    # The account is the ADMIN OF THIS EDGE, looked up in this installation's
+    # own user store (read-only). VAL_USER only chooses between several.
+    admins = []
+    try:
+        auth_db = os.path.join(os.path.dirname(db_path), "trustnode_auth.db")
+        acon = sqlite3.connect("file:%s?mode=ro" % auth_db.replace("\\", "/"), uri=True, timeout=3)
+        admins = [str(r[0]) for r in acon.execute(
+            "SELECT username FROM users WHERE tenant_id = ? AND LOWER(role) IN ('admin','super') "
+            "ORDER BY username", (edge_tenant,)).fetchall()]
+        acon.close()
+    except Exception as exc:                                  # noqa: BLE001
+        return "could not read this edge's users (%s)" % exc
+    if not admins:
+        return "this edge (tenant %s) has no admin account to test with" % edge_tenant
+    wanted = str(env.get("VAL_USER") or "")
+    env["VAL_USER"] = wanted if wanted in admins else admins[0]
+    if wanted and wanted not in admins:
+        print("  VAL_USER %r is not an admin of this edge - using %r" % (wanted, env["VAL_USER"]), flush=True)
+    def _login(user, pw):
+        body = _json.dumps({"username": user, "password": pw}).encode()
+        req = urllib.request.Request(api + "/api/auth/login", data=body,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return (_json.loads(r.read() or b"{}") or {}).get("token") or ""
+        except Exception:                                     # noqa: BLE001
+            return ""
+    # The .env password is tried only when .env names THIS edge's admin: a
+    # password that belongs to another account would only add a failed
+    # sign-in against the real admin on every run (and lockouts count them).
+    tok = (_login(env["VAL_USER"], env.get("VAL_PASS", ""))
+           if env.get("VAL_PASS") and wanted in admins else "")
+    if not tok:
+        # 2026-11-04, from the owner: "use the password set for the admin
+        # user or create admin with access when running the tests". When
+        # this edge's admin password is not available, the gate adds a
+        # temporary admin to THIS edge's tenant (random password, hashed
+        # the way the app hashes) and removes it when the gate ends.
+        made = _create_temp_admin(auth_db, edge_tenant)
+        if not made:
+            return ("VAL_USER %r could not sign in and a temporary admin could not be created"
+                    % env["VAL_USER"])
+        env["VAL_USER"], env["VAL_PASS"] = made
+        print("  %r has no usable password here - testing as the temporary admin %r "
+              "(removed when the gate ends)" % (admins[0] if wanted not in admins else wanted, made[0]), flush=True)
+        tok = _login(*made)
+        if not tok:
+            return "the temporary admin %r could not sign in" % made[0]
+    try:
+        claims = _json.loads(base64.urlsafe_b64decode(tok.split(".")[1] + "=="))
+    except Exception:                                         # noqa: BLE001
+        return "the login returned no usable token"
+    role = str(claims.get("role") or "").lower()
+    tenant = str(claims.get("tenant_id") or "").strip()
+    print("  gate account: %s  role=%s  tenant=%s  | this edge: tenant=%s  store=%s"
+          % (env["VAL_USER"], role, tenant or "-", edge_tenant or "-", db_path), flush=True)
+    if role not in ("admin", "super"):
+        return "VAL_USER %r is a %r, not an admin" % (env["VAL_USER"], role)
+    if edge_tenant and edge_tenant != "default" and tenant not in (edge_tenant, "default", ""):
+        return ("VAL_USER %r belongs to tenant %s, but this edge is %s - set VAL_USER/VAL_PASS "
+                "in .env to an admin of THIS edge" % (env["VAL_USER"], tenant, edge_tenant))
+    return ""
+
+
+_why = _edge_account_preflight()
+if _why:
+    print("RELEASE GATE: cannot run - %s." % _why, flush=True)
+    sys.exit(2)
 print("RELEASE GATE: running the 10-minute full-system validation...", flush=True)
-rc = subprocess.call([sys.executable, os.path.join(HERE, "validate_full_12h.py")], env=env)
+try:
+    rc = subprocess.call([sys.executable, os.path.join(HERE, "validate_full_12h.py")], env=env)
+finally:
+    _remove_temp_admin()
 print(f"\nRELEASE GATE: {'PASS - safe to commit this version' if rc == 0 else 'FAIL - do NOT commit; see scripts/validation_out/validation_report.txt'}",
       flush=True)
 sys.exit(rc)

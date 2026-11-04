@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 
 API = os.environ.get("VAL_API", "http://127.0.0.1:8000")
-USER = os.environ.get("VAL_USER", "admin-mari")
+USER = os.environ.get("VAL_USER", "admin")
 # 2026-10-20: no literal default. A real operator credential in a
 # committed script lives in every clone and the whole git history.
 PASSWORD = os.environ.get("VAL_PASS", "")

@@ -54,7 +54,7 @@ API = "http://127.0.0.1:8000"
 # every fork and the whole git history - and CLAUDE.md 6 already says to ask
 # for key NAMES, not values. There is no default now: the run says what to
 # set and stops, which is noisier than a silent wrong-password 401 anyway.
-LOGIN = {"username": os.environ.get("VAL_USER", "admin-mari"),
+LOGIN = {"username": os.environ.get("VAL_USER", "admin"),
          "password": os.environ.get("VAL_PASS", "")}
 if not LOGIN["password"]:
     raise SystemExit(

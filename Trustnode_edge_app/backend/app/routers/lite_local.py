@@ -135,6 +135,11 @@ def _verify_session_jwt(jwt: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _lite_session_tenant(token_tenant: str, edge_tenant: str) -> str:
+    from app.tenant import session_tenant
+    return session_tenant(token_tenant, edge_tenant) or "default"
+
+
 def _extract_session(request: Request, token_qs: Optional[str]) -> Dict[str, Any]:
     """Resolve a Lite session from either a Bearer JWT or a raw
     view-link token (single-call form). Returns the session body or
@@ -169,7 +174,11 @@ def _extract_session(request: Request, token_qs: Optional[str]) -> Dict[str, Any
                 if not isinstance(s, dict):
                     s = {}
                 return {
-                    "tenant_id": str(jwt_body.get("tenant_id") or s.get("tenant_id") or "default"),
+                    # 2026-11-04: an account still filed under `default`
+                    # reads THIS edge's tenant (tenant.session_tenant).
+                    "tenant_id": _lite_session_tenant(
+                        str(jwt_body.get("tenant_id") or s.get("tenant_id") or "default"),
+                        str(s.get("tenant_id") or "")),
                     "edge_id": str(s.get("edge_id") or ""),
                     "customer_id": str(jwt_body.get("customer_id") or s.get("customer_id") or ""),
                     "user_id": str(jwt_body.get("sub") or jwt_body.get("username") or ""),
