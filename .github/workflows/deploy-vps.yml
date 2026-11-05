@@ -21,15 +21,10 @@ name: Deploy VPS
 #   VPS_SSH_PRIVATE_KEY raw OpenSSH private key (NOT path)
 #   PUBLIC_HEALTH_URL   e.g. https://trustnode.lsapps.app/api/health
 
+# 2026-11-05: manual only. This workflow has failed all 92 of its runs since
+# 2026-06-18 (its rsync step never had a working key), while the real deploy
+# is trustnode-edge-cicd.yml's deploy-vps job. Run it by hand if you need it.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "Trustnode_edge_app/backend/**"
-      - "Trustnode_edge_app/frontend/**"
-      - "Trustnode_edge_app/db/**"
-      - "Trustnode_edge_app/scripts/**"
-      - ".github/workflows/deploy-vps.yml"
   workflow_dispatch: {}
 
 jobs:

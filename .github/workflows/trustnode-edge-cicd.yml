@@ -486,7 +486,18 @@ jobs:
               exit 1
             fi
 
-      - name: Post-deploy control-plane smoke
+      - name: Post-deploy smoke
+        # 2026-11-05: this step used admin/admin with tenant `default` when no
+        # smoke secrets were set - which they never were - and that account is
+        # removed from every store on purpose (CLAUDE.md section 9), so every
+        # deploy since June ended red AFTER a successful deploy. Without
+        # secrets it now proves the deploy from outside with no account and
+        # writes nothing: the backend was restarted by this deploy and is
+        # healthy, the portal page and its bundle are served, and a wrong
+        # sign-in is refused cleanly (4xx, not 5xx). With TRUSTNODE_SMOKE_USER
+        # and TRUSTNODE_SMOKE_PASS set, the full control-plane smoke runs as
+        # well (it creates a customer, edge, licence and code - use a test
+        # tenant).
         if: ${{ steps.gate.outputs.deploy == 'true' }}
         shell: pwsh
         env:
@@ -496,7 +507,41 @@ jobs:
         run: |
           $baseUrl = "${{ secrets.TRUSTNODE_CLOUD_API_URL }}"
           if (-not $baseUrl) { $baseUrl = "https://trustnode.lsapps.app" }
-          $user = if ($env:TRUSTNODE_SMOKE_USER) { $env:TRUSTNODE_SMOKE_USER } else { "admin" }
-          $pass = if ($env:TRUSTNODE_SMOKE_PASS) { $env:TRUSTNODE_SMOKE_PASS } else { "admin" }
-          $tenant = if ($env:TRUSTNODE_SMOKE_TENANT) { $env:TRUSTNODE_SMOKE_TENANT } else { "default" }
-          pwsh -NoProfile -ExecutionPolicy Bypass -File "./Trustnode_edge_app/scripts/smoke-control-plane.ps1" -BaseUrl $baseUrl -Username $user -Password $pass -TenantId $tenant
+          $baseUrl = $baseUrl.TrimEnd("/")
+          $failures = @()
+          # The backend answers ~2 s after restart at the earliest; retry for 90 s.
+          $health = $null
+          for ($i = 0; $i -lt 18; $i++) {
+            try { $health = Invoke-RestMethod -Uri "$baseUrl/api/health" -TimeoutSec 15; if ($health.status -eq "ok") { break } } catch { }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $health -or $health.status -ne "ok") { $failures += "health: no 'ok' from $baseUrl/api/health" }
+          else {
+            $age = [double]($health.boot.process_age_s)
+            Write-Host "health ok, api_build=$($health.api_build), process_age_s=$age"
+            if ($age -gt 1800) { $failures += "health: the backend was NOT restarted by this deploy (process_age_s=$age)" }
+          }
+          try {
+            $page = Invoke-WebRequest -Uri "$baseUrl/" -TimeoutSec 20 -UseBasicParsing
+            $bundle = [regex]::Match($page.Content, 'assets/index-[A-Za-z0-9_-]+\.js').Value
+            if (-not $bundle) { $failures += "portal: the page names no assets/index-*.js bundle" }
+            else {
+              $js = Invoke-WebRequest -Uri "$baseUrl/$bundle" -TimeoutSec 30 -UseBasicParsing -Method Head
+              Write-Host "portal page ok, bundle $bundle -> $($js.StatusCode)"
+            }
+          } catch { $failures += "portal: $($_.Exception.Message)" }
+          $probe = @{ username = "smoke-" + [guid]::NewGuid().ToString("N").Substring(0, 8); password = [guid]::NewGuid().ToString("N") } | ConvertTo-Json
+          $code = 0
+          try { Invoke-WebRequest -Uri "$baseUrl/api/auth/login" -Method Post -ContentType "application/json" -Body $probe -TimeoutSec 20 -UseBasicParsing | Out-Null; $code = 200 }
+          catch { $code = [int]$_.Exception.Response.StatusCode }
+          Write-Host "a wrong sign-in answered $code"
+          if ($code -lt 400 -or $code -ge 500) { $failures += "login: a wrong sign-in answered $code (expected 400/401/403)" }
+          if ($env:TRUSTNODE_SMOKE_USER -and $env:TRUSTNODE_SMOKE_PASS) {
+            $tenant = if ($env:TRUSTNODE_SMOKE_TENANT) { $env:TRUSTNODE_SMOKE_TENANT } else { "default" }
+            pwsh -NoProfile -ExecutionPolicy Bypass -File "./Trustnode_edge_app/scripts/smoke-control-plane.ps1" -BaseUrl $baseUrl -Username $env:TRUSTNODE_SMOKE_USER -Password $env:TRUSTNODE_SMOKE_PASS -TenantId $tenant
+            if ($LASTEXITCODE -ne 0) { $failures += "control-plane smoke failed" }
+          } else {
+            Write-Host "no TRUSTNODE_SMOKE_USER/PASS secrets: the full control-plane smoke is skipped"
+          }
+          if ($failures.Count) { $failures | ForEach-Object { Write-Host "::error::$_" }; exit 1 }
+          Write-Host "post-deploy smoke: PASS"
