@@ -16,7 +16,12 @@ newest 5000 readings instead of the run from its start signal.
   * three series over 6 h of 0.5 s data come back from the API as <= 100
     points each that span the window - the same request the widget makes;
   * the chart code uses all of this, and the trigger chart loads its history
-    from the trigger start.
+    from the trigger start;
+  * (2026-11-05, reported at a customer: "only the last few items" on every
+    preset) the window is fetched on a slow tick, one fetch per widget at a
+    time, a failed read keeps the series, and live rows at the gateway
+    interval cause no window fetch - test_dashboard_charts_live_light.mjs
+    renders the real widget in jsdom and counts the fetches.
 
     python scripts/test_dashboard_charts_follow_window.py
 """
@@ -159,6 +164,16 @@ console.log(JSON.stringify({
     check("the trigger chart loads its history from the trigger start",
           "fromUtc: trigStart > 0 ? new Date(trigStart).toISOString()" in src
           and "trigWin?.start, trigWin?.end]" in src)
+
+    check("a trend chart fetches from the server on the slow tick, not every gateway tick",
+          "const windowQueryTick = trendChart ? windowRefreshTick : refreshTickFast;" in src
+          and ("    windowQueryTick," + chr(10) + "  ]);") in src.replace(chr(13) + chr(10), chr(10)))
+    check("  a failed extra-series read keeps what the chart already has", "next[def.id] = null;" in src)
+    live = subprocess.run(["node", os.path.join(ROOT, "scripts", "test_dashboard_charts_live_light.mjs")],
+                          capture_output=True, text=True, timeout=180, cwd=ROOT)
+    check("the real widget, rendered: live every 200 ms, the window fetched once per series",
+          live.returncode == 0 and "RESULT: PASS" in live.stdout,
+          (live.stdout.strip().splitlines() or [""])[-1] + " " + live.stderr.strip()[-200:])
 
     print()
     print("  %d passed, %d failed" % (len(PASS), len(FAIL)))

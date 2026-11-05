@@ -896,6 +896,10 @@ export function thinTimestamps(sortedTs, max) {
   return out;
 }
 
+/** How often a windowed trend chart re-aligns its window with the store (ms). */
+export const WINDOW_REFETCH_MS = 30000;
+const TREND_WINDOW_TYPES = ["line_chart", "line_area_chart", "bar_chart", "stacked_trend"];
+
 export function bucketAggFor(cfg) {
   const a = String(cfg?.bucket_aggregation || "avg");
   return ["avg", "min", "max", "last"].includes(a) ? a : "avg";
@@ -1376,13 +1380,18 @@ function LiveTagChart({
     const fetcher = fetchRowsRef.current;
     if (typeof fetcher !== "function") return undefined;
     (async () => {
+      // 2026-11-05: the "same tag" sentinel is not a tag; and 500 rows was
+      // ~4 minutes at 0.5 s, so a run under way for longer than that was never
+      // found and the chart showed its last few readings until the next run.
+      // 5 000 rows reach back ~40 minutes at 0.5 s; a run older than that
+      // starts at the oldest row read (the reducer sees it already on).
       const want = [trigCfg.tag];
-      if (trigCfg.stopTag && trigCfg.stopTag !== trigCfg.tag) want.push(trigCfg.stopTag);
+      if (trigCfg.stopTag && trigCfg.stopTag !== trigCfg.tag && trigCfg.stopTag !== SAME_TAG_STOP) want.push(trigCfg.stopTag);
       const got = [];
       for (const t of want) {
         try {
           const rows = await fetcher({
-            fromUtc: "", toUtc: "", limit: 500, offset: 0,
+            fromUtc: "", toUtc: "", limit: 5000, offset: 0,
             gateway: trigCfg.gatewayId || "", tag: t,
             timeoutMs: 8000, maxAttempts: 1,
           });
@@ -2355,6 +2364,28 @@ function DashboardWidgetCardImpl({
   const cfgTimePreset = String(cfg?.query_time_filter_preset || "none");
   const cfgTimeFrom = String(cfg?.query_time_filter_from || "");
   const cfgTimeTo = String(cfg?.query_time_filter_to || "");
+  // 2026-11-05, reported at a customer: on every preset (15 min ... 6 h) a
+  // 3-series chart showed "only the last few items". Every gateway interval
+  // (0.5 s) each windowed series re-queried its WHOLE window - the extras
+  // with no in-flight guard, and a failed query replaced the series with []
+  // - so the queries queued, expired in the browser, and the chart fell back
+  // to the live tail. And under a rolling or trigger chart (LiveTagChart) the
+  // same two effects kept fetching rows nobody drew - the extras loop
+  // restarted every tick and never reached the third series - starving the
+  // other widgets' reads in the browser's request gate.
+  // A trend chart reading a tag directly now fetches from the server on this
+  // slow tick only; its liveness at the gateway interval comes from the
+  // WebSocket rows (effectiveRows / extraSeriesRowsByDef fold them into the
+  // chart's bucket; LiveTagChart appends them). A config change still
+  // fetches at once; every other widget type keeps the fast tick.
+  const [windowRefreshTick, setWindowRefreshTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setWindowRefreshTick((v) => v + 1), WINDOW_REFETCH_MS);
+    return () => clearInterval(t);
+  }, []);
+  const trendChart = TREND_WINDOW_TYPES.includes(String(widget?.type || ""))
+    && String(cfg?.data_source_type || "tag_direct") === "tag_direct";
+  const windowQueryTick = trendChart ? windowRefreshTick : refreshTickFast;
 
   useEffect(() => {
     fetchWidgetRowsRef.current = fetchWidgetRows;
@@ -2648,9 +2679,7 @@ function DashboardWidgetCardImpl({
     historicalFromLocal,
     historicalToLocal,
     rulesDepKey,
-    refreshTickFast,
-    refreshTickMedium,
-    refreshTickPaginated,
+    windowQueryTick,
   ]);
 
   useEffect(() => {
@@ -3059,6 +3088,8 @@ function DashboardWidgetCardImpl({
   const [extraSeriesServerRowsByDef, setExtraSeriesServerRowsByDef] = useState({});
   // 2026-11-04: the bucket the extra series were fetched with (0 = raw).
   const [extraSeriesBucket, setExtraSeriesBucket] = useState(0);
+  const extraSeriesInFlightRef = useRef(0);
+  const extraSeriesKeyRef = useRef("");
 
   useEffect(() => {
     if (!extraSeriesDefs.length) {
@@ -3145,22 +3176,39 @@ function DashboardWidgetCardImpl({
           if (cancelled) return;
           next[def.id] = Array.isArray(rows) ? rows : [];
         } catch {
-          next[def.id] = [];
+          next[def.id] = null; // a failed read keeps what the chart already has
         }
       }
       if (!cancelled) {
-        setExtraSeriesServerRowsByDef(next);
+        setExtraSeriesServerRowsByDef((prev) => {
+          const out = {};
+          for (const def of extraSeriesDefs) {
+            out[def.id] = next[def.id] === null ? (prev?.[def.id] || []) : (next[def.id] || []);
+          }
+          return out;
+        });
         setExtraSeriesBucket(Number(extraBucket) || 0);
       }
     };
-    fetchAll();
+    // One fetch per widget at a time: a tick that arrives while the previous
+    // fetch is still running is skipped, unless the request itself changed.
+    const extraKey = JSON.stringify([
+      extraSeriesDefs.map((d) => `${d.gateway_id}::${d.tag_name}`), localRange, cfgReadingsCount,
+      bucketSecondsFor(cfg), bucketAggFor(cfg),
+    ]);
+    if (extraKey === extraSeriesKeyRef.current && extraSeriesInFlightRef.current > 0) {
+      return () => {};
+    }
+    extraSeriesKeyRef.current = extraKey;
+    extraSeriesInFlightRef.current += 1;
+    fetchAll().finally(() => { extraSeriesInFlightRef.current = Math.max(0, extraSeriesInFlightRef.current - 1); });
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     JSON.stringify(extraSeriesDefs.map((d) => `${d.gateway_id}::${d.tag_name}`)),
-    refreshTickFast,
+    windowQueryTick,
     cfgTimePreset,
     cfgTimeFrom,
     cfgTimeTo,
