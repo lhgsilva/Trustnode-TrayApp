@@ -1,4 +1,6 @@
 import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import DataFilterEditor from "./components/DataFilter/DataFilterEditor";
+import { cleanDataFilter, describeDataFilter } from "./components/DataFilter/dataFilter.js";
 import { cataloguePageOpen, cataloguePageEdit } from "./permissionCatalog.js";
 import { Login } from "./components/Login/Login";
 import { DashboardDesigner } from "./components/Dashboard/DashboardDesigner";
@@ -401,6 +403,8 @@ const toSink = (conn) => ({
   // with downstream tooling that expects a specific layout.
   csv_format: String(conn.csv_format || ""),
   csv_header: String(conn.csv_header || ""),
+  // 2026-11-16: the data filter (other tags' values at the same time).
+  data_filter: cleanDataFilter(conn.data_filter),
   // The SECOND hand-written allowlist this value has to survive. The one
   // above persists it; this one is what the running worker actually
   // receives. A field added to only one of the two is saved and then
@@ -4423,6 +4427,7 @@ function AppShell() {
   // flipped the list back to "all selected" and re-ticked every box. That is
   // why the tags could not be unselected (reported 2026-09-29).
   const [tagPickTouched, setTagPickTouched] = useState(false);
+  const [dbDataFilterOpen, setDbDataFilterOpen] = useState(false);   // 2026-11-16: the connection's data filter window
   const [dbForm, setDbForm] = useState({
     name: "",
     engine: "mysql",
@@ -5396,8 +5401,10 @@ function AppShell() {
       id: g.id,
       name: g.name || g.id,
       kind: "gateway",
+      // 2026-11-16: gateway tags are plain names ("Flow"), not objects - the
+      // picker read t.tag_name and listed none.
       tags: (Array.isArray(g.tags) ? g.tags : [])
-        .map((t) => String(t?.tag_name || t?.name || "").trim())
+        .map((t) => String((t && typeof t === "object") ? (t.tag_name || t.name || "") : (t || "")).trim())
         .filter(Boolean),
     }));
     for (const d of (powerConfig?.devices || [])) {
@@ -14000,7 +14007,13 @@ function AppShell() {
         .sort((a, b) => runtimeScore(b) - runtimeScore(a))[0] || null;
     };
 
+    // 2026-11-16: two gateways may run on one PLC address, each with its own
+    // start/stop - a gateway that has a row of its own is what it is; one
+    // without falls back by endpoint only when NO configured gateway owns that
+    // row, so a stopped sibling is never shown as RUNNING.
+    const ownedIds = new Set((gatewayConfigs || []).map((g) => String(g?.id || "")));
     const endpointMatches = runtimeRows.filter((row) => {
+      if (ownedIds.has(String(row?.gateway_id || ""))) return false;
       const rowType = String(row?.gateway_type || "").trim().toLowerCase();
       if (rowType !== targetType) return false;
       if (targetType === "siemens_opcua") {
@@ -16775,9 +16788,17 @@ const getGatewayHealth = (gateway) => {
     setEditingCollectionTriggerId(trigger.id);
     setCollectionTriggerForm({
       gateway_id: trigger.gateway_id || "",
+      // 2026-11-16: editing a SCHEDULE trigger turned it into a tag trigger -
+      // kind and the schedule fields were not loaded back into the form.
+      kind: String(trigger.kind || "tag"),
       tag_name: trigger.tag_name || "",
       operator: trigger.operator || ">=",
       value: trigger.value === null || trigger.value === undefined ? "" : String(trigger.value),
+      schedule_interval: String(trigger.schedule_interval || "daily"),
+      schedule_start: String(trigger.schedule_start || "08:00"),
+      schedule_stop: String(trigger.schedule_stop || "18:00"),
+      schedule_day_of_month: Number(trigger.schedule_day_of_month || 0) || 1,
+      schedule_date: String(trigger.schedule_date || ""),
       trigger_type: trigger.trigger_type === "one_time" ? "one_time" : "continuous",
       enabled: trigger.enabled !== false
     });
@@ -17182,6 +17203,25 @@ const getGatewayHealth = (gateway) => {
     // Dropping a tag is allowed and safe for the gateway - but a dashboard
     // widget, alarm or trigger pointed at it will simply stop updating, with no
     // error anywhere. Name them before it happens.
+    // 2026-11-16: two gateways may read one PLC independently; a tag read by
+    // both is stored twice (once per gateway). Allowed - said, not blocked.
+    {
+      const sameEndpoint = (gatewayConfigs || []).filter((g) => g && g.id !== editingGatewayId
+        && String(g.gateway_type || "") === String(gatewayForm.gateway_type || "")
+        && String(g.plc_ip || "").trim().toLowerCase() === plcIp.toLowerCase());
+      const shared = [];
+      for (const g of sameEndpoint) {
+        const theirs = new Set((g.tags || []).map((t) => String(t)));
+        const both = tags.filter((t) => theirs.has(String(t)));
+        if (both.length) shared.push(`${g.name || g.id}: ${both.slice(0, 6).join(", ")}${both.length > 6 ? ", …" : ""}`);
+      }
+      if (shared.length && !window.confirm(
+        `Another gateway on ${plcIp} already reads some of these tags:\n\n  ${shared.join("\n  ")}\n\n`
+        + "Both gateways can run at the same time with their own start/stop; each stores its own copy "
+        + "of a shared tag (under its own gateway). Save this gateway?"
+      )) return;
+    }
+
     if (editingGatewayId) {
       const before = (gatewayConfigs.find((g) => g.id === editingGatewayId)?.tags) || [];
       const dropped = before.filter((t) => !tags.includes(t));
@@ -18144,7 +18184,14 @@ const getGatewayHealth = (gateway) => {
       tag_filters: Array.isArray(conn.tag_filters) ? conn.tag_filters : [],
       gateway_filters: Array.isArray(conn.gateway_filters) ? conn.gateway_filters : [],
       csv_format: String(conn.csv_format || ""),
-      csv_header: String(conn.csv_header || "")
+      csv_header: String(conn.csv_header || ""),
+      // 2026-11-16: reopening a connection showed "One row per reading" and
+      // the next save wrote it back - these four were saved but never loaded.
+      layout: String(conn.layout || "long"),
+      export_interval_s: Number(conn.export_interval_s || 0) || 0,
+      rollover: String(conn.rollover || "none"),
+      data_filter: cleanDataFilter(conn.data_filter),
+      max_file_mb: Number(conn.max_file_mb || 0) || 0
     });
     setDbTestResult(
       conn.last_test
@@ -18372,6 +18419,7 @@ const getGatewayHealth = (gateway) => {
         rollover: String(dbForm.rollover || "none"),
         layout: String(dbForm.layout || "long"),
         max_file_mb: Number(dbForm.max_file_mb || 0) || 0,
+        data_filter: cleanDataFilter(dbForm.data_filter),
         csv_format: String(dbForm.csv_format || ""),
         csv_header: String(dbForm.csv_header || ""),
         connection_ok: true,
@@ -23550,7 +23598,7 @@ const getGatewayHealth = (gateway) => {
                   return raw;   // bucketing failed: a truncated view beats none
                 }
               }}
-              fetchWidgetRows={async ({ fromUtc, toUtc, limit = 2000, offset = 0, gateway = "", tag = "", timeoutMs, maxAttempts, bucketSeconds = 0, bucketAgg = "avg" }) => {
+              fetchWidgetRows={async ({ fromUtc, toUtc, limit = 2000, offset = 0, gateway = "", tag = "", timeoutMs, maxAttempts, bucketSeconds = 0, bucketAgg = "avg", dataFilter = "" }) => {
                 const preferCloudReads = Boolean(isHostedWebClient && endpointMode === "cloud");
                 const edgeFilter = preferCloudReads ? cloudEdgeApiFilter : null;
                 if (Number(bucketSeconds) > 0) {
@@ -23560,7 +23608,7 @@ const getGatewayHealth = (gateway) => {
                   const agg = await getAppStoreHistorianAgg({
                     bucketSeconds, fromUtc, toUtc, gateway, tag,
                     limit: Math.max(500, Math.min(200000, Number(limit || 2000) * 4)),
-                    cloudEdge: edgeFilter, timeoutMs: Math.max(15000, Number(timeoutMs || 0)), maxAttempts,
+                    cloudEdge: edgeFilter, dataFilter, timeoutMs: Math.max(15000, Number(timeoutMs || 0)), maxAttempts,
                   });
                   const rows = Array.isArray(agg?.rows) ? agg.rows : [];
                   // newest first, like the raw endpoint
@@ -23573,7 +23621,7 @@ const getGatewayHealth = (gateway) => {
                   offset,
                   gateway,
                   tag,
-                  cloudEdge: edgeFilter,
+                  cloudEdge: edgeFilter, dataFilter,
                   preferCloud: preferCloudReads,
                   timeoutMs,
                   maxAttempts,
@@ -23589,14 +23637,14 @@ const getGatewayHealth = (gateway) => {
                   offset,
                   gateway: "",
                   tag,
-                  cloudEdge: edgeFilter,
+                  cloudEdge: edgeFilter, dataFilter,
                   preferCloud: preferCloudReads,
                   timeoutMs,
                   maxAttempts: 1,
                 });
                 return Array.isArray(retry?.rows) ? retry.rows : rows;
               }}
-              fetchWidgetStats={async ({ fromUtc, toUtc, gateway = "", tag = "", timeoutMs, maxAttempts }) => {
+              fetchWidgetStats={async ({ fromUtc, toUtc, gateway = "", tag = "", timeoutMs, maxAttempts, dataFilter = "" }) => {
                 const preferCloudReads = Boolean(isHostedWebClient && endpointMode === "cloud");
                 const edgeFilter = preferCloudReads ? cloudEdgeApiFilter : null;
                 const res = await getAppStoreHistorianStats({
@@ -23604,7 +23652,7 @@ const getGatewayHealth = (gateway) => {
                   toUtc,
                   gateway,
                   tag,
-                  cloudEdge: edgeFilter,
+                  cloudEdge: edgeFilter, dataFilter,
                   preferCloud: preferCloudReads,
                   timeoutMs,
                   maxAttempts,
@@ -23617,14 +23665,14 @@ const getGatewayHealth = (gateway) => {
                   toUtc,
                   gateway: "",
                   tag,
-                  cloudEdge: edgeFilter,
+                  cloudEdge: edgeFilter, dataFilter,
                   preferCloud: preferCloudReads,
                   timeoutMs,
                   maxAttempts: 1,
                 });
                 return Array.isArray(retry?.rows) ? retry.rows : rows;
               }}
-              fetchWidgetRuleStats={async ({ rules = [], fromUtc, toUtc, gateway = "", timeoutMs, maxAttempts }) => {
+              fetchWidgetRuleStats={async ({ rules = [], fromUtc, toUtc, gateway = "", timeoutMs, maxAttempts, dataFilter = "" }) => {
                 const preferCloudReads = Boolean(isHostedWebClient && endpointMode === "cloud");
                 const edgeFilter = preferCloudReads ? cloudEdgeApiFilter : null;
                 const res = await getAppStoreHistorianRuleStats({
@@ -23632,7 +23680,7 @@ const getGatewayHealth = (gateway) => {
                   fromUtc,
                   toUtc,
                   gateway,
-                  cloudEdge: edgeFilter,
+                  cloudEdge: edgeFilter, dataFilter,
                   preferCloud: preferCloudReads,
                   timeoutMs,
                   maxAttempts,
@@ -28602,7 +28650,7 @@ const getGatewayHealth = (gateway) => {
                               <input
                                 type="number"
                                 min="0"
-                                value={Number(cpAiEndpoint?.rate_limits?.queries_per_day ?? 500)}
+                                value={cpAiEndpoint?.rate_limits?.queries_per_day ?? 500}
                                 onChange={(e) => setCpAiEndpoint((p) => ({ ...p, rate_limits: { ...(p.rate_limits || {}), queries_per_day: Number(e.target.value || 0) } }))}
                               />
                             </label>
@@ -28611,7 +28659,7 @@ const getGatewayHealth = (gateway) => {
                               <input
                                 type="number"
                                 min="0"
-                                value={Number(cpAiEndpoint?.rate_limits?.max_tokens_per_query ?? 2048)}
+                                value={cpAiEndpoint?.rate_limits?.max_tokens_per_query ?? 2048}
                                 onChange={(e) => setCpAiEndpoint((p) => ({ ...p, rate_limits: { ...(p.rate_limits || {}), max_tokens_per_query: Number(e.target.value || 0) } }))}
                               />
                             </label>
@@ -32452,8 +32500,8 @@ const getGatewayHealth = (gateway) => {
                           <input
                             type="number"
                             min="1"
-                            value={Number(dbForm.max_file_mb || 0) || ""}
-                            onChange={(e) => setDbForm({ ...dbForm, max_file_mb: Number(e.target.value) || 0 })}
+                            value={dbForm.max_file_mb ?? ""}
+                            onChange={(e) => setDbForm({ ...dbForm, max_file_mb: e.target.value })} onBlur={(e) => setDbForm({ ...dbForm, max_file_mb: Number(e.target.value) || 0 })}
                             placeholder="50"
                             disabled={!canEditPage("database")}
                           />
@@ -32480,6 +32528,18 @@ const getGatewayHealth = (gateway) => {
                   <section className="db-group">
                     <div className="db-group-title">Tag &amp; Gateway Scope</div>
                     <div className="db-grid-2">
+                      <div className="db-span-2 tn-data-filter-line">
+                        <span>Data filter: <strong>{describeDataFilter(dbForm.data_filter) || "none - every reading is exported"}</strong></span>
+                        <button type="button" className="btn btn-sm btn-secondary" onClick={() => setDbDataFilterOpen(true)}
+                          disabled={!canEditPage("database")}>Open Data Filter</button>
+                      </div>
+                      <DataFilterEditor
+                        open={dbDataFilterOpen}
+                        onClose={() => setDbDataFilterOpen(false)}
+                        value={dbForm.data_filter}
+                        onChange={(f) => setDbForm((p) => ({ ...p, data_filter: f }))}
+                        gatewayOptions={exportScopeSources}
+                      />
                       <label className="db-span-2">
                         Restrict to these gateways (optional)
                         <div className="db-tag-chip-grid">
@@ -33228,7 +33288,7 @@ const getGatewayHealth = (gateway) => {
                       type="number"
                       min="0"
                       value={cpLicenseForm[p.field] ?? 0}
-                      onChange={(e) => setCpLicenseForm((prev) => ({ ...prev, [p.field]: Math.max(0, Number(e.target.value || 0)) }))}
+                      onChange={(e) => setCpLicenseForm((prev) => ({ ...prev, [p.field]: e.target.value }))} onBlur={(e) => setCpLicenseForm((prev) => ({ ...prev, [p.field]: Math.max(0, Number(e.target.value || 0)) }))}
                     />
                     <small className="hint">{p.hint}</small>
                   </label>
@@ -33404,8 +33464,8 @@ const getGatewayHealth = (gateway) => {
                 </div>
                 {powerMeterUsesCts ? (
                   <>
-                    <label><span>CT Primary (A)</span><input type="number" step="0.1" value={Number(powerDeviceForm.ct_primary ?? 80)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_primary: Number(e.target.value || 80) })} /></label>
-                    <label><span>CT Secondary (A)</span><input type="number" step="0.1" value={Number(powerDeviceForm.ct_secondary ?? 5)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_secondary: Number(e.target.value || 5) })} /></label>
+                    <label><span>CT Primary (A)</span><input type="number" step="0.1" value={powerDeviceForm.ct_primary ?? 80} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_primary: Number(e.target.value || 80) })} /></label>
+                    <label><span>CT Secondary (A)</span><input type="number" step="0.1" value={powerDeviceForm.ct_secondary ?? 5} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_secondary: Number(e.target.value || 5) })} /></label>
                   </>
                 ) : (
                   <div className="info-note pwr-span-2" style={{ fontSize: 12 }}>
@@ -33414,8 +33474,8 @@ const getGatewayHealth = (gateway) => {
                     primary-side values itself.
                   </div>
                 )}
-                <label><span>VT Primary (V)</span><input type="number" step="0.1" value={Number(powerDeviceForm.vt_primary ?? 230)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, vt_primary: Number(e.target.value || 230) })} /></label>
-                <label><span>VT Secondary (V)</span><input type="number" step="0.1" value={Number(powerDeviceForm.vt_secondary ?? 230)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, vt_secondary: Number(e.target.value || 230) })} /></label>
+                <label><span>VT Primary (V)</span><input type="number" step="0.1" value={powerDeviceForm.vt_primary ?? 230} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, vt_primary: Number(e.target.value || 230) })} /></label>
+                <label><span>VT Secondary (V)</span><input type="number" step="0.1" value={powerDeviceForm.vt_secondary ?? 230} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, vt_secondary: Number(e.target.value || 230) })} /></label>
               </div>
             </div>
 
@@ -33810,36 +33870,41 @@ const getGatewayHealth = (gateway) => {
                         a chart looks the same on either page. */}
                     <label><span>Line width</span>
                       <input type="number" min="1" max="6" step="0.5"
-                        value={Number(current.chart_line_width) || 2}
+                        value={current.chart_line_width ?? 2}
                         onChange={(e) => setField("chart_line_width",
+                          e.target.value)} onBlur={(e) => setField("chart_line_width",
                           Math.max(1, Math.min(6, Number(e.target.value || 2))))} />
                     </label>
                     <label><span>X label angle</span>
                       <input type="number" min="-90" max="90" step="15"
-                        value={Number(current.chart_x_tick_angle) || 0}
+                        value={current.chart_x_tick_angle ?? 0}
                         onChange={(e) => setField("chart_x_tick_angle",
+                          e.target.value)} onBlur={(e) => setField("chart_x_tick_angle",
                           Math.max(-90, Math.min(90, Number(e.target.value || 0))))} />
                     </label>
                     <label><span>Axis text size</span>
                       <input type="number" min="0.3" max="4" step="0.1"
-                        value={Number(current.font_axis_scale) || 1}
+                        value={current.font_axis_scale ?? 1}
                         onChange={(e) => setField("font_axis_scale",
+                          e.target.value)} onBlur={(e) => setField("font_axis_scale",
                           Math.max(0.3, Math.min(4, Number(e.target.value || 1))))} />
                     </label>
                     <label><span>Label text size</span>
                       <input type="number" min="0.3" max="4" step="0.1"
-                        value={Number(current.font_labels_scale) || 1}
+                        value={current.font_labels_scale ?? 1}
                         onChange={(e) => setField("font_labels_scale",
+                          e.target.value)} onBlur={(e) => setField("font_labels_scale",
                           Math.max(0.3, Math.min(4, Number(e.target.value || 1))))} />
                     </label>
                     <label><span>Legend text size</span>
                       <input type="number" min="0.3" max="4" step="0.1"
-                        value={Number(current.font_legend_scale) || 1}
+                        value={current.font_legend_scale ?? 1}
                         onChange={(e) => setField("font_legend_scale",
+                          e.target.value)} onBlur={(e) => setField("font_legend_scale",
                           Math.max(0.3, Math.min(4, Number(e.target.value || 1))))} />
                     </label>
                     <label><span>Reading points</span>
-                      <input type="number" min="10" max="2000" value={Number(current.readings_count || 200)} onChange={(e) => setField("readings_count", Math.max(10, Math.min(2000, Number(e.target.value || 200))))} />
+                      <input type="number" min="10" max="2000" value={current.readings_count ?? 200} onChange={(e) => setField("readings_count", e.target.value)} onBlur={(e) => setField("readings_count", Math.max(10, Math.min(2000, Number(e.target.value || 200))))} />
                     </label>
                     {/* 2026-10-28, requested: a chart whose X axis starts
                         when a trigger fired, so the operator sees the
@@ -34168,7 +34233,7 @@ const getGatewayHealth = (gateway) => {
                       Day of month
                       <input
                         type="number" min="1" max="31"
-                        value={Number(collectionTriggerForm.schedule_day_of_month || 1)}
+                        value={collectionTriggerForm.schedule_day_of_month ?? 1}
                         onChange={(e) => setCollectionTriggerForm({ ...collectionTriggerForm, schedule_day_of_month: Number(e.target.value || 1) })}
                         disabled={!canEditPage("triggers_and_limits")}
                       />

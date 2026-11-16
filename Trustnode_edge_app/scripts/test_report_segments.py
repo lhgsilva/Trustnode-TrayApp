@@ -157,7 +157,21 @@ src = inspect.getsource(rr._fetch_kpi_value)
 # Check the AGGREGATE call specifically. "from_utc=from_utc" also appears in
 # the text-value fallback below it, so looking for the bare string passes even
 # when the aggregate - the number the KPI actually shows - is unscoped.
-_stats_call = src.split("get_historian_rule_stats", 1)[-1].split(")", 1)[0]
+# 2026-11-16: the call now opens with `data_filter=_DATA_FILTER.get(), ` whose
+# own ")" ended the old split early; take the call up to its matching paren.
+def _call_text(text, name):
+    tail = text.split(name + "(", 1)[-1]
+    depth, out = 1, []
+    for ch in tail:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        out.append(ch)
+    return "".join(out)
+_stats_call = _call_text(src, "get_historian_rule_stats")
 check("  and passes it to the AGGREGATE query",
       "from_utc=from_utc" in _stats_call and "to_utc=to_utc" in _stats_call,
       "without this every KPI aggregates ALL of history")

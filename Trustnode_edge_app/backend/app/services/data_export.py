@@ -159,6 +159,15 @@ def build_query(spec: Dict[str, Any], tenant_id: str) -> Tuple[str, list, List[s
             where.pop()          # a condition we cannot parse filters nothing
             continue
 
+    # 2026-11-16: the data filter - other tags' values at the same time.
+    from app.services import historian_filter as _hf
+    _gws = _clean_list(spec.get("gateways"))
+    _df_sql, _df_params = _hf.sql_fragment_positional(
+        _hf.parse_filter(spec.get("data_filter")), query_gateway=_gws[0] if len(_gws) == 1 else "")
+    if _df_sql:
+        where.append(_df_sql)
+        params.extend(_df_params)
+
     contains = str(spec.get("tag_contains") or "").strip()
     if contains:
         # Free text is a scan by nature, so it runs LAST, on whatever the

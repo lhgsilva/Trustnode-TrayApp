@@ -379,13 +379,66 @@ def list_generated(
     limit: int = Query(default=200, ge=1, le=2000),
     schedule_id: str = "",
     template_id: str = "",
+    from_utc: str = "",
+    to_utc: str = "",
+    column: str = "",
+    value: str = "",
+    schedule_name: str = "",
 ) -> dict[str, Any]:
     rows = reports_store.list_generated(
         limit=limit,
         schedule_id=schedule_id or None,
         template_id=template_id or None,
+        from_utc=from_utc or None, to_utc=to_utc or None,
+        column=column or None, value=value or None,
+        schedule_name=schedule_name or None,
     )
     return {"ok": True, "tenant_id": get_current_tenant(), "generated": rows}
+
+
+def _generated_filters(limit, schedule_id, template_id, from_utc, to_utc, column, value, schedule_name) -> dict:
+    return dict(limit=limit, schedule_id=schedule_id or None, template_id=template_id or None,
+                from_utc=from_utc or None, to_utc=to_utc or None, column=column or None,
+                value=value or None, schedule_name=schedule_name or None)
+
+
+@router.get("/generated/export.csv")
+def export_generated_csv(
+    limit: int = Query(default=2000, ge=1, le=2000), schedule_id: str = "", template_id: str = "",
+    from_utc: str = "", to_utc: str = "", column: str = "", value: str = "", schedule_name: str = "",
+) -> Response:
+    """2026-11-16: the test-results list, with its result columns, as CSV."""
+    header, body = reports_store.export_generated_table(
+        **_generated_filters(limit, schedule_id, template_id, from_utc, to_utc, column, value, schedule_name))
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(header)
+    for row in body:
+        writer.writerow(row)
+    return PlainTextResponse(buf.getvalue(), media_type="text/csv; charset=utf-8",
+                             headers={"Content-Disposition": 'attachment; filename="test_results.csv"'})
+
+
+@router.get("/generated/export.xlsx")
+def export_generated_xlsx(
+    limit: int = Query(default=2000, ge=1, le=2000), schedule_id: str = "", template_id: str = "",
+    from_utc: str = "", to_utc: str = "", column: str = "", value: str = "", schedule_name: str = "",
+) -> Response:
+    """The same table as an Excel workbook (one sheet, header + rows)."""
+    from openpyxl import Workbook
+    header, body = reports_store.export_generated_table(
+        **_generated_filters(limit, schedule_id, template_id, from_utc, to_utc, column, value, schedule_name))
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "test results"
+    sheet.append(header)
+    for row in body:
+        sheet.append([("" if c is None else c) for c in row])
+    out = io.BytesIO()
+    book.save(out)
+    return Response(out.getvalue(),
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="test_results.xlsx"'})
 
 
 @router.get("/generated/{generated_id}")
@@ -399,7 +452,8 @@ def get_generated(generated_id: str) -> dict[str, Any]:
 def _render_into_record(template: dict[str, Any], *, triggered_by: str,
                         generated_id: str = "",
                         window: tuple[str, str] | None = None,
-                        segments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                        segments: list[dict[str, Any]] | None = None,
+                        output_path: str = "") -> dict[str, Any]:
     """Record first, PDF second - the same shape as a scheduled run.
 
     With `generated_id` the existing record is regenerated in place: it goes
@@ -425,7 +479,8 @@ def _render_into_record(template: dict[str, Any], *, triggered_by: str,
     gid = str(record.get("id") or generated_id or "")
     t0 = _t.perf_counter()
     try:
-        path, byte_count, sha = render_template_to_pdf(template, window=window, segments=segments)
+        path, byte_count, sha = render_template_to_pdf(template, window=window, segments=segments,
+                                                       output_path=output_path or None)
     except Exception as exc:
         return reports_store.update_generated_render(
             gid, render_state="failed", render_error=f"Render failed: {exc}") or record
@@ -494,8 +549,12 @@ def regenerate_generated(generated_id: str) -> dict[str, Any]:
         from app.tenant import set_current_tenant
         set_current_tenant(tenant)
         try:
+            # 2026-11-16: rebuild the SAME file - the schedule's name and
+            # folder - not a <uuid>.pdf in the default folder.
+            _prev = str(record.get("file_path") or "")
             rec = _render_into_record(template, triggered_by=str(record.get("triggered_by") or "manual"),
-                                      generated_id=generated_id, window=window, segments=segs)
+                                      generated_id=generated_id, window=window, segments=segs,
+                                      output_path=_prev if _prev.lower().endswith(".pdf") else "")
             if rec.get("render_state") == "ready":
                 job["result"] = {"generated": rec}
                 job["state"] = "done"

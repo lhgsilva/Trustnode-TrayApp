@@ -1603,6 +1603,7 @@ export async function getAppStoreHistorianRange({
   preferCloud = null,
   timeoutMs = 15000,
   maxAttempts = 3,
+  dataFilter = "",          // 2026-11-16: the data filter, JSON text
 } = {}) {
   const params = new URLSearchParams();
   if (fromUtc) params.set("from_utc", String(fromUtc));
@@ -1612,6 +1613,7 @@ export async function getAppStoreHistorianRange({
   if (gateway) params.set("gateway", String(gateway));
   if (device) params.set("device", String(device));
   if (tag) params.set("tag", String(tag));
+  if (dataFilter) params.set("data_filter", typeof dataFilter === "string" ? dataFilter : JSON.stringify(dataFilter));
   if (typeof preferCloud === "boolean") params.set("prefer_cloud", preferCloud ? "true" : "false");
   const baseUrl = `${getAppStoreApiBase()}/api/app-store/historian/range?${params.toString()}`;
   const url = appendCloudEdgeParams(baseUrl, cloudEdge);
@@ -1651,6 +1653,7 @@ export async function getAppStoreHistorianAgg({
   cloudEdge = null,
   timeoutMs = 15000,
   maxAttempts = 2,
+  dataFilter = "",          // 2026-11-16: the data filter, JSON text
 } = {}) {
   const params = new URLSearchParams();
   params.set("bucket", String(bucket || "minute"));
@@ -1661,6 +1664,7 @@ export async function getAppStoreHistorianAgg({
   if (toUtc) params.set("to_utc", String(toUtc));
   if (gateway) params.set("gateway", String(gateway));
   if (tag) params.set("tag", String(tag));
+  if (dataFilter) params.set("data_filter", typeof dataFilter === "string" ? dataFilter : JSON.stringify(dataFilter));
   if (source) params.set("source", String(source));
   params.set("limit", String(limit));
   const baseUrl = `${getAppStoreApiBase()}/api/app-store/historian/agg?${params.toString()}`;
@@ -1695,6 +1699,7 @@ export async function getAppStoreHistorianStats({
   preferCloud = null,
   timeoutMs = 15000,
   maxAttempts = 3,
+  dataFilter = "",          // 2026-11-16: the data filter, JSON text
 } = {}) {
   const params = new URLSearchParams();
   if (fromUtc) params.set("from_utc", String(fromUtc));
@@ -1702,6 +1707,7 @@ export async function getAppStoreHistorianStats({
   if (gateway) params.set("gateway", String(gateway));
   if (device) params.set("device", String(device));
   if (tag) params.set("tag", String(tag));
+  if (dataFilter) params.set("data_filter", typeof dataFilter === "string" ? dataFilter : JSON.stringify(dataFilter));
   if (typeof preferCloud === "boolean") params.set("prefer_cloud", preferCloud ? "true" : "false");
   const baseUrl = `${getAppStoreApiBase()}/api/app-store/historian/stats?${params.toString()}`;
   const url = appendCloudEdgeParams(baseUrl, cloudEdge);
@@ -1735,6 +1741,7 @@ export async function getAppStoreHistorianRuleStats({
   preferCloud = null,
   timeoutMs = 15000,
   maxAttempts = 3,
+  dataFilter = "",          // 2026-11-16: the data filter, JSON text
 } = {}) {
   const body = {
     rules: Array.isArray(rules) ? rules : [],
@@ -1743,6 +1750,7 @@ export async function getAppStoreHistorianRuleStats({
     gateway: gateway ? String(gateway) : "",
     edge_id: edgeId ? String(edgeId) : "",
     prefer_cloud: typeof preferCloud === "boolean" ? (preferCloud ? "true" : "false") : "",
+    data_filter: dataFilter || null,
   };
   let url = `${getAppStoreApiBase()}/api/app-store/historian/rule-stats`;
   const edgeParams = new URLSearchParams();
@@ -4154,11 +4162,32 @@ export async function getReportSchedulerStatus() {
   return res.json();
 }
 
-export async function listGeneratedReports({ limit = 200, scheduleId = "", templateId = "" } = {}) {
+function _generatedParams({ limit = 200, scheduleId = "", templateId = "", fromUtc = "", toUtc = "", column = "", value = "", scheduleName = "" } = {}) {
   const params = new URLSearchParams();
   params.set("limit", String(limit));
   if (scheduleId) params.set("schedule_id", String(scheduleId));
   if (templateId) params.set("template_id", String(templateId));
+  if (fromUtc) params.set("from_utc", String(fromUtc));
+  if (toUtc) params.set("to_utc", String(toUtc));
+  if (column) params.set("column", String(column));
+  if (value) params.set("value", String(value));
+  if (scheduleName) params.set("schedule_name", String(scheduleName));
+  return params;
+}
+
+// 2026-11-16: the generated reports are the TEST RESULTS - one row per run
+// with its stored columns. The list with its columns, as CSV or Excel.
+export async function downloadGeneratedListExport(format = "csv", filters = {}) {
+  const params = _generatedParams({ limit: 2000, ...filters });
+  const res = await fetchWithTimeout(
+    `${_reportApiBase()}/api/reports/generated/export.${format === "xlsx" ? "xlsx" : "csv"}?${params.toString()}`,
+    { __tnNoGate: true }, 60000);
+  if (!res.ok) throw new Error(`Export failed (HTTP ${res.status})`);
+  return res.blob();
+}
+
+export async function listGeneratedReports({ limit = 200, scheduleId = "", templateId = "", fromUtc = "", toUtc = "", column = "", value = "", scheduleName = "" } = {}) {
+  const params = _generatedParams({ limit, scheduleId, templateId, fromUtc, toUtc, column, value, scheduleName });
   const res = await fetchWithTimeout(
     withNoCache(`${_reportApiBase()}/api/reports/generated?${params.toString()}`),
     { headers: { "Cache-Control": "no-store, no-cache, max-age=0" } },
@@ -4174,7 +4203,7 @@ export async function listGeneratedReports({ limit = 200, scheduleId = "", templ
 export async function getGeneratedReportPreviewData(generatedId) {
   const res = await fetchWithTimeout(
     withNoCache(`${_reportApiBase()}/api/reports/generated/${encodeURIComponent(generatedId)}/preview-data`),
-    { headers: { "Cache-Control": "no-store, no-cache, max-age=0" } },
+    { headers: { "Cache-Control": "no-store, no-cache, max-age=0" }, __tnNoGate: true },   // a click, not a poll
     20000,
   );
   await ensureOk(res, "Report data could not be loaded");
@@ -4320,9 +4349,12 @@ export function getGeneratedReportFileUrl(generatedId, { inline = false } = {}) 
 }
 
 export async function downloadGeneratedReportBlob(generatedId) {
+  // 2026-11-16, reported: "the action icons take too long to do something".
+  // An operator's click is not a poll: it skips the read gate (where it
+  // queued behind the page's refreshes, with nothing on screen).
   const res = await fetchWithTimeout(
     `${_reportApiBase()}/api/reports/generated/${encodeURIComponent(generatedId)}/file`,
-    { headers: { Accept: "application/pdf" } },
+    { headers: { Accept: "application/pdf" }, __tnNoGate: true },
     60000,
   );
   if (!res.ok) {

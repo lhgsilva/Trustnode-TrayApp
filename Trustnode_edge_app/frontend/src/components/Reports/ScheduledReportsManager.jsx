@@ -7,6 +7,7 @@ import {
   getReportSchedulerStatus,
   getGeneratedReportPreviewData,
   regenerateGeneratedReport,
+  downloadGeneratedListExport,
   listGeneratedReports,
   getReportsOverview,
   getAppStoreBootstrap,
@@ -497,6 +498,15 @@ function emptySchedule(templateId = "") {
   };
 }
 
+function downloadBlobUrl(url, filename) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -508,13 +518,6 @@ function downloadBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 1500);
 }
 
-async function openPdfInTab(generatedId) {
-  const blob = await downloadGeneratedReportBlob(generatedId);
-  const url = URL.createObjectURL(blob);
-  const win = window.open(url, "_blank", "noopener,noreferrer");
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
-  return win;
-}
 
 // Resolve the TrustNode logo URL — mirrors App.jsx logic so the same file is
 // served for the header and the generated-reports card branding.
@@ -823,6 +826,40 @@ export function ScheduledReportsManager({
     setBusy("");
   };
 
+  // 2026-11-16, asked: "we should be able to duplicate the schedule
+  // reporting setting". Every setting is copied; the copy gets a new id, a
+  // unique "(copy)" name and is saved DISABLED, so it can never fire into
+  // the same folder on the same trigger before the operator changes it.
+  // Run state (last run, an open cycle) is not copied - a new id starts
+  // clean on the server.
+  const handleDuplicate = async () => {
+    if (!draft.id) return;
+    setBusy("duplicate");
+    try {
+      const taken = new Set((schedules || []).map((sc) => String(sc?.name || "").trim().toLowerCase()));
+      const base = `${String(draft.name || "Schedule").trim()} (copy)`;
+      let name = base;
+      for (let n = 2; taken.has(name.toLowerCase()); n += 1) name = `${base} ${n}`;
+      const payload = {
+        ...draft,
+        id: "",
+        name,
+        enabled: false,
+        last_run_utc: "", next_run_utc: "", last_status: "", last_error: "",
+        cycle_started_utc: "", cycle_report_id: "", cycle_segments: [],
+        recipients: recipientsInput.split(/[;,\n]+/).map((x) => x.trim()).filter(Boolean),
+      };
+      const res = await saveScheduledReport(payload);
+      const saved = res?.schedule;
+      if (saved) loadSchedule(saved);
+      await refreshFresh();
+      onNotify({ type: "success", message: `Duplicated as "${name}" - it is saved disabled; enable it when it is ready.` });
+    } catch (e) {
+      onNotify({ type: "error", message: `Duplicate failed: ${e?.message || e}` });
+    }
+    setBusy("");
+  };
+
   const handleDelete = async () => {
     if (!draft.id) return;
     if (!window.confirm(`Delete schedule "${draft.name}"?`)) return;
@@ -902,6 +939,26 @@ export function ScheduledReportsManager({
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [anyPending]);
+  // 2026-11-16: one action at a time per row, shown on the button, so a click
+  // is never silent while the file is on its way.
+  const [rowBusy, setRowBusy] = useState({});
+  const withRowBusy = async (id, kind, fn) => {
+    const key = `${id}:${kind}`;
+    if (rowBusy[key]) return;
+    setRowBusy((b) => ({ ...b, [key]: true }));
+    try { await fn(); } finally { setRowBusy((b) => { const n = { ...b }; delete n[key]; return n; }); }
+  };
+  const isRowBusy = (id, kind) => Boolean(rowBusy[`${id}:${kind}`]);
+  // The PDF is shown INSIDE the app, the way the report builder shows it.
+  // window.open on a blob that was revoked 5 s later opened a window in the
+  // desktop app that often showed nothing.
+  const [pdfView, setPdfView] = useState(null); // { target, url, loading, error }
+  const closePdfView = () => {
+    setPdfView((v) => {
+      if (v?.url) { try { URL.revokeObjectURL(v.url); } catch (_) { /* gone */ } }
+      return null;
+    });
+  };
   const handlePreviewData = async (g) => {
     setDataPreview({ target: g, data: null, source: "", loading: true, error: "" });
     try {
@@ -911,27 +968,33 @@ export function ScheduledReportsManager({
       setDataPreview({ target: g, data: null, source: "", loading: false, error: e?.message || String(e) });
     }
   };
-  const handleRegenerateGenerated = async (g) => {
+  const handleRegenerateGenerated = (g) => withRowBusy(g.id, "regen", async () => {
     try {
       await regenerateGeneratedReport(g.id);
       onNotify({ type: "info", message: `Regenerating "${g.file_name || g.template_name || g.id}" - the row updates when the PDF lands.` });
-      await refreshFresh();
+      refreshFresh();   // not awaited: the row's pending poll picks it up
     } catch (e) {
       onNotify({ type: "error", message: `Regenerate failed: ${e?.message || e}` });
     }
-  };
-  const handlePreviewGenerated = async (gid) => {
-    try { await openPdfInTab(gid); }
-    catch (e) { onNotify({ type: "error", message: `Preview failed: ${e?.message || e}` }); }
-  };
-  const handleDownloadGenerated = async (g) => {
+  });
+  const handlePreviewGenerated = (g) => withRowBusy(g.id, "pdf", async () => {
+    setPdfView({ target: g, url: "", loading: true, error: "" });
+    try {
+      const blob = await downloadGeneratedReportBlob(g.id);
+      const url = URL.createObjectURL(blob);
+      setPdfView((v) => (v && v.target?.id === g.id ? { ...v, url, loading: false } : (URL.revokeObjectURL(url), v)));
+    } catch (e) {
+      setPdfView((v) => (v && v.target?.id === g.id ? { ...v, loading: false, error: `Preview failed: ${e?.message || e}` } : v));
+    }
+  });
+  const handleDownloadGenerated = (g) => withRowBusy(g.id, "dl", async () => {
     try {
       const blob = await downloadGeneratedReportBlob(g.id);
       downloadBlob(blob, g.file_name || `${(g.template_name || "report").replace(/\s+/g, "_")}.pdf`);
     } catch (e) {
       onNotify({ type: "error", message: `Download failed: ${e?.message || e}` });
     }
-  };
+  });
   // Lightweight email modal: pick attachment formats + recipients without a
   // second window.prompt call. Stored in state so the user can tweak before
   // hitting "Send".
@@ -992,10 +1055,55 @@ export function ScheduledReportsManager({
     }
   };
 
+  // 2026-11-16, asked: the results of a day / a month / the last N tests of
+  // one part number. Date range and "column = value" filters on the list,
+  // and the filtered list exported with its result columns.
+  const [filterFrom, setFilterFrom] = useState("");
+  const [filterTo, setFilterTo] = useState("");
+  const [filterColumn, setFilterColumn] = useState("");
+  const [filterValue, setFilterValue] = useState("");
   const filteredGenerated = useMemo(() => {
-    if (!filterScheduleId) return generated;
-    return generated.filter((g) => String(g.schedule_id || "") === String(filterScheduleId));
-  }, [generated, filterScheduleId]);
+    let rows = generated;
+    if (filterScheduleId) rows = rows.filter((g) => String(g.schedule_id || "") === String(filterScheduleId));
+    const fromMs = filterFrom ? new Date(filterFrom).getTime() : NaN;
+    const toMs = filterTo ? new Date(filterTo).getTime() : NaN;
+    if (Number.isFinite(fromMs) || Number.isFinite(toMs)) {
+      rows = rows.filter((g) => {
+        const ms = Date.parse(String(g.created_utc || "").replace(" ", "T") + "Z");
+        if (!Number.isFinite(ms)) return true;
+        if (Number.isFinite(fromMs) && ms < fromMs) return false;
+        if (Number.isFinite(toMs) && ms > toMs) return false;
+        return true;
+      });
+    }
+    if (filterColumn) {
+      const needle = String(filterValue || "").trim().toLowerCase();
+      rows = rows.filter((g) => {
+        const v = (g?.meta?.columns || {})[filterColumn];
+        if (v === undefined || v === null) return false;
+        return !needle || String(v).toLowerCase().includes(needle);
+      });
+    }
+    return rows;
+  }, [generated, filterScheduleId, filterFrom, filterTo, filterColumn, filterValue]);
+  const exportFilters = () => ({
+    scheduleId: filterScheduleId || "",
+    fromUtc: filterFrom ? new Date(filterFrom).toISOString() : "",
+    toUtc: filterTo ? new Date(filterTo).toISOString() : "",
+    column: filterColumn || "", value: filterColumn ? (filterValue || "") : "",
+  });
+  const [exporting, setExporting] = useState("");
+  const handleExportList = async (format) => {
+    if (exporting) return;
+    setExporting(format);
+    try {
+      const blob = await downloadGeneratedListExport(format, exportFilters());
+      downloadBlob(blob, `test_results.${format}`);
+    } catch (e) {
+      onNotify({ type: "error", message: `Export failed: ${e?.message || e}` });
+    }
+    setExporting("");
+  };
 
   // 2026-10-27, reported: the Generated Reports page offered no way to add
   // a column, because the editor lived in the SCHEDULE editor and this page
@@ -1587,6 +1695,12 @@ export function ScheduledReportsManager({
                   <IconPlay /> {busy === "run" ? "Running…" : "Run now"}
                 </button>
                 {draft.id ? (
+                  <button type="button" className="btn" onClick={handleDuplicate} disabled={busy === "duplicate"}
+                    title="Copy every setting into a new schedule, saved disabled">
+                    {busy === "duplicate" ? "Duplicating…" : "Duplicate"}
+                  </button>
+                ) : null}
+                {draft.id ? (
                   <button type="button" className="btn btn-danger" onClick={handleDelete} disabled={busy === "delete"}>
                     <IconTrash /> Delete schedule
                   </button>
@@ -1609,7 +1723,7 @@ export function ScheduledReportsManager({
           </div>
           <div className="tn-card-head-actions">
             <label className="generated-reports-filter">
-              <span>Filter</span>
+              <span>Schedule</span>
               <select
                 value={filterScheduleId}
                 onChange={(e) => setFilterScheduleId(e.target.value)}
@@ -1620,6 +1734,34 @@ export function ScheduledReportsManager({
                 ))}
               </select>
             </label>
+            <label className="generated-reports-filter">
+              <span>From</span>
+              <input type="datetime-local" value={filterFrom} onChange={(e) => setFilterFrom(e.target.value)} />
+            </label>
+            <label className="generated-reports-filter">
+              <span>To</span>
+              <input type="datetime-local" value={filterTo} onChange={(e) => setFilterTo(e.target.value)} />
+            </label>
+            <label className="generated-reports-filter">
+              <span>Column</span>
+              <select value={filterColumn} onChange={(e) => setFilterColumn(e.target.value)} title="A result column (Part #, Result ...) to filter on">
+                <option value="">Any column</option>
+                {extraColumns.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </label>
+            <label className="generated-reports-filter">
+              <span>Value</span>
+              <input value={filterValue} placeholder={filterColumn ? "contains…" : "pick a column"} disabled={!filterColumn}
+                onChange={(e) => setFilterValue(e.target.value)} />
+            </label>
+            <button type="button" className="btn btn-secondary btn-sm" disabled={!!exporting}
+              title="The filtered list with its result columns, as CSV" onClick={() => handleExportList("csv")}>
+              {exporting === "csv" ? "Exporting…" : "CSV"}
+            </button>
+            <button type="button" className="btn btn-secondary btn-sm" disabled={!!exporting}
+              title="The filtered list with its result columns, as Excel" onClick={() => handleExportList("xlsx")}>
+              {exporting === "xlsx" ? "Exporting…" : "Excel"}
+            </button>
             <button type="button" className="icon-btn" onClick={refresh} title="Refresh list" aria-label="Refresh">
               <IconRefresh />
             </button>
@@ -1745,19 +1887,21 @@ export function ScheduledReportsManager({
                           <button
                             type="button"
                             className="icon-btn"
-                            title={String(g.render_state || "ready") === "ready" ? "Preview in new tab" : "The PDF is not available yet"}
+                            title={isRowBusy(g.id, "pdf") ? "Opening…" : String(g.render_state || "ready") === "ready" ? "Preview the PDF" : "The PDF is not available yet"}
                             aria-label="Preview"
-                            disabled={String(g.render_state || "ready") !== "ready"}
-                            onClick={() => handlePreviewGenerated(g.id)}
+                            aria-busy={isRowBusy(g.id, "pdf")}
+                            disabled={String(g.render_state || "ready") !== "ready" || isRowBusy(g.id, "pdf")}
+                            onClick={() => handlePreviewGenerated(g)}
                           >
                             <IconEye />
                           </button>
                           <button
                             type="button"
                             className="icon-btn"
-                            title={String(g.render_state || "ready") === "ready" ? "Download PDF" : "The PDF is not available yet"}
+                            title={isRowBusy(g.id, "dl") ? "Downloading…" : String(g.render_state || "ready") === "ready" ? "Download PDF" : "The PDF is not available yet"}
                             aria-label="Download"
-                            disabled={String(g.render_state || "ready") !== "ready"}
+                            aria-busy={isRowBusy(g.id, "dl")}
+                            disabled={String(g.render_state || "ready") !== "ready" || isRowBusy(g.id, "dl")}
                             onClick={() => handleDownloadGenerated(g)}
                           >
                             <IconDownload />
@@ -1765,9 +1909,10 @@ export function ScheduledReportsManager({
                           <button
                             type="button"
                             className="icon-btn"
-                            title="Rebuild the PDF for the same window"
+                            title={isRowBusy(g.id, "regen") ? "Starting…" : "Rebuild the PDF for the same window"}
                             aria-label="Regenerate"
-                            disabled={String(g.render_state || "ready") === "pending"}
+                            aria-busy={isRowBusy(g.id, "regen")}
+                            disabled={String(g.render_state || "ready") === "pending" || isRowBusy(g.id, "regen")}
                             onClick={() => handleRegenerateGenerated(g)}
                           >
                             <IconRefresh />
@@ -1803,6 +1948,33 @@ export function ScheduledReportsManager({
       </section>
       )}
 
+      {pdfView ? (
+        <div className="modal-backdrop" onClick={closePdfView}>
+          <div
+            className="modal-card schedule-data-preview-dialog"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3>{pdfView.target.file_name || pdfView.target.template_name || "Report"}</h3>
+            <p className="muted small">generated {pdfView.target.created_utc || "-"}</p>
+            {pdfView.loading ? <div className="muted">Opening the PDF…</div> : null}
+            {pdfView.error ? <div className="warn">{pdfView.error}</div> : null}
+            {pdfView.url ? (
+              <object data={pdfView.url} type="application/pdf" className="tn-pdf-preview-frame" title="Report PDF"
+                style={{ width: "100%", height: "70vh" }}>
+                <iframe src={pdfView.url} title="Report PDF" className="tn-pdf-preview-frame"
+                  style={{ width: "100%", height: "70vh", border: 0 }} />
+              </object>
+            ) : null}
+            <div className="row modal-actions">
+              <button type="button" className="btn" disabled={!pdfView.url}
+                onClick={() => downloadBlobUrl(pdfView.url, pdfView.target.file_name || "report.pdf")}>
+                Download
+              </button>
+              <button type="button" className="btn btn-primary" onClick={closePdfView}>Close</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {dataPreview ? (
         <div className="modal-backdrop" onClick={() => setDataPreview(null)}>
           <div

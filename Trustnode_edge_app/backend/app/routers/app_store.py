@@ -288,6 +288,7 @@ class HistorianRuleStatsRequest(BaseModel):
     gateway: str = ""
     edge_id: str = ""
     prefer_cloud: str = ""
+    data_filter: Any = None          # 2026-11-16: see services/historian_filter.py
 
 
 class RetentionPolicyPayload(BaseModel):
@@ -1173,6 +1174,7 @@ def get_historian_range(
     tag: str = "",
     edge_id: str = "",
     prefer_cloud: str = "",
+    data_filter: str = "",
 ) -> dict:
     prefer_cloud_reads = _resolve_prefer_cloud_reads(request, prefer_cloud=prefer_cloud)
     safe_limit = max(50, min(int(limit or 5000), 10000 if prefer_cloud_reads else 50000))
@@ -1190,6 +1192,7 @@ def get_historian_range(
             device=device,
             tag=tag,
             edge_id=edge_id,
+            data_filter=data_filter,
         ),
     }
 
@@ -1315,6 +1318,7 @@ def get_historian_agg(
     source: str = "",
     limit: int = 50000,
     bucket_seconds: int = 0,
+    data_filter: str = "",
 ) -> dict:
     """Operator 2026-06-17: serve pre-bucketed historian rows from the
     `historian_agg_<bucket>` tables (populated by the retention worker).
@@ -1330,7 +1334,19 @@ def get_historian_agg(
             "bucket": "%ds" % n_s,
             "rows": app_store.bucket_series_rows(
                 from_utc=from_utc, to_utc=to_utc, gateway=gateway, tag=tag,
-                bucket_seconds=n_s, limit=max(safe_limit, 200000)),
+                bucket_seconds=n_s, limit=max(safe_limit, 200000), data_filter=data_filter),
+        }
+    if str(data_filter or "").strip():
+        # 2026-11-16: the pre-aggregated grains are per tag and cannot answer a
+        # filter on other tags; bucket in SQL instead (minute/hour/day in seconds).
+        _grain = {"second": 1, "minute": 60, "hour": 3600, "day": 86400}.get(str(bucket or "minute").lower(), 60)
+        return {
+            "ok": True,
+            "tenant_id": get_current_tenant(),
+            "bucket": bucket,
+            "rows": app_store.bucket_series_rows(
+                from_utc=from_utc, to_utc=to_utc, gateway=gateway, tag=tag,
+                bucket_seconds=_grain, limit=max(safe_limit, 200000), data_filter=data_filter),
         }
     return {
         "ok": True,
@@ -1358,6 +1374,7 @@ def get_historian_stats(
     tag: str = "",
     edge_id: str = "",
     prefer_cloud: str = "",
+    data_filter: str = "",
 ) -> dict:
     prefer_cloud_reads = _resolve_prefer_cloud_reads(request, prefer_cloud=prefer_cloud)
     return {
@@ -1371,6 +1388,7 @@ def get_historian_stats(
             tag=tag,
             edge_id=edge_id,
             prefer_cloud_reads=prefer_cloud_reads,
+            data_filter=data_filter,
         ),
     }
 
@@ -1391,6 +1409,7 @@ def get_historian_rule_stats(
             gateway=payload.gateway,
             edge_id=payload.edge_id,
             prefer_cloud_reads=prefer_cloud_reads,
+            data_filter=payload.data_filter,
         ),
     }
 

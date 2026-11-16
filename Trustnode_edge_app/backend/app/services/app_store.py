@@ -1,4 +1,5 @@
 import json
+from app.services import historian_filter as _hf
 import os
 import sqlite3
 import sys
@@ -1504,6 +1505,13 @@ class AppStore:
                 params: tuple = (tid,)
                 if t == "report_templates" and has_name:
                     where += " AND name NOT IN (SELECT name FROM report_templates WHERE tenant_id = ?)"
+                    # 2026-11-16, the owner: an update never adds templates the
+                    # customer did not make. Built-in seeds (tpl-demo-*,
+                    # tpl-batch-*) and the empty shells the legacy migration
+                    # wrote stay under `default`; a template somebody actually
+                    # built still moves.
+                    where += (" AND id NOT LIKE 'tpl-demo-%' AND id NOT LIKE 'tpl-batch-%'"
+                              " AND definition_json NOT LIKE '{\"sections\":[]%'")
                     params = (tid, tid)
                 t0 = time.time()
                 try:
@@ -1770,8 +1778,15 @@ class AppStore:
             except Exception:
                 settings = {}
             tenant_id = str(settings.get("tenant_id") or "").strip() or "default"
+            # 2026-11-16, from the owner: "when we are updating existing installations,
+            # we should not create new templates in the customer, and never change the
+            # existing templates on the customer database."
+            # The demo set ran on EVERY start and put back any demo template
+            # the customer had deleted. It is for a fresh install only: a
+            # tenant that has any template at all is left exactly as it is.
             try:
-                _rs.seed_demo_templates(tenant_id=tenant_id, created_by="system_demo_seed")
+                if not _rs.list_templates(tenant_id=tenant_id):
+                    _rs.seed_demo_templates(tenant_id=tenant_id, created_by="system_demo_seed")
             except Exception:
                 pass
             try:
@@ -9722,6 +9737,7 @@ class AppStore:
         tag: str = "",
         bucket_seconds: int = 60,
         limit: int = 100000,
+        data_filter: Any = None,
     ) -> list[dict[str, Any]]:
         """One row per N-second bucket per tag: avg, min, max, last, sum, count.
 
@@ -9766,6 +9782,10 @@ class AppStore:
         if tag_txt:
             where += " AND tag_name = :tag_exact"
             params["tag_exact"] = tag_txt
+        # 2026-11-16: the data filter (other tags' values at the same time).
+        _df_sql, _df_params = _hf.sql_fragment(_hf.parse_filter(data_filter), query_gateway=gw_txt)
+        where += _df_sql
+        params.update(_df_params)
         # `last` = the value with the greatest timestamp in the bucket, via the
         # printf/char(31) ordering trick the rollup engine uses.
         sql = f"""
@@ -10229,9 +10249,14 @@ class AppStore:
         device: str = "",
         tag: str = "",
         edge_id: str = "",
+        data_filter: Any = None,
     ) -> list[dict[str, Any]]:
         lim = max(1, min(int(limit or 5000), 50000))
         off = max(0, int(offset or 0))
+        # 2026-11-16: a data filter is answered by the local store (the
+        # correlated predicate is SQLite's); the cloud / customer-DB routes
+        # are skipped for it.
+        flt = _hf.parse_filter(data_filter)
         edge_filter = self._normalize_edge_filter(edge_id)
         tenant_id = self._current_tenant_id()
         gateway_txt = str(gateway or "").strip()
@@ -10239,7 +10264,7 @@ class AppStore:
         tag_txt = str(tag or "").strip()
         from_txt = self._normalize_utc_filter(from_utc)
         to_txt = self._normalize_utc_filter(to_utc)
-        prefer_cloud = self._prefer_cloud_reads() if prefer_cloud_reads is None else bool(prefer_cloud_reads)
+        prefer_cloud = (self._prefer_cloud_reads() if prefer_cloud_reads is None else bool(prefer_cloud_reads)) and not flt
         if prefer_cloud:
             cloud_rows = self._fetch_historian_rows_from_cloud(
                 limit=lim,
@@ -10255,7 +10280,7 @@ class AppStore:
 
         # Canonical-customer-DB routing (2026-06-23) — same shape as
         # get_historian_rows but carries the range filter through.
-        ct = self.customer_database_read_target() if not prefer_cloud else None
+        ct = self.customer_database_read_target() if (not prefer_cloud and not flt) else None
         if ct:
             merged = self._route_historian_read_with_spill(
                 ct, limit=lim,
@@ -10332,6 +10357,11 @@ class AppStore:
             where_unscoped += " AND ts_utc <= :to_utc"
             params["to_utc"] = to_txt
             params_unscoped["to_utc"] = to_txt
+        _df_sql, _df_params = _hf.sql_fragment(flt, query_gateway=gateway_txt)
+        where += _df_sql
+        where_unscoped += _df_sql
+        params.update(_df_params)
+        params_unscoped.update(_df_params)
 
         # Read-only path: SQLite WAL allows concurrent readers without serializing.
         # We deliberately do NOT acquire self._lock here so dashboard widgets and
@@ -10438,6 +10468,7 @@ class AppStore:
         tag: str = "",
         edge_id: str = "",
         prefer_cloud_reads: bool | None = None,
+        data_filter: Any = None,
     ) -> list[dict[str, Any]]:
         edge_filter = self._normalize_edge_filter(edge_id)
         tenant_id = self._current_tenant_id()
@@ -10446,8 +10477,9 @@ class AppStore:
         tag_txt = str(tag or "").strip()
         from_txt = self._normalize_utc_filter(from_utc)
         to_txt = self._normalize_utc_filter(to_utc)
+        flt = _hf.parse_filter(data_filter)   # 2026-11-16: local store, raw path only
 
-        prefer_cloud = self._prefer_cloud_reads() if prefer_cloud_reads is None else bool(prefer_cloud_reads)
+        prefer_cloud = (self._prefer_cloud_reads() if prefer_cloud_reads is None else bool(prefer_cloud_reads)) and not flt
         if prefer_cloud:
             cloud_stats = self._fetch_historian_stats_from_cloud(
                 gateway=gateway_txt,
@@ -10513,6 +10545,11 @@ class AppStore:
             where_unscoped += " AND ts_utc <= :to_utc"
             params["to_utc"] = to_txt
             params_unscoped["to_utc"] = to_txt
+        _df_sql, _df_params = _hf.sql_fragment(flt, query_gateway=gateway_txt)
+        where += _df_sql
+        where_unscoped += _df_sql
+        params.update(_df_params)
+        params_unscoped.update(_df_params)
 
         def _fetch_aggregates(conn: sqlite3.Connection, where_sql: str, params_sql: dict[str, Any]) -> list[sqlite3.Row]:
             return conn.execute(
@@ -10579,7 +10616,7 @@ class AppStore:
                                                      gateway_txt, tag_txt, from_txt, to_txt)
                 except Exception:
                     fast = None
-            if fast is not None:
+            if fast is not None and not flt:
                 rows = [{"tag_name": t, "row_count": v["n"], "sum_value": v["sum"],
                          "avg_value": (v["sum"] / v["n"]) if v["n"] else None,
                          "min_value": v["min"], "max_value": v["max"]}
@@ -10618,8 +10655,10 @@ class AppStore:
         gateway: str = "",
         edge_id: str = "",
         prefer_cloud_reads: bool | None = None,
+        data_filter: Any = None,
     ) -> list[dict[str, Any]]:
         del edge_id  # rule stats are tenant-scoped historian aggregates
+        flt = _hf.parse_filter(data_filter)   # 2026-11-16
         del prefer_cloud_reads  # local edge must remain local-source-of-truth for widget rules
         tenant_id = self._current_tenant_id()
         from_txt = self._normalize_utc_filter(from_utc)
@@ -10794,6 +10833,9 @@ class AppStore:
             if to_txt:
                 where_g += " AND ts_utc <= :to_utc"
                 params_g["to_utc"] = to_txt
+            _df_sql, _df_params = _hf.sql_fragment(flt, query_gateway=gw_txt)
+            where_g += _df_sql
+            params_g.update(_df_params)
             return where_g, params_g
 
         def _rule_predicate(r: dict[str, Any], param_prefix: str) -> tuple[str, dict[str, Any]]:
@@ -10858,7 +10900,7 @@ class AppStore:
                                                              gw, base_tag, from_txt, to_txt)
                         except Exception:
                             fast = None
-                    if fast is not None:
+                    if fast is not None and not flt:
                         st = fast.get(base_tag) or {"n": 0, "sum": 0.0, "min": None, "max": None}
                         row = {}
                         for r in group_rules:

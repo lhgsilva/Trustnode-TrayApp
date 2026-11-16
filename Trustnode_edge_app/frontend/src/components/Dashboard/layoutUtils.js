@@ -1,3 +1,4 @@
+import { cleanDataFilter } from "../DataFilter/dataFilter.js";
 import {
   DASHBOARD_GRID_COLS,
   DASHBOARD_GRID_ROWS,
@@ -136,6 +137,8 @@ function migrateLegacyWidget(old, placed) {
       pie_show_count: true,
       pie_show_percent: true,
       pie_legend_layout: "side",
+      pie_size: 100,
+      data_filter: null,
       chart_show_legend: false,
       chart_show_point_labels: false,
       chart_value_format: "auto",
@@ -199,7 +202,7 @@ export function normalizeWidgets(rawWidgets) {
         readings_count: clamp(raw?.config?.readings_count ?? raw?.readings_count ?? 120, 5, 5000),
         // 2026-11-02: the allowlist trap - a key missing here is stripped on
         // every reflow. See dashboard_widget_conventions.
-        bucket_interval: ["none", "1s", "2s", "5s", "10s", "30s", "1m", "5m", "15m", "1h"].includes(String(raw?.config?.bucket_interval || ""))
+        bucket_interval: ["none", "1s", "2s", "5s", "10s", "30s", "1m", "5m", "15m", "1h", "1d", "custom"].includes(String(raw?.config?.bucket_interval || ""))
           ? String(raw?.config?.bucket_interval) : "none",
         bucket_aggregation: ["avg", "min", "max", "last"].includes(String(raw?.config?.bucket_aggregation || ""))
           ? String(raw?.config?.bucket_aggregation) : "avg",
@@ -228,6 +231,7 @@ export function normalizeWidgets(rawWidgets) {
           : "none",
         query_time_filter_from: String(raw?.config?.query_time_filter_from || ""),
         query_time_filter_to: String(raw?.config?.query_time_filter_to || ""),
+        data_filter: cleanDataFilter(raw?.config?.data_filter),
         query_table_columns: Array.isArray(raw?.config?.query_table_columns)
           ? raw.config.query_table_columns.filter((c) => TABLE_COL_VALUES.has(String(c)))
           : ["ts", "tag", "value"],
@@ -237,6 +241,7 @@ export function normalizeWidgets(rawWidgets) {
         pie_show_count: raw?.config?.pie_show_count !== false,
         pie_show_percent: raw?.config?.pie_show_percent !== false,
         pie_legend_layout: String(raw?.config?.pie_legend_layout || "side") === "bottom" ? "bottom" : "side",
+        pie_size: Number.isFinite(Number(raw?.config?.pie_size)) && Number(raw?.config?.pie_size) > 0 ? Math.max(40, Math.min(100, Number(raw.config.pie_size))) : 100,
         chart_show_legend: raw?.config?.chart_show_legend === true,
         chart_show_point_labels: raw?.config?.chart_show_point_labels === true,
         chart_value_format: VALUE_FORMAT_VALUES.has(String(raw?.config?.chart_value_format || ""))

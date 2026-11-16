@@ -134,6 +134,28 @@ def _tick() -> None:
             _log.warning("v2 trigger dispatch failed: %s", e)
 
 
+def _after_terminal(exe, batch_id: str) -> None:
+    """2026-11-16: a batch stopped by a PLC trigger was never evaluated - the
+    compute + auto-report ran only from the manual stop/abort routes
+    (router_v2._terminal_hook), so every PLC-stopped part stayed PENDING with
+    no KPIs and no PDF. Same two steps here, best effort, one batch at a time
+    on the watcher thread (reads on the store, one bounded write of the
+    result)."""
+    store = getattr(exe, "_app_store", None)
+    if store is None:
+        return
+    try:
+        from .calc_v2 import BatchCalcService
+        BatchCalcService(store).compute_batch(batch_id)
+    except Exception as exc:                                   # noqa: BLE001
+        _log.warning("v2 trigger: compute after stop failed for %s: %s", batch_id, exc)
+    try:
+        from .reports_v2 import ReportIntegrationService
+        ReportIntegrationService(store).on_batch_terminal(batch_id, actor=None)
+    except Exception as exc:                                   # noqa: BLE001
+        _log.warning("v2 trigger: auto-report after stop failed for %s: %s", batch_id, exc)
+
+
 def _dispatch(exe, grp, ref: Dict[str, Any]) -> None:
     """Route a fired trigger to the right execution action."""
     scope = str(ref.get("trigger_scope") or "")
@@ -161,6 +183,7 @@ def _dispatch(exe, grp, ref: Dict[str, Any]) -> None:
             rows, _ = exe.list_batches(status=st, definition_id=defn_id, limit=50)
             for b in rows:
                 exe.stop_batch(b["id"], source=src, reason="gateway trigger")
+                _after_terminal(exe, b["id"])
 
     elif scope == "HOLD":
         rows, _ = exe.list_batches(status="running", definition_id=defn_id, limit=50)
@@ -177,6 +200,7 @@ def _dispatch(exe, grp, ref: Dict[str, Any]) -> None:
             rows, _ = exe.list_batches(status=st, definition_id=defn_id, limit=50)
             for b in rows:
                 exe.abort_batch(b["id"], source=src, reason="gateway trigger")
+                _after_terminal(exe, b["id"])
 
     elif scope == "BATCH_GROUP_START":
         g = grp.create_group({"definition_id": defn_id, "equipment_id": eq}, actor=None)

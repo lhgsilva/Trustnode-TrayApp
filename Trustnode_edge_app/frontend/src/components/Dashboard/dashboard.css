@@ -302,8 +302,9 @@
   height: 100%;
   margin: 0;
   padding: 0;
-  transform: scale(1.1);
-  transform-origin: center center;
+  /* 2026-11-16: this box used to be scaled 1.1x past its bounds - the donut
+     drew over the card header and its action buttons could not be clicked.
+     The size is now the widget's own "Chart size" option. */
 }
 
 .dashboard-donut-legend {
@@ -1109,6 +1110,22 @@
 
 .dashboard-computed-modal .dashboard-rule-row {
   grid-template-columns: minmax(140px, 1.2fr) minmax(150px, 1.2fr) minmax(150px, 1.2fr) minmax(110px, 0.9fr) minmax(96px, 0.8fr) minmax(96px, 0.8fr) minmax(120px, 0.9fr) 44px 36px;
+}
+
+/* 2026-11-16: the data filter window - gateway, tag, operator, value, value 2, remove */
+.dashboard-computed-modal .dashboard-rule-row.tn-data-filter-row {
+  grid-template-columns: minmax(150px, 1.1fr) minmax(170px, 1.4fr) minmax(96px, 0.7fr) minmax(96px, 0.8fr) minmax(96px, 0.8fr) 36px;
+}
+
+.tn-data-filter-logic {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.tn-data-filter-logic select {
+  height: 30px;
 }
 
 .dashboard-computed-modal .dashboard-rule-row.dashboard-meter-rule-row {

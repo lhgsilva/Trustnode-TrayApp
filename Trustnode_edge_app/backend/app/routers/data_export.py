@@ -34,6 +34,7 @@ class ExportSpec(BaseModel):
     quality: str = "all"
     columns: List[str] = Field(default_factory=list)
     conditions: List[Dict[str, Any]] = Field(default_factory=list)
+    data_filter: Any = None          # 2026-11-16: other tags' values at the same time
     bucket: str = ""
     aggregate: str = ""
     pivot: bool = False
@@ -250,7 +251,48 @@ def export_run(spec: ExportSpec) -> StreamingResponse:
             for row in chunk:
                 yield row
 
-    stream = _q.iter_csv(rows(), columns, include_header=bool(spec.include_header))
+    # 2026-11-16, reported: the preview pivoted (one row per timestamp, a
+    # column per tag) but the download streamed the long rows. Pivot is
+    # streamed too: the rows arrive ordered by ts_utc, so consecutive rows
+    # with one timestamp fold into one line; the tag columns are read first
+    # with a DISTINCT over the same filter (index-bound).
+    out_columns = columns
+    out_rows = rows()
+    if spec.pivot and all(k in columns for k in ("ts_utc", "tag_name", "value")):
+        inner = sql.split(" ORDER BY ")[0]
+        try:
+            with app_store._connect_readonly() as conn:
+                labels = [str(r[0] or "") for r in conn.execute(
+                    "SELECT DISTINCT tag_name FROM (%s) ORDER BY tag_name LIMIT 500" % inner, params)]
+        except Exception:
+            labels = []
+        if labels:
+            i_ts, i_tag, i_val = columns.index("ts_utc"), columns.index("tag_name"), columns.index("value")
+            i_txt = columns.index("value_text") if "value_text" in columns else -1
+            out_columns = ["ts_utc", *labels]
+            pos = {name: k + 1 for k, name in enumerate(labels)}
+
+            def _pivoted(src):
+                cur_ts = None
+                line = None
+                for r in src:
+                    ts = str(r[i_ts] or "")
+                    if ts != cur_ts:
+                        if line is not None:
+                            yield line
+                        cur_ts = ts
+                        line = [ts] + [None] * len(labels)
+                    k = pos.get(str(r[i_tag] or ""))
+                    if k:
+                        v = r[i_val]
+                        if v is None and i_txt >= 0:
+                            v = r[i_txt]
+                        line[k] = v
+                if line is not None:
+                    yield line
+            out_rows = _pivoted(rows())
+
+    stream = _q.iter_csv(out_rows, out_columns, include_header=bool(spec.include_header))
     return StreamingResponse(
         stream,
         media_type="text/csv; charset=utf-8",

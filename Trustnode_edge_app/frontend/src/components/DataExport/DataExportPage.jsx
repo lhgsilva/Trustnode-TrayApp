@@ -24,6 +24,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./dataExport.css";
 import { readPageCache, writePageCache } from "../../pageCache.js";
+import DataFilterEditor from "../DataFilter/DataFilterEditor";
+import { describeDataFilter } from "../DataFilter/dataFilter.js";
 
 const QUALITY_OPTIONS = [
   { value: "all", label: "All readings" },
@@ -40,7 +42,7 @@ const FORMATS = [
 const EMPTY_SPEC = {
   gateways: [], devices: [], tags: [], tag_contains: "",
   from_utc: "", to_utc: "", quality: "all",
-  columns: [], conditions: [], bucket: "", aggregate: "",
+  columns: [], conditions: [], data_filter: null, bucket: "", aggregate: "",
   pivot: false, order: "asc", include_header: true,
 };
 
@@ -88,6 +90,7 @@ export default function DataExportPage({ api, isCloudClient = false, onError }) 
   const patchRef = useRef(patch);
   patchRef.current = patch;
   const [loadError, setLoadError] = useState("");
+  const [dataFilterOpen, setDataFilterOpen] = useState(false);   // 2026-11-16: the data filter window
 
   const loadSources = useCallback(async () => {
     const [opt, src] = await Promise.all([
@@ -369,6 +372,21 @@ export default function DataExportPage({ api, isCloudClient = false, onError }) 
               <input value={spec.tag_contains} placeholder="optional, e.g. Temp"
                 onChange={(e) => patch({ tag_contains: e.target.value })} />
             </label>
+
+            <div className="dexp-field">
+              <span>Data filter (other tags at the same time)</span>
+              <button type="button" className="btn dexp-control" onClick={() => setDataFilterOpen(true)}
+                title={describeDataFilter(spec.data_filter) || "Keep only the readings taken while other tags meet conditions"}>
+                {describeDataFilter(spec.data_filter) || "Add data filter"}
+              </button>
+            </div>
+            <DataFilterEditor
+              open={dataFilterOpen}
+              onClose={() => setDataFilterOpen(false)}
+              value={spec.data_filter}
+              onChange={(f) => patch({ data_filter: f })}
+              gatewayOptions={(sources?.gateways || []).map((id) => ({ id, name: (sources?.gateway_names || {})[id] || id, tags: sources?.tags || [] }))}
+            />
 
             <div className="dexp-field">
               <span>Value conditions</span>

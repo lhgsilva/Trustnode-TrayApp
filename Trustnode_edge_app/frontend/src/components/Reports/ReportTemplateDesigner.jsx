@@ -1,4 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import DataFilterEditor from "../DataFilter/DataFilterEditor";
+import { describeDataFilter } from "../DataFilter/dataFilter.js";
 import {
   Area,
   AreaChart,
@@ -52,6 +54,8 @@ const SECTION_PRESETS = [
     description: "Your own rows - fixed text, or a tag value via {TagName}" },
   { type: "segment_summary", label: "Test summary table",
     description: "One row per test/cycle, aggregated per tag, with a total row" },
+  { type: "runs_table", label: "Past runs table",
+    description: "One row per past run of this template (a day's parts, a month's tests, the last N of a part number) with each run's stored result columns" },
   { type: "image", label: "Image", description: "Embed an uploaded picture (logo, photo, diagram)" },
   { type: "spacer", label: "Spacer", description: "Vertical gap" },
   { type: "page_break", label: "Page break", description: "Force a new page" },
@@ -166,6 +170,12 @@ const KPI_AGGREGATIONS = [
   { value: "min", label: "Min" },
   { value: "max", label: "Max" },
   { value: "latest", label: "Latest" },
+  // 2026-11-16: the engine had these (TCU starter templates used them) but
+  // no menu offered them.
+  { value: "duration_s", label: "Duration (s)" },
+  { value: "ramp_time", label: "Ramp time (s, from → to)" },
+  { value: "rate_max", label: "Max rate (/min)" },
+  { value: "rate_min", label: "Min rate (/min)" },
 ];
 
 // What a Test summary table can compute per test, and again across tests.
@@ -180,6 +190,10 @@ const SEGMENT_AGGREGATIONS = [
   { value: "sum", label: "Sum" },
   { value: "count", label: "Count" },
   { value: "median", label: "Median" },
+  { value: "duration_s", label: "Duration (s)" },
+  { value: "ramp_time", label: "Ramp time (s, from → to)" },
+  { value: "rate_max", label: "Max rate (/min)" },
+  { value: "rate_min", label: "Min rate (/min)" },
 ];
 
 const RULE_OPERATORS = [
@@ -842,6 +856,23 @@ function defaultSection(type) {
           id: makeId("pill"), label: "Result", text: "PASS",
           color: "#ffffff", background: "#14a89a", bold: true,
         }],
+      };
+    case "runs_table":
+      // 2026-11-16: the past runs of THIS template over a window, with the
+      // columns each run stored (Part #, Result ...), and a count footer.
+      return {
+        id: makeId("sec"),
+        type,
+        title: "Test results",
+        time_range: { preset: "24h" },
+        runs_schedule_name: "",
+        runs_filter_column: "",
+        runs_filter_value: "",
+        runs_columns: [],
+        runs_limit: 200,
+        count_column: "",
+        count_label: "Count",
+        runs_time_header: "Run",
       };
     case "segment_summary":
       // One row per test/cycle the run produced, one column per tag, and an
@@ -1981,6 +2012,33 @@ function TriggerSide({ label, side, trigger, onChange, gatewayOptions, tagList,
 }
 
 
+/** 2026-11-16: the section's data filter - readings kept only when other
+ * tags, read at the same time, meet the conditions. The same window as the
+ * dashboard and the export connection use; the renderer passes it to every
+ * historian read of the section. */
+function SectionDataFilter({ section, onChange, gatewayOptions, tagList, formatTagForDisplay }) {
+  const [open, setOpen] = React.useState(false);
+  const summary = describeDataFilter(section.data_filter, (t) => (formatTagForDisplay ? formatTagForDisplay(t) : t));
+  return (
+    <>
+      <div className="tn-subhead">Data filter (optional)</div>
+      <div className="tn-inline-label tn-data-filter-line">
+        <span className="tn-data-filter-text">{summary || "none - every reading in the window"}</span>
+        <button type="button" className="btn btn-ghost btn-sm" onClick={() => setOpen(true)}>Open Data Filter</button>
+      </div>
+      <DataFilterEditor
+        open={open}
+        onClose={() => setOpen(false)}
+        value={section.data_filter}
+        onChange={(f) => onChange({ data_filter: f })}
+        gatewayOptions={gatewayOptions}
+        tagsForGateway={tagList}
+        formatTagForDisplay={formatTagForDisplay}
+      />
+    </>
+  );
+}
+
 function SectionTrigger({ section, onChange, gatewayOptions, tagList,
                           formatTagForDisplay }) {
   const trigger = section.trigger || {};
@@ -1990,6 +2048,8 @@ function SectionTrigger({ section, onChange, gatewayOptions, tagList,
         && trigger.start_conditions.some((c) => c?.tag_name)));
   return (
     <>
+      <SectionDataFilter section={section} onChange={onChange} gatewayOptions={gatewayOptions}
+                         tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
       <div className="tn-subhead">Trigger (optional)</div>
       <TriggerSide
         label="Start when" side="start" trigger={trigger} onChange={setTrigger}
@@ -2252,6 +2312,50 @@ function TokenInput({ value, onChange, placeholder = "", className = "",
   );
 }
 
+
+// 2026-11-16, asked: each Y-axis bound on its own - Auto, Manual or linked to
+// a Tag. Stored in the SAME field as before ("" / a number / a tag token),
+// so every saved template reads exactly as it did.
+function axisBoundMode(v) {
+  const s = String(v ?? "").trim();
+  if (!s) return "auto";
+  return s.includes("{") ? "tag" : "manual";
+}
+function AxisBoundInput({ label, value, onChange, gatewayOptions, tagList, formatTagForDisplay }) {
+  const [mode, setMode] = useState(() => axisBoundMode(value));
+  useEffect(() => {
+    const m = axisBoundMode(value);
+    if (m !== "auto") setMode(m);
+  }, [value]);
+  const pick = (m) => {
+    setMode(m);
+    if (m === "auto") onChange("");
+    else if (m === "manual" && axisBoundMode(value) !== "manual") onChange("");
+    else if (m === "tag" && axisBoundMode(value) !== "tag") onChange("");
+  };
+  return (
+    <label className="tn-axis-bound">
+      {label}
+      <div className="tn-bound-controls">
+      <select value={mode} onChange={(e) => pick(e.target.value)} title="Auto from the data, a fixed number, or a tag's value in this section's window">
+        <option value="auto">Auto</option>
+        <option value="manual">Manual</option>
+        <option value="tag">Tag</option>
+      </select>
+      {mode === "manual" ? (
+        <input type="number" step="any" value={value ?? ""} placeholder="value"
+               onChange={(e) => onChange(e.target.value)} />
+      ) : null}
+      {mode === "tag" ? (
+        <TokenInput value={value || ""} placeholder="pick a tag →"
+                    title="The tag's value over this section's window: Latest, or its Max / Min / Average"
+                    gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay}
+                    onChange={onChange} />
+      ) : null}
+      </div>
+    </label>
+  );
+}
 
 // 2026-10-23: a template exported from one edge and imported into another
 // names gateways and tags that do not exist on the target. Every picker in
@@ -2741,11 +2845,11 @@ function SectionEditor({
             </label>
             <label>Per row
               <input type="number" min="1" max="8" value={section.columns ?? 4}
-                     onChange={(e) => onChange({ columns: Number(e.target.value) || 1 })} />
+                     onChange={(e) => onChange({ columns: e.target.value })} onBlur={(e) => onChange({ columns: Number(e.target.value) || 1 })} />
             </label>
             <label>Text size (pt)
               <input type="number" min="6" max="28" step="0.5" value={section.font_size ?? 10}
-                     onChange={(e) => onChange({ font_size: Number(e.target.value) || 10 })} />
+                     onChange={(e) => onChange({ font_size: e.target.value })} onBlur={(e) => onChange({ font_size: Number(e.target.value) || 10 })} />
             </label>
           </div>
           <div className="tn-row tn-row-3">
@@ -2884,8 +2988,8 @@ function SectionEditor({
                 type="number"
                 min={0}
                 max={180}
-                value={Number(section.width_mm || 0)}
-                onChange={(e) => onChange({ width_mm: Math.max(0, Math.min(180, Number(e.target.value || 0))) })}
+                value={section.width_mm ?? 0}
+                onChange={(e) => onChange({ width_mm: e.target.value })} onBlur={(e) => onChange({ width_mm: Math.max(0, Math.min(180, Number(e.target.value || 0))) })}
                 placeholder="0 = auto"
                 title="0 = automatic (70% of page width). Otherwise width in millimeters, capped at the printable area."
               />
@@ -2933,6 +3037,67 @@ function SectionEditor({
         </div>
       ) : null}
 
+      {type === "runs_table" ? (
+        <div className="tn-section-form">
+          <div className="tn-row tn-row-3">
+            <TagTokenField label="Title" value={section.title} onChange={(v) => onChange({ title: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
+            <label>Window
+              <select value={section.time_range?.preset || "24h"}
+                onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), preset: e.target.value } })}>
+                <option value="24h">Last 24 hours</option>
+                <option value="7d">Last 7 days</option>
+                <option value="30d">Last 30 days</option>
+                <option value="run">This run</option>
+                <option value="custom">Custom</option>
+                <option value="none">All runs</option>
+              </select>
+            </label>
+            <label>Rows (newest N)
+              <input type="number" min="1" max="2000" value={section.runs_limit ?? 200}
+                onChange={(e) => onChange({ runs_limit: e.target.value })} onBlur={(e) => onChange({ runs_limit: Math.max(1, Math.min(2000, Number(e.target.value) || 200)) })} />
+            </label>
+          </div>
+          {String(section.time_range?.preset || "") === "custom" ? (
+            <div className="tn-row tn-row-2">
+              <label>From (UTC)<input value={section.time_range?.from_utc || ""} placeholder="2026-11-01 00:00:00"
+                onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), from_utc: e.target.value } })} /></label>
+              <label>To (UTC)<input value={section.time_range?.to_utc || ""} placeholder="2026-11-30 23:59:59"
+                onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), to_utc: e.target.value } })} /></label>
+            </div>
+          ) : null}
+          <div className="tn-row tn-row-3">
+            <label>Schedule name contains
+              <input value={section.runs_schedule_name || ""} placeholder="blank = every schedule of this template"
+                onChange={(e) => onChange({ runs_schedule_name: e.target.value })} />
+            </label>
+            <label>Only runs where column
+              <input value={section.runs_filter_column || ""} placeholder="e.g. Part #"
+                onChange={(e) => onChange({ runs_filter_column: e.target.value })} />
+            </label>
+            <label>contains
+              <input value={section.runs_filter_value || ""} placeholder="e.g. WO-4471"
+                onChange={(e) => onChange({ runs_filter_value: e.target.value })} />
+            </label>
+          </div>
+          <div className="tn-row tn-row-3">
+            <label>Columns to show
+              <input value={(section.runs_columns || []).join(", ")} placeholder="blank = every stored column (comma-separated)"
+                onChange={(e) => onChange({ runs_columns: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })} />
+            </label>
+            <label>Count footer on column
+              <input value={section.count_column || ""} placeholder="e.g. Result → PASS 18 / FAIL 2"
+                onChange={(e) => onChange({ count_column: e.target.value })} />
+            </label>
+            <label>First column header
+              <input value={section.runs_time_header || "Run"} onChange={(e) => onChange({ runs_time_header: e.target.value })} />
+            </label>
+          </div>
+          <p className="tn-token-help">
+            The columns come from the schedule's "Columns" (Generated Reports page): a value read from a tag when each report was generated, e.g. Part # and Result.
+          </p>
+          <SectionLayout section={section} onChange={onChange} prevType={prevType} showAlign />
+        </div>
+      ) : null}
       {type === "segment_summary" ? (
         <div className="tn-section-form">
           <div className="tn-row tn-row-3">
@@ -3109,7 +3274,7 @@ function SectionEditor({
               <input
                 type="number" min={1} max={6}
                 value={section.columns || 4}
-                onChange={(e) => onChange({ columns: Math.max(1, Math.min(6, Number(e.target.value || 4))) })}
+                onChange={(e) => onChange({ columns: e.target.value })} onBlur={(e) => onChange({ columns: Math.max(1, Math.min(6, Number(e.target.value || 4))) })}
               />
             </label>
           </div>
@@ -3150,6 +3315,16 @@ function SectionEditor({
                 >
                   {KPI_AGGREGATIONS.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
                 </select>
+                {String(item.aggregation || "") === "ramp_time" ? (
+                  <>
+                    <input type="number" step="any" placeholder="from" title="Ramp from this value…" style={{ width: 72 }}
+                      value={item.ramp_from ?? ""}
+                      onChange={(e) => onChange({ items: section.items.map((it, i) => (i === idx ? { ...it, ramp_from: e.target.value } : it)) })} />
+                    <input type="number" step="any" placeholder="to" title="…to this value" style={{ width: 72 }}
+                      value={item.ramp_to ?? ""}
+                      onChange={(e) => onChange({ items: section.items.map((it, i) => (i === idx ? { ...it, ramp_to: e.target.value } : it)) })} />
+                  </>
+                ) : null}
                 <button type="button" className="icon-btn icon-btn-danger" onClick={() => onChange({ items: section.items.filter((_, i) => i !== idx) })}>×</button>
               </div>
             ))}
@@ -3209,7 +3384,7 @@ function SectionEditor({
                   <input
                     type="number" min={20} max={5000}
                     value={section.readings_count || 200}
-                    onChange={(e) => onChange({ readings_count: Math.max(20, Math.min(5000, Number(e.target.value || 200))) })}
+                    onChange={(e) => onChange({ readings_count: e.target.value })} onBlur={(e) => onChange({ readings_count: Math.max(20, Math.min(5000, Number(e.target.value || 200))) })}
                   />
                 </label>
               ) : (
@@ -3217,7 +3392,7 @@ function SectionEditor({
                   <input
                     type="number" min={5} max={500}
                     value={section.row_limit || 30}
-                    onChange={(e) => onChange({ row_limit: Math.max(5, Math.min(500, Number(e.target.value || 30))) })}
+                    onChange={(e) => onChange({ row_limit: e.target.value })} onBlur={(e) => onChange({ row_limit: Math.max(5, Math.min(500, Number(e.target.value || 30))) })}
                   />
                 </label>
               )}
@@ -3447,8 +3622,8 @@ function SectionEditor({
                 <div className="tn-row tn-row-4">
                   <label>Title<TokenInput value={section.y_axis_label || ""} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_axis_label: v })} /></label>
                   <label>Unit / suffix<TokenInput value={section.y_axis_unit || ""} placeholder="e.g. kW" gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_axis_unit: v })} /></label>
-                  <label>Min<input type="number" step="any" value={section.y_min ?? ""} onChange={(e) => onChange({ y_min: e.target.value })} placeholder="auto" /></label>
-                  <label>Max<input type="number" step="any" value={section.y_max ?? ""} onChange={(e) => onChange({ y_max: e.target.value })} placeholder="auto" /></label>
+                  <AxisBoundInput label="Min" value={section.y_min ?? ""} onChange={(v) => onChange({ y_min: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
+                  <AxisBoundInput label="Max" value={section.y_max ?? ""} onChange={(v) => onChange({ y_max: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
                 
                 <div className="tn-row tn-row-2">
                   <label className="tn-checkbox" title="The rotated axis name beside the numbers.">
@@ -3468,8 +3643,8 @@ function SectionEditor({
                 <div className="tn-row tn-row-4">
                   <label>Title<TokenInput value={section.y_axis_right_label || ""} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_axis_right_label: v })} /></label>
                   <label>Unit / suffix<TokenInput value={section.y_axis_right_unit || ""} placeholder="e.g. °C" gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_axis_right_unit: v })} /></label>
-                  <label>Min<input type="number" step="any" value={section.y_right_min ?? ""} onChange={(e) => onChange({ y_right_min: e.target.value })} placeholder="auto" /></label>
-                  <label>Max<input type="number" step="any" value={section.y_right_max ?? ""} onChange={(e) => onChange({ y_right_max: e.target.value })} placeholder="auto" /></label>
+                  <AxisBoundInput label="Min" value={section.y_right_min ?? ""} onChange={(v) => onChange({ y_right_min: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
+                  <AxisBoundInput label="Max" value={section.y_right_max ?? ""} onChange={(v) => onChange({ y_right_max: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
                 
                 <div className="tn-row tn-row-2">
                   <label className="tn-checkbox" title="The rotated axis name beside the numbers.">
@@ -3489,8 +3664,8 @@ function SectionEditor({
                 <div className="tn-row tn-row-4">
                   <label>Title<TokenInput value={section.y_left2_label || ""} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_left2_label: v })} /></label>
                   <label>Unit / suffix<TokenInput value={section.y_left2_unit || ""} placeholder="e.g. bar" gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_left2_unit: v })} /></label>
-                  <label>Min<input type="number" step="any" value={section.y_left2_min ?? ""} onChange={(e) => onChange({ y_left2_min: e.target.value })} placeholder="auto" /></label>
-                  <label>Max<input type="number" step="any" value={section.y_left2_max ?? ""} onChange={(e) => onChange({ y_left2_max: e.target.value })} placeholder="auto" /></label>
+                  <AxisBoundInput label="Min" value={section.y_left2_min ?? ""} onChange={(v) => onChange({ y_left2_min: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
+                  <AxisBoundInput label="Max" value={section.y_left2_max ?? ""} onChange={(v) => onChange({ y_left2_max: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
                 
                 <div className="tn-row tn-row-2">
                   <label className="tn-checkbox" title="The rotated axis name beside the numbers.">
@@ -3510,8 +3685,8 @@ function SectionEditor({
                 <div className="tn-row tn-row-4">
                   <label>Title<TokenInput value={section.y_right2_label || ""} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_right2_label: v })} /></label>
                   <label>Unit / suffix<TokenInput value={section.y_right2_unit || ""} placeholder="e.g. l/min" gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} onChange={(v) => onChange({ y_right2_unit: v })} /></label>
-                  <label>Min<input type="number" step="any" value={section.y_right2_min ?? ""} onChange={(e) => onChange({ y_right2_min: e.target.value })} placeholder="auto" /></label>
-                  <label>Max<input type="number" step="any" value={section.y_right2_max ?? ""} onChange={(e) => onChange({ y_right2_max: e.target.value })} placeholder="auto" /></label>
+                  <AxisBoundInput label="Min" value={section.y_right2_min ?? ""} onChange={(v) => onChange({ y_right2_min: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
+                  <AxisBoundInput label="Max" value={section.y_right2_max ?? ""} onChange={(v) => onChange({ y_right2_max: v })} gatewayOptions={gatewayOptions} tagList={tagList} formatTagForDisplay={formatTagForDisplay} />
                 
                 <div className="tn-row tn-row-2">
                   <label className="tn-checkbox" title="The rotated axis name beside the numbers.">
@@ -3732,7 +3907,7 @@ function SectionEditor({
       {type === "spacer" ? (
         <div className="tn-section-form">
           <label>Height (mm)
-            <input type="number" min={2} max={80} value={section.height || 8} onChange={(e) => onChange({ height: Math.max(2, Math.min(80, Number(e.target.value || 8))) })} />
+            <input type="number" min={2} max={80} value={section.height || 8} onChange={(e) => onChange({ height: e.target.value })} onBlur={(e) => onChange({ height: Math.max(2, Math.min(80, Number(e.target.value || 8))) })} />
           </label>
         </div>
       ) : null}

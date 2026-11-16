@@ -22,6 +22,7 @@ values in PDFs match what the user sees on the live dashboard.
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import io
 import math
@@ -67,6 +68,12 @@ def _utc_str_to_local_iso(ts_utc: str) -> str:
     except Exception:
         return raw
 from typing import Any
+
+# 2026-11-16: the section being rendered sets its data filter here (other
+# tags' values at the same time, see services/historian_filter.py); every
+# historian read a section makes carries it. The trigger reader does not -
+# a trigger is found on every reading.
+_DATA_FILTER: "contextvars.ContextVar[Any]" = contextvars.ContextVar("report_section_data_filter", default=None)
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -222,7 +229,7 @@ def _fetch_series(section: dict[str, Any], default_limit: int = 240) -> list[dic
     gateway = str(section.get("gateway_id") or "").strip()
     tag = str(section.get("tag_name") or "").strip()
     limit = max(20, min(int(section.get("readings_count") or default_limit), 5000))
-    rows = _app_store().get_historian_rows_range(
+    rows = _app_store().get_historian_rows_range(data_filter=_DATA_FILTER.get(), 
         from_utc=from_utc,
         to_utc=to_utc,
         limit=limit,
@@ -551,7 +558,7 @@ def _bucketed_or_raw_rows(from_utc: str, to_utc: str, gateway: str, tag: str,
     span = _span_seconds(from_utc, to_utc)
     raw: list[dict[str, Any]] = []
     if span <= 2 * 3600:
-        raw = _app_store().get_historian_rows_range(
+        raw = _app_store().get_historian_rows_range(data_filter=_DATA_FILTER.get(), 
             from_utc=from_utc, to_utc=to_utc, limit=limit, offset=0,
             gateway=gateway, tag=tag, prefer_cloud_reads=False)
         if len(raw) < limit or span <= 120:
@@ -559,7 +566,7 @@ def _bucketed_or_raw_rows(from_utc: str, to_utc: str, gateway: str, tag: str,
     # Dense: pick the finest step that fits.
     step = next((n for n in _AUTO_BUCKET_STEPS if span / float(n) <= _AUTO_BUCKET_CAP),
                 _AUTO_BUCKET_STEPS[-1])
-    if step in (60, 3600, 86400):
+    if step in (60, 3600, 86400) and not _DATA_FILTER.get():
         bucket = {60: "minute", 3600: "hour", 86400: "day"}[step]
         try:
             rows = _app_store().get_historian_agg_rows(
@@ -569,7 +576,7 @@ def _bucketed_or_raw_rows(from_utc: str, to_utc: str, gateway: str, tag: str,
             rows = []
     else:
         try:
-            rows = _app_store().bucket_series_rows(
+            rows = _app_store().bucket_series_rows(data_filter=_DATA_FILTER.get(), 
                 from_utc=from_utc, to_utc=to_utc, gateway=gateway, tag=tag,
                 bucket_seconds=step)
             rows = list(reversed(rows))        # callers expect newest-first
@@ -623,7 +630,7 @@ def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tu
             # no longer quietly turned into minutes past two hours.
             field = {"": "value", "avg": "value", "min": "value_min", "max": "value_max",
                      "last": "value_last", "sum": "value_sum", "count": "sample_count"}[agg]
-            for r in _app_store().bucket_series_rows(
+            for r in _app_store().bucket_series_rows(data_filter=_DATA_FILTER.get(), 
                     from_utc=from_utc, to_utc=to_utc, gateway=gw, tag=tag,
                     bucket_seconds=bucket_secs):
                 raw = r.get(field)
@@ -815,7 +822,7 @@ def _fetch_kpi_value(item: dict[str, Any], from_utc: str = "",
         # How long the window lasted - the test's own duration, per cycle.
         return (_window_seconds(from_utc, to_utc), 1, None)
     if agg == "ramp_time":
-        raw = _app_store().get_historian_rows_range(
+        raw = _app_store().get_historian_rows_range(data_filter=_DATA_FILTER.get(), 
             from_utc=from_utc, to_utc=to_utc, limit=5000, offset=0,
             gateway=rule["gateway_id"], tag=rule["tag_name"],
             prefer_cloud_reads=False)
@@ -823,13 +830,13 @@ def _fetch_kpi_value(item: dict[str, Any], from_utc: str = "",
                              item.get("ramp_from"), item.get("ramp_to"))
         return (secs, 0 if secs is None else 1, None)
     if agg in {"rate_max", "rate_min"}:
-        raw = _app_store().get_historian_rows_range(
+        raw = _app_store().get_historian_rows_range(data_filter=_DATA_FILTER.get(), 
             from_utc=from_utc, to_utc=to_utc, limit=5000, offset=0,
             gateway=rule["gateway_id"], tag=rule["tag_name"],
             prefer_cloud_reads=False)
         value, used = _rate_per_minute(list(reversed(raw or [])), agg)
         return (value, used, None)
-    rows = _app_store().get_historian_rule_stats(
+    rows = _app_store().get_historian_rule_stats(data_filter=_DATA_FILTER.get(), 
         rules=[rule], gateway=rule["gateway_id"],
         from_utc=from_utc, to_utc=to_utc, prefer_cloud_reads=False)
     numeric_val: float | None = None
@@ -852,12 +859,29 @@ def _fetch_kpi_value(item: dict[str, Any], from_utc: str = "",
     # So zero is the one number worth a second look. The lookup below only
     # WINS if a text value actually exists, so a genuine reading of 0 still
     # renders as 0.
+    # 2026-11-10, reported: a work order read "76668.000". The collector
+    # stores a numeric-looking STRING reading twice - value=76668.0 AND
+    # value_text='76668' (plc_manager._coerce_value) - so the number won
+    # here and was formatted as a measurement. For the latest reading, a
+    # reading that carries text IS text: show it as the PLC sent it.
+    # Numeric tags never carry value_text, so they are unchanged.
+    if agg in ("latest", "last") and numeric_val is not None and numeric_val != 0.0:
+        try:
+            newest = _app_store().get_historian_rows_range(data_filter=_DATA_FILTER.get(), 
+                gateway=rule["gateway_id"], tag=rule["tag_name"],
+                from_utc=from_utc, to_utc=to_utc, limit=1, prefer_cloud_reads=False)
+        except Exception:
+            newest = []
+        if newest:
+            txt = newest[0].get("value_text")
+            if txt not in (None, ""):
+                return (None, sample_count or 1, str(txt))
     if numeric_val is not None and numeric_val != 0.0:
         return (numeric_val, sample_count, None)
     # Text-tag fallback: look up the most recent text value via the historian
     # range query. If none, return the number (or None so the cell renders "-").
     try:
-        rows_text = _app_store().get_historian_rows_range(
+        rows_text = _app_store().get_historian_rows_range(data_filter=_DATA_FILTER.get(), 
             gateway=rule["gateway_id"],
             tag=rule["tag_name"],
             from_utc=from_utc,
@@ -881,7 +905,7 @@ def _fetch_pie_data(section: dict[str, Any]) -> list[tuple[str, float, str]]:
         rules = section.get("compute_rules") or []
         if not isinstance(rules, list) or not rules:
             return []
-        rows = _app_store().get_historian_rule_stats(
+        rows = _app_store().get_historian_rule_stats(data_filter=_DATA_FILTER.get(), 
             rules=rules,
             gateway=str(section.get("gateway_id") or ""),
             prefer_cloud_reads=False,
@@ -895,7 +919,7 @@ def _fetch_pie_data(section: dict[str, Any]) -> list[tuple[str, float, str]]:
         return out
     # tag_direct
     from_utc, to_utc = _resolve_time_range(section.get("time_range"))
-    stats = _app_store().get_historian_stats(
+    stats = _app_store().get_historian_stats(data_filter=_DATA_FILTER.get(), 
         from_utc=from_utc,
         to_utc=to_utc,
         gateway=str(section.get("gateway_id") or ""),
@@ -2784,7 +2808,9 @@ def build_chart_section_rows(section: dict[str, Any]) -> tuple[list[str], list[l
             pts = aligned[j]
             if i < len(pts):
                 v = pts[i][1]
-                row.append("-" if v is None else f"{float(v):.3f}")
+                # 2026-11-10: a string tag's reading shows its text.
+                t = pts[i][2] if len(pts[i]) > 2 else None
+                row.append(str(t) if t else ("-" if v is None else f"{float(v):.3f}"))
             else:
                 row.append("-")
         body.append(row)
@@ -2814,6 +2840,7 @@ def build_template_render_data(template: dict[str, Any]) -> dict[str, Any]:
     for section in sections:
         if not isinstance(section, dict):
             continue
+        _DATA_FILTER.set(section.get("data_filter"))
         stype = str(section.get("type") or "").strip().lower()
         title = str(section.get("title") or "").strip()
         try:
@@ -2912,6 +2939,15 @@ def build_template_render_data(template: dict[str, Any]) -> dict[str, Any]:
                     "rows": [[("" if c is None else str(c)) for c in r] for r in s_rows[:500]],
                     "row_count": len(s_rows),
                 })
+            elif stype == "runs_table":
+                r_header, r_rows = build_runs_table(section)
+                out_sections.append({
+                    "type": "table",
+                    "title": title,
+                    "header": [str(h) for h in r_header],
+                    "rows": [[("" if c is None else str(c)) for c in r] for r in r_rows[:500]],
+                    "row_count": len(r_rows),
+                })
             elif stype == "static_table":
                 # A table whose header + rows are supplied literally by the
                 # caller (KPIs, pass/fail, limits) — no historian query. Renders
@@ -2989,6 +3025,7 @@ def build_template_dataset_files(template: dict[str, Any], output_dir: Path, bas
     for section in sections:
         if not isinstance(section, dict):
             continue
+        _DATA_FILTER.set(section.get("data_filter"))
         stype = str(section.get("type") or "").strip().lower()
         title = str(section.get("title") or stype or "data").strip()
         try:
@@ -3201,6 +3238,71 @@ def _section_static_table(section: dict[str, Any], styles, story: list) -> None:
     body = [[("" if c is None else str(c)) for c in r]
             for r in (section.get("rows") or [])[:500]]
     _draw_table(section, header, body, styles, story)
+
+
+def build_runs_table(section: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
+    """2026-11-16: one row per PAST RUN of a template (a generated report) over
+    the section's time range - the day's parts, the month's TCU tests, the
+    last N tests of one part number - with the result columns each run
+    stored (meta.columns) and an optional count of a column's values in a
+    footer ("PASS 18 / FAIL 2"). Reads the reports store only - never the
+    historian - so a 200-row table costs one indexed query.
+
+    Section keys: time_range (as every section), runs_template_id ("" = the
+    template being rendered, filled in by apply_text_tokens as _template_id),
+    runs_schedule_name (contains), runs_filter_column + runs_filter_value,
+    runs_columns (list of labels; empty = every column seen), runs_limit,
+    count_column (footer counts of that column's distinct values)."""
+    from app.state import reports_store as _store
+    f, t = _resolve_time_range(section.get("time_range"))
+    tpl = str(section.get("runs_template_id") or section.get("_template_id") or "").strip()
+    try:
+        limit = max(1, min(int(section.get("runs_limit") or 200), 2000))
+    except Exception:
+        limit = 200
+    try:
+        rows = _store.list_generated(
+            limit=limit, template_id=tpl or None,
+            from_utc=f or None, to_utc=t or None,
+            schedule_name=str(section.get("runs_schedule_name") or "").strip() or None,
+            column=str(section.get("runs_filter_column") or "").strip() or None,
+            value=str(section.get("runs_filter_value") or "").strip() or None)
+    except Exception:
+        rows = []
+    rows = [g for g in rows if str(g.get("render_state") or "ready") != "failed"
+            or bool(section.get("runs_include_failed"))]
+    rows.sort(key=lambda g: str(g.get("created_utc") or ""))
+    wanted = [str(c).strip() for c in (section.get("runs_columns") or []) if str(c or "").strip()]
+    if not wanted:
+        for g in rows:
+            for k in ((g.get("meta") or {}).get("columns") or {}).keys():
+                if k not in wanted:
+                    wanted.append(str(k))
+    header = [str(section.get("runs_time_header") or "Run")] + wanted
+    body: list[list[Any]] = []
+    for g in rows:
+        cols = (g.get("meta") or {}).get("columns") or {}
+        when = _utc_str_to_local_iso(str(g.get("created_utc") or ""))[:19].replace("T", " ")
+        body.append([when] + [("" if cols.get(k) is None else str(cols.get(k))) for k in wanted])
+    count_col = str(section.get("count_column") or "").strip()
+    if count_col and count_col in wanted and body:
+        i = 1 + wanted.index(count_col)
+        counts: dict[str, int] = {}
+        for r in body:
+            key = str(r[i] or "-")
+            counts[key] = counts.get(key, 0) + 1
+        label = " / ".join("%s %d" % (k, n) for k, n in counts.items())
+        foot = [str(section.get("count_label") or "Count")] + ["" for _ in wanted]
+        foot[i] = label
+        body.append(foot)
+    return header, body
+
+
+def _section_runs_table(section: dict[str, Any], styles, story: list) -> None:
+    """One row per past run of this template, with its stored result columns."""
+    header, body = build_runs_table(section)
+    _draw_table(section, header, body, styles, story,
+                empty="No runs in the selected range.")
 
 
 def _section_segment_summary(section: dict[str, Any], styles, story: list) -> None:
@@ -4064,35 +4166,44 @@ def resolve_text_tokens(text: str, from_utc: str, to_utc: str,
             return "-"
         values = []
         texts = []
+        readings = []   # (number or None, text or None), oldest first
         for r in rows:
             v = r.get("value")
-            if v is None:
-                t = r.get("value_text")
-                if t not in (None, ""):
-                    texts.append(str(t))
-                continue
+            t = r.get("value_text")
+            t = str(t) if t not in (None, "") else None
             try:
-                values.append(float(v))
+                num = float(v) if v is not None else None
             except (TypeError, ValueError):
+                num = None
+            if num is None and t is None:
                 continue
+            readings.append((num, t))
+            if t is not None:
+                texts.append(t)
+            if num is not None:
+                values.append(num)
         def _masked(num, txt):
             """The mask wins when it matches; otherwise the raw reading."""
             if mask:
                 hit = apply_value_map(mask, num, txt)
                 if hit is not None:
                     return hit
+            # 2026-11-10: a reading that carries text (a STRING tag) prints
+            # its text - "76668", not "76668.000". Numeric tags carry none.
+            if txt not in (None, ""):
+                return txt
             if num is not None:
                 return _fmt_number(num, num_fmt or "3dp", None)
-            return txt if txt not in (None, "") else "-"
+            return "-"
 
         if kind in ("tag", "last"):
-            if values:
-                return _masked(values[-1], texts[-1] if texts else None)
-            return _masked(None, texts[-1] if texts else None)
+            if readings:
+                return _masked(*readings[-1])
+            return _masked(None, None)
         if kind == "first":
-            if values:
-                return _masked(values[0], texts[0] if texts else None)
-            return _masked(None, texts[0] if texts else None)
+            if readings:
+                return _masked(*readings[0])
+            return _masked(None, None)
         if not values:
             return _masked(None, None)
         if kind == "avg":
@@ -4172,6 +4283,8 @@ def apply_text_tokens(template: dict[str, Any], fetch=None) -> dict[str, Any]:
         f, t = _resolve_time_range(sec.get("time_range"))
         gw = str(sec.get("gateway_id") or "")
         copy = dict(sec)
+        if str(copy.get("type") or "").strip().lower() == "runs_table" and not copy.get("runs_template_id"):
+            copy["_template_id"] = _tpl_id
         # 2026-10-11, requested: "we should be able to add the axis lables
         # for different Y axis and X axis tht also cab be a tag value". The
         # four Y titles, their units and the X title were the one group of
@@ -4185,6 +4298,15 @@ def apply_text_tokens(template: dict[str, Any], fetch=None) -> dict[str, Any]:
                 copy[field] = fill_run_tokens(
                     resolve_text_tokens(copy[field], f, t, gw, fetch),
                     f, t, _tpl_name, _tpl_id)
+        # 2026-11-16, asked: "configure the Y axis to be auto and/or manual and
+        # also link the values to a tag ... individual to min and max". A
+        # bound is "" (auto), a number (manual) or a tag token - {Tag},
+        # {max:Tag}, {min:Tag}, {avg:Tag}, {first:Tag} - read over THIS
+        # section's window. "name" format prints a plain number that float()
+        # takes back; no reading leaves "-", which the axis treats as auto.
+        for field in tuple(k for a in AXES4 for k in (_AXIS_KEYS[a]["min"], _AXIS_KEYS[a]["max"])):
+            if isinstance(copy.get(field), str) and "{" in copy[field]:
+                copy[field] = resolve_text_tokens(copy[field], f, t, gw, fetch, num_fmt="name").strip()
         items = copy.get("items")
         if isinstance(items, list):
             copy["items"] = [
@@ -4647,6 +4769,7 @@ def _draw_section(section: dict[str, Any], styles, story: list) -> None:
     through exactly the same path - a column must not be a second,
     drifting copy of the dispatch.
     """
+    _DATA_FILTER.set(section.get("data_filter") if isinstance(section, dict) else None)
     stype = str(section.get("type") or "").strip().lower()
     try:
         if stype == "header":
@@ -4669,6 +4792,8 @@ def _draw_section(section: dict[str, Any], styles, story: list) -> None:
             _section_static_table(section, styles, story)
         elif stype == "segment_summary":
             _section_segment_summary(section, styles, story)
+        elif stype == "runs_table":
+            _section_runs_table(section, styles, story)
         elif stype == "image":
             _section_image(section, styles, story)
         elif stype == "page_break":

@@ -673,13 +673,11 @@ try:
     from app.modules.batch_management import batch_router_v2  # noqa: E402
     if batch_router_v2 is not None:
         app.include_router(batch_router_v2)
-    from app.modules.batch_management.reports_v2 import seed_report_templates as _seed_batch_tpls
-    try:
-        _n = _seed_batch_tpls()
-        if _n:
-            print(f"[trustnode][boot] batch v2: seeded {_n} report template(s)", flush=True)
-    except Exception:
-        pass
+    # 2026-11-16, from the owner: an update never creates templates in a
+    # customer's database. The 4 batch report templates were seeded HERE, at
+    # import, under `default` (no request, no tenant) on every start; they are
+    # now created only when someone opens the batch report list on an edge
+    # that has none of them (router_v2 GET /report-templates).
 except Exception as _e:  # pragma: no cover - keep boot resilient
     print(f"[trustnode][boot] batch v2 router mount skipped: {_e}", flush=True)
 
@@ -957,6 +955,25 @@ async def _deferred_startup() -> None:
     # state. We persist `last_running` in telemetry_service on every
     # /gateways/start and /stop call; here we walk that list and
     # re-issue the start for each still-configured gateway.
+    # 2026-11-16: the saved collection triggers BEFORE any gateway
+    # resumes - and on every boot, gateways to resume or not (a meter-only
+    # site asks the same gate). They reached the workers only when somebody saved
+    # them (or a UI re-applied them), so after a restart every
+    # auto-resumed gateway wrote ungated until the page was opened.
+    # Read from THIS edge's own scope (get_domain_scoped_fast) - the
+    # reason plc_manager._load_saved_triggers_once stays empty was
+    # that no such scoped read existed when it was written.
+    try:
+        _trig_doc = app_store.get_domain_scoped_fast("triggers_limits")
+        if isinstance(_trig_doc, dict):
+            _trig_rows = [t for t in (_trig_doc.get("collection_triggers") or []) if isinstance(t, dict)]
+            if _trig_rows:
+                plc_manager.apply_collection_triggers(
+                    _trig_rows, str(_trig_doc.get("collection_trigger_mode") or "any"))
+                print("[trustnode][boot] collection triggers restored: %d rule(s)" % len(_trig_rows),
+                      flush=True)
+    except Exception as _exc:                                # noqa: BLE001
+        print("[trustnode][boot] collection triggers not restored: %r" % (_exc,), flush=True)
     try:
         running_ids = telemetry_service.list_running_gateways()
         scoped_bootstrap = bootstrap
@@ -1063,9 +1080,10 @@ async def _deferred_startup() -> None:
                         pass
                     skipped_opt_out += 1
                     continue
-                db_id = str(gw.get("database_id") or "")
-                db_cfg = db_by_id.get(db_id) or {}
-                primary = _to_sink(db_cfg) if db_cfg else None
+                # 2026-11-16: the full saved sinks (every parallel export,
+                # each with its layout and filters) - plc_manager's one rule.
+                from app.services.plc_manager import saved_gateway_sinks as _saved_sinks
+                primary, _all_sinks = _saved_sinks(gw, db_rows)
                 config = _GwCfg(
                     gateway_type=str(gw.get("gateway_type") or ""),
                     plc_ip=str(gw.get("plc_ip") or ""),
@@ -1081,7 +1099,7 @@ async def _deferred_startup() -> None:
                         gateway_id=gid,
                         config=config,
                         db_sink=primary,
-                        db_sinks=[primary] if primary else [],
+                        db_sinks=_all_sinks,
                     )
                     resumed += 1
                 except Exception as exc:
@@ -1185,7 +1203,12 @@ async def _deferred_startup() -> None:
     except Exception as exc:
         print(f"[trustnode][boot] tenant rehome skipped: {exc!r}", flush=True)
     try:
-        if isinstance(bootstrap, dict):
+        # 2026-11-16: the legacy reporting_setup migration wrote empty template
+        # shells under `default` on every boot - after the rehome had moved
+        # them out - and the rehome then carried them into the customer. On an
+        # activated edge it does not run: its templates are the customer's.
+        _act = str(app_store._configured_tenant_id() or "")      # noqa: SLF001
+        if isinstance(bootstrap, dict) and (not _act or _act == "default"):
             reports_store.migrate_from_bootstrap(bootstrap, tenant_id="default")
     except Exception:
         pass

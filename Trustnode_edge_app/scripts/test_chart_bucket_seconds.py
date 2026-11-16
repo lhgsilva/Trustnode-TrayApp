@@ -166,6 +166,8 @@ def main() -> int:
     # explicit one, or the window-derived one when none is set).
     _sites = (w.count("bucketSeconds: bucketSecondsFor(cfg), bucketAgg: bucketAggFor(cfg)")
               + w.count("bucketSeconds: effectiveBucketSeconds, bucketAgg: bucketAggFor(cfg)")
+              # 2026-11-16: the window fetch names the agg once (a grouped pie asks for "last")
+              + w.count("bucketSeconds: effectiveBucketSeconds, bucketAgg: bucketAggUsed")
               + w.count("bucketSeconds: extraBucket, bucketAgg: bucketAggFor(cfg)")
               + w.count("bucketSeconds: trigBucket, bucketAgg: bucketAggFor(cfg)"))
     check("chart widgets send their bucket on every series fetch", _sites >= 6, "%d sites" % _sites)

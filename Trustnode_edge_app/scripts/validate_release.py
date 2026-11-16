@@ -422,6 +422,39 @@ SOURCE_CHECKS = [
     # 2026-11-04: a 3-series chart on "Last 6 hours" drew 30 seconds - the
     # extra series fetched the newest raw rows and the merge kept the newest N.
     ("every chart series shows the chosen window", "test_dashboard_charts_follow_window.py"),
+    # 2026-11-16: the chart was handed a null between every pair of bucketed
+    # points - nothing could be drawn; trigger began at the first live row.
+    ("a dashboard chart draws its window", "test_dashboard_charts_draw_window.mjs"),
+    # 2026-11-16: aggregation did not re-fetch (5 min bars stayed 1 min), no
+    # 2 s / custom, blank ends, 130 ms per live tick at 5 000 points,
+    # per-bound Y axis, card resized on type change.
+    ("aggregation matrix: every type, period and mode; speed; Y bounds", "test_dashboard_aggregation_matrix.mjs"),
+    # 2026-11-16, the two customers (parts tested one by one; TCU cycles):
+    # PLC-stopped batches evaluated, v2 batch widgets, Data Export pivot,
+    # table text + masks, text part ids, KPI menus, Excel wide/text; short
+    # cycles and a gated stop; results across runs (filters, CSV/Excel,
+    # past-runs section, results table widget, X labels from a tag).
+    ("the part-test and TCU paths", "test_part_test_paths.py"),
+    ("short cycles never merge; a gated stop is seen", "test_short_cycles_and_gated_stop.py"),
+    ("test results across runs", "test_results_across_runs.py"),
+    # 2026-11-16: the data filter (other tags' values at the same time) on
+    # the four readers, the routes, Data Export and the in-memory evaluator.
+    ("data filter", "test_data_filter.py"),
+    ("number fields typeable", "test_number_fields_typeable.py"),
+    # 2026-11-16: report actions queued behind polls; Regenerate lost the
+    # name/folder; Duplicate schedule; each Y-axis bound Auto/Manual/Tag.
+    ("generated-report actions answer at once", "test_reports_actions_2026_11_16.py"),
+    ("each report Y-axis bound is auto, manual or a tag", "test_report_axis_bounds.py"),
+    # 2026-11-16, the owner: an update never adds templates to a customer and
+    # never changes one (4 automatic writers found, one overwrote edits).
+    ("an update never touches a customer's templates", "test_update_never_touches_templates.py"),
+    # 2026-11-16: gateways on one PLC evicted each other; the PLC CSV writers
+    # ignored "one row per timestamp"; One-Time was used up by other
+    # evaluations and held by the export interval; restarts dropped exports.
+    ("gateways on one PLC run independently; CSV keeps its shape", "test_csv_gateways_independent.py"),
+    # 2026-11-10: a work order on a STRING tag printed "76668.000" - the
+    # collector stores numeric-looking text as a number too.
+    ("a string tag prints as its text in reports", "test_string_tag_prints_text.py"),
     # 2026-10-30, asked for directly: "every new installer can be installed
     # in existing computer with all fixes and updates". Boots the PACKAGED
     # backend on a copy of a real workspace with NO data-dir override - the
@@ -556,8 +589,16 @@ def _run_contained(argv):
             k32.CloseHandle(job)      # KILL_ON_JOB_CLOSE reaps the stragglers
 
 
+# 2026-11-16: the source checks take over an hour now, so a full-system stage
+# that fails only its "boot block is from THIS run" rule (the app was
+# relaunched during the source phase) used to cost another hour to re-run.
+# VAL_SKIP_SOURCE=1 re-runs ONLY the full-system stage - for that case, right
+# after the source checks have passed on the same tree, never instead of them.
+_skip_source = str(os.environ.get("VAL_SKIP_SOURCE", "")).strip() in ("1", "true", "yes")
+if _skip_source:
+    print("RELEASE GATE: source checks SKIPPED (VAL_SKIP_SOURCE=1) - valid only right after a pass of them on this tree", flush=True)
 print("RELEASE GATE: source checks...", flush=True)
-for label, script in SOURCE_CHECKS:
+for label, script in ([] if _skip_source else SOURCE_CHECKS):
     # 2026-10-30: the frontend checks are node, not python. They were run by
     # hand and therefore not run - the dashboard layout one had been broken
     # by an extensionless import for days without anybody noticing.

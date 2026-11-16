@@ -5979,6 +5979,16 @@ textarea {
 .generated-reports-filter select {
   min-width: 180px;
 }
+/* 2026-11-16: date / value filters beside the schedule filter - the same
+   label-above-control shape and control height, wrapping on narrow widths. */
+.generated-reports-filter input {
+  min-width: 140px;
+}
+.tn-card-head-actions {
+  flex-wrap: wrap;
+  row-gap: 6px;
+  align-items: flex-end;
+}
 .generated-reports-logo {
   height: 36px;
   width: auto;
@@ -6238,6 +6248,11 @@ textarea {
   min-width: 36px;
 }
 
+/* 2026-11-16: a Y-axis bound (Min / Max / Tick step) is a source select plus
+   its value or tag pickers - on ONE row, equal height, wrapping when narrow. */
+.tn-bound-controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: stretch; min-width: 0; }
+.tn-bound-controls > select, .tn-bound-controls > input { flex: 1 1 96px; min-width: 0; }
+.tn-bound-controls > .tn-token-input { flex: 2 1 160px; min-width: 0; }
 .tn-row { display: grid; gap: 6px 10px; min-width: 0; }
 .tn-row-2 { grid-template-columns: 1fr 1fr; }
 .tn-row-3 { grid-template-columns: 1fr 1fr 1fr; }

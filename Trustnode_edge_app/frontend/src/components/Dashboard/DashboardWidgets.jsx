@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AXIS_BOUND_KEYS, axisTagSpecs, resolveAxisScale } from "./axisBounds.js";
 import {
   listReportTemplates,
   listGeneratedReports,
@@ -39,6 +40,7 @@ import {
 } from "recharts";
 import {
   buildFixedText,
+  describeRule,
   evaluateComputedRules,
   formatSeriesValue,
   formatWidgetValue,
@@ -47,6 +49,7 @@ import {
   toTsMs,
 } from "./dashboardAnalytics";
 import CloudSyncStatusWidget from "./CloudSyncStatusWidget";
+import { rowsPassDataFilter } from "../DataFilter/dataFilter.js";
 import {
   OeeKpiWidget, OeeMachineCardWidget, OeeMachineStatusWidget, OeeTrendWidget,
   OeeDowntimeParetoWidget, OeeStatusTimelineWidget, OeeRuntimeDowntimeWidget,
@@ -55,6 +58,9 @@ import {
 } from "./OeeWidgets";
 import IoBlockWidget from "./IoBlockWidget";
 
+// 2026-11-16: the widget's data filter (other tags' values at the same
+// time) rides on every historian request; the server applies it.
+const _dfOf = (c) => (c && c.data_filter && typeof c.data_filter === "object" ? c.data_filter : undefined);
 const LAST_WIDGET_DIRECT_STATS_CACHE = new Map();
 const LAST_WIDGET_RULE_STATS_CACHE = new Map();
 const LAST_WIDGET_ROWS_CACHE = new Map();
@@ -307,7 +313,7 @@ function toIsoUtc(value) {
   return Number.isFinite(d.getTime()) ? d.toISOString() : "";
 }
 
-function resolveTimeFilterRange(cfg) {
+export function resolveTimeFilterRange(cfg) {
   const preset = String(cfg?.query_time_filter_preset || "none");
   if (preset === "none") return null;
   if (preset === "custom") {
@@ -334,16 +340,20 @@ function resolveTimeFilterRange(cfg) {
   return { fromUtc: from.toISOString(), toUtc: to.toISOString() };
 }
 
-function applyWidgetTimeFilter(rows, cfg) {
+export function applyWidgetTimeFilter(rows, cfg) {
   const src = Array.isArray(rows) ? rows : [];
   if (!src.length) return src;
   const preset = String(cfg?.query_time_filter_preset || "none");
   if (preset === "none") return src;
   const rowTsMs = (r) => toTsMs(r?.ts || r?.ts_utc || r?.created_utc || "");
+  // 2026-11-16: this started from NaN, and nothing is greater than NaN, so
+  // the "latest row" anchor below never applied - the window was always
+  // measured from the clock. With live rows flowing the two agree; with the
+  // feed paused the first seconds of a fetched window were cut away.
   const latestRowMs = src.reduce((acc, r) => {
     const ts = rowTsMs(r);
     return Number.isFinite(ts) && ts > acc ? ts : acc;
-  }, Number.NaN);
+  }, -Infinity);
   // Preset windows should be stable even when streams are paused or clock-skewed:
   // anchor to latest dataset timestamp whenever available.
   const anchorMs = Number.isFinite(latestRowMs) ? latestRowMs : Date.now();
@@ -420,6 +430,37 @@ function _formatChartTickTime(ms, formatKey) {
   } catch (_) { return ""; }
 }
 
+// 2026-11-16, reported: "a gap is shown in the beginning and on the end of
+// the chart plot area" with an aggregation. A live window's axis began one
+// window-length before the newest point, but the first bucket lands up to two
+// buckets later - so a strip of nothing opened on the left. The axis now
+// starts at the first point when the difference is only that rounding (up to
+// three point spacings); a real hole (collection off) still shows.
+function _liveWindowDomain(sortedTs, widthMs) {
+  const last = sortedTs[sortedTs.length - 1];
+  let start = last - widthMs;
+  const first = sortedTs[0];
+  if (sortedTs.length > 2 && first > start) {
+    const gaps = [];
+    for (let i = 1; i < sortedTs.length; i += 1) gaps.push(sortedTs[i] - sortedTs[i - 1]);
+    gaps.sort((a, b) => a - b);
+    const spacing = gaps[Math.floor(gaps.length / 2)] || 0;
+    if (first - start <= spacing * 3) start = first;
+  }
+  return [start, last];
+}
+
+/** Half the typical spacing between sorted timestamps - the room an edge
+ * bar needs on a time axis so it sits inside the plot instead of straddling
+ * the axis line (2026-11-16, reported with a screenshot). */
+function _halfSlotMs(sortedTs) {
+  if (!Array.isArray(sortedTs) || sortedTs.length < 2) return 500;
+  const gaps = [];
+  for (let i = 1; i < sortedTs.length; i += 1) gaps.push(sortedTs[i] - sortedTs[i - 1]);
+  gaps.sort((a, b) => a - b);
+  return Math.max(0, (gaps[Math.floor(gaps.length / 2)] || 0) / 2);
+}
+
 function buildXAxisProps(series, cfg = {}, opts = {}) {
   const sample = Array.isArray(series) ? series.length : 0;
   const fmt = String(cfg?.chart_x_time_format || "hh_mm_ss");
@@ -450,6 +491,10 @@ function buildXAxisProps(series, cfg = {}, opts = {}) {
         const ts = String(hit?.ts || "");
         if (!ts) return String(idx);
         const ms = toTsMs(ts);
+        if (typeof opts?.labelOf === "function" && Number.isFinite(ms)) {
+          const lbl = opts.labelOf(ms);
+          if (lbl) return lbl;
+        }
         if (Number.isFinite(ms)) return _formatChartTickTime(ms, fmt);
         const t = ts.includes("T") ? ts.split("T")[1] : ts.split(" ")[1];
         return String(t || ts).slice(0, 8);
@@ -479,11 +524,21 @@ function buildXAxisProps(series, cfg = {}, opts = {}) {
   }
   if (hasReal) {
     const tsValues = Array.from(tsMsLookup.values()).sort((a, b) => a - b);
+    let domain = Array.isArray(opts?.domain)
+      ? (opts?.followData && tsValues.length
+        ? _liveWindowDomain(tsValues, opts.domain[1] - opts.domain[0])
+        : opts.domain)
+      : (tsValues.length ? [tsValues[0], tsValues[tsValues.length - 1]] : ["auto", "auto"]);
+    if (opts?.padBars && tsValues.length && typeof domain[0] === "number" && typeof domain[1] === "number") {
+      const half = _halfSlotMs(tsValues);
+      domain = [domain[0] - half, domain[1] + half];
+    }
     return {
       dataKey: (row) => tsMsLookup.get(row?.idx) ?? row?.idx ?? 0,
       type: "number",
       scale: "time",
-      domain: tsValues.length ? [tsValues[0], tsValues[tsValues.length - 1]] : ["auto", "auto"],
+      domain,
+      allowDataOverflow: Array.isArray(opts?.domain),
       tickFormatter: (ms) => _formatChartTickTime(ms, fmt),
       minTickGap: 24,
       tick: { fill: "var(--ink-soft, #8a98ab)", fontSize: 11 },
@@ -804,10 +859,35 @@ export const SAME_TAG_STOP = "__start_condition_ends__";
 // so hours of 1 Hz data stay readable without dropping to minute buckets.
 export const BUCKET_INTERVAL_SECONDS = {
   none: 0, "1s": 1, "2s": 2, "5s": 5, "10s": 10, "30s": 30,
-  "1m": 60, "5m": 300, "15m": 900, "1h": 3600,
+  "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "1d": 86400,
 };
 export function bucketSecondsFor(cfg) {
-  return Number(BUCKET_INTERVAL_SECONDS[String(cfg?.bucket_interval || "none")] || 0);
+  const key = String(cfg?.bucket_interval || "none");
+  // 2026-11-16, asked: "a custom option when we enter the value in secs".
+  if (key === "custom") {
+    const n = Math.round(Number(cfg?.bucket_custom_seconds));
+    return Number.isFinite(n) && n >= 1 ? Math.min(86400, n) : 0;
+  }
+  return Number(BUCKET_INTERVAL_SECONDS[key] || 0);
+}
+// 2026-11-16: a chart had TWO aggregation controls - "Aggregate every"
+// (server buckets, had 2 s) and the query dialog's "Time grouping" (grouped
+// again in the browser, no 2 s, lost the edges and the live tail). A chart has
+// one now; a saved "Time grouping" on a chart reads as its "Aggregate every".
+// Tables and KPIs keep their grouping. Same object back when nothing moves,
+// so hooks keyed on the config do not re-run.
+const _CHART_TYPES_AGG = new Set(["line_chart", "line_area_chart", "bar_chart", "stacked_trend"]);
+const _aggCfgCache = new WeakMap();
+export function chartAggregationConfig(type, config) {
+  const c = config || {};
+  if (!_CHART_TYPES_AGG.has(String(type || ""))) return c;
+  const g = String(c.query_group_interval || "none");
+  const b = String(c.bucket_interval || "none");
+  if (g === "none" || !(g in BUCKET_INTERVAL_SECONDS) || (b !== "none" && b !== "")) return c;
+  if (typeof c === "object" && _aggCfgCache.has(c)) return _aggCfgCache.get(c);
+  const out = { ...c, bucket_interval: g, query_group_interval: "none" };
+  try { _aggCfgCache.set(c, out); } catch (_) { /* frozen */ }
+  return out;
 }
 // 2026-11-04, reported: "when I set more period of time to show the data it
 // still shows only a few" points. A time window was applied as a FILTER, but
@@ -815,7 +895,7 @@ export function bucketSecondsFor(cfg) {
 // last two minutes. With no explicit bucket, the window is now divided into
 // the reading count: the bucket is the smallest step that keeps the point
 // count within readings_count. Raw stays raw when it already fits.
-const AUTO_BUCKET_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 86400];
+const AUTO_BUCKET_STEPS = [1, 2, 5, 10, 15, 20, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 86400];
 export function autoBucketSecondsFor(windowSeconds, readingsCount, pollSeconds) {
   const span = Number(windowSeconds) || 0;
   const points = Math.max(5, Number(readingsCount) || 120);
@@ -885,6 +965,71 @@ export function bucketLiveTail(rows, bucketSeconds, agg = "avg") {
   }));
 }
 
+/**
+ * 2026-11-16, reported with screenshots: with a time window the chart showed
+ * a blank strip on the right that grew between refreshes. Live readings were
+ * joined only AFTER the newest server bucket had ENDED, so the bucket being
+ * filled right now was missing. The live rows from the newest server bucket's
+ * START on are folded into buckets; for that one shared bucket the version
+ * that has seen more samples wins, so the edge is current and never thinner.
+ */
+export function mergeLiveBuckets(serverRows, liveRows, bucketSeconds, agg = "avg") {
+  const base = Array.isArray(serverRows) ? serverRows : [];
+  let newest = -Infinity;
+  let newestRow = null;
+  for (const r of base) {
+    const t = toTsMs(r?.ts || r?.ts_utc);
+    if (Number.isFinite(t) && t > newest) { newest = t; newestRow = r; }
+  }
+  const tail = bucketLiveTail((Array.isArray(liveRows) ? liveRows : [])
+    .filter((r) => { const t = toTsMs(r?.ts || r?.ts_utc); return Number.isFinite(t) && t >= newest; }),
+  bucketSeconds, agg);
+  if (!tail.length) return base;
+  const first = toTsMs(tail[0].ts);
+  if (newestRow && first === newest
+      && Number(newestRow.sample_count || newestRow.n || 0) > Number(tail[0].sample_count || 0)) {
+    return base.concat(tail.slice(1));                       // the server's bucket is fuller
+  }
+  return base.filter((r) => toTsMs(r?.ts || r?.ts_utc) < first).concat(tail);
+}
+
+/**
+ * 2026-11-16: a chart draws at most `maxRows` rows - more than a widget has
+ * pixels for. Rows are grouped in time order and, per group, the rows holding
+ * each series' MIN and MAX are kept (plus the first and last row), so no peak
+ * or dip disappears. Rows below the cap are returned untouched.
+ */
+export function decimateRows(rows, keys, maxRows = 1500) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (list.length <= maxRows) return list;
+  const ks = (keys || []).filter(Boolean);
+  const per = Math.max(2, 2 * Math.max(1, ks.length));
+  const groups = Math.max(1, Math.floor((maxRows - 2) / per));
+  const size = list.length / groups;
+  const keep = new Set([0, list.length - 1]);
+  for (let g = 0; g < groups; g += 1) {
+    const a = Math.floor(g * size);
+    const b = Math.min(list.length, Math.floor((g + 1) * size));
+    if (b <= a) continue;
+    if (!ks.length) { keep.add(a); continue; }
+    for (const k of ks) {
+      let lo = -1; let hi = -1; let lv = Infinity; let hv = -Infinity;
+      for (let i = a; i < b; i += 1) {
+        const v = list[i] ? list[i][k] : null;
+        if (v === null || v === undefined || !Number.isFinite(Number(v))) continue;
+        const n = Number(v);
+        if (n < lv) { lv = n; lo = i; }
+        if (n > hv) { hv = n; hi = i; }
+      }
+      if (lo >= 0) keep.add(lo);
+      if (hi >= 0) keep.add(hi);
+      if (lo < 0 && hi < 0) keep.add(a);
+    }
+  }
+  return Array.from(keep).sort((x, y) => x - y).map((i) => list[i]);
+}
+export const CHART_DRAW_CAP = 1500;
+
 /** At most `max` timestamps, evenly spaced, both ends kept - so a long window stays light to draw. */
 export function thinTimestamps(sortedTs, max) {
   const list = Array.isArray(sortedTs) ? sortedTs : [];
@@ -899,6 +1044,43 @@ export function thinTimestamps(sortedTs, max) {
 /** How often a windowed trend chart re-aligns its window with the store (ms). */
 export const WINDOW_REFETCH_MS = 30000;
 const TREND_WINDOW_TYPES = ["line_chart", "line_area_chart", "bar_chart", "stacked_trend"];
+
+/** Rolling (no window) + an aggregation: the last `readings` buckets - not
+ *  every bucket in the store (on a customer edge, months). Anchored to the
+ *  bucket so the request is stable within a bucket. */
+export function rollingBucketRange(cfg, readings) {
+  const b = bucketSecondsFor(cfg);
+  if (!(b > 0)) return null;
+  const ms = b * 1000;
+  const anchor = Math.floor(Date.now() / ms) * ms;
+  const n = Math.max(5, Math.min(5000, Number(readings) || 120));
+  return { fromUtc: new Date(anchor - (n - 1) * ms).toISOString(), toUtc: "" };
+}
+
+/** "1=PASS,0=FAIL,*=OTHER" -> a function (value, text) => label | null. */
+export function parseValueMask(text) {
+  const src = String(text || "").trim();
+  if (!src) return null;
+  const map = new Map();
+  let star = null;
+  for (const part of src.split(/[,;\n]+/)) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    const k = part.slice(0, i).trim();
+    const v = part.slice(i + 1).trim();
+    if (!k) continue;
+    if (k === "*") star = v; else map.set(k.toLowerCase(), v);
+  }
+  if (!map.size && star === null) return null;
+  return (value, textValue) => {
+    const keys = [];
+    if (textValue !== null && textValue !== undefined && textValue !== "") keys.push(String(textValue));
+    const n = Number(value);
+    if (Number.isFinite(n)) { keys.push(String(n)); if (n === Math.round(n)) keys.push(String(Math.round(n))); }
+    for (const k of keys) if (map.has(k.toLowerCase())) return map.get(k.toLowerCase());
+    return star;
+  };
+}
 
 export function bucketAggFor(cfg) {
   const a = String(cfg?.bucket_aggregation || "avg");
@@ -991,16 +1173,95 @@ export function applyTriggerRows(rows, cfg, ref, setWin) {
   if (start !== st.start || end !== st.end) setWin({ start, end });
 }
 
+/**
+ * 2026-11-16: values for Y-axis bounds linked to a tag. "Latest" follows the
+ * live rows; max / min / avg are the tag's statistics over `rangeOf()` -
+ * fetched once per WINDOW_REFETCH_MS, never per live tick.
+ */
+function useAxisTagValues(cfg, fetchStats, liveRows, rangeOf) {
+  const specs = axisTagSpecs(cfg);
+  const specsKey = specs.map((s) => s.key).join("||");
+  const [stats, setStats] = useState({});
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!specs.some((s) => s.agg !== "latest")) return undefined;
+    const t = setInterval(() => setTick((v) => v + 1), WINDOW_REFETCH_MS);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [specsKey]);
+  useEffect(() => {
+    const need = specs.filter((s) => s.agg !== "latest");
+    if (!need.length || typeof fetchStats !== "function") return undefined;
+    let cancelled = false;
+    const range = (typeof rangeOf === "function" ? rangeOf() : null) || {};
+    const seen = new Map();
+    for (const s of need) seen.set(`${s.gatewayId}::${s.tagName}`, s);
+    Promise.all(Array.from(seen.values()).map(async (s) => {
+      try {
+        const rows = await fetchStats({ fromUtc: range.fromUtc || "", toUtc: range.toUtc || "",
+          gateway: s.gatewayId, tag: s.tagName, timeoutMs: 12000, maxAttempts: 1 });
+        const row = (Array.isArray(rows) ? rows : []).find((r) => String(r?.tag || r?.tag_name || "") === s.tagName)
+          || (Array.isArray(rows) ? rows[0] : null);
+        return [`${s.gatewayId}::${s.tagName}`, row || null];
+      } catch (_) {
+        return [`${s.gatewayId}::${s.tagName}`, null];
+      }
+    })).then((pairs) => {
+      if (cancelled) return;
+      setStats((prev) => {
+        const next = { ...prev };
+        for (const [k, row] of pairs) if (row) next[k] = row;      // a failed read keeps the last value
+        return next;
+      });
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [specsKey, tick, cfg?.query_time_filter_preset, cfg?.query_time_filter_from, cfg?.query_time_filter_to]);
+  return useMemo(() => {
+    const out = {};
+    for (const s of specs) {
+      const base = `${s.gatewayId}::${s.tagName}`;
+      if (s.agg === "latest") {
+        let best = -Infinity;
+        let val = null;
+        for (const r of Array.isArray(liveRows) ? liveRows : []) {
+          if (String(r?.tag || r?.tag_name || "") !== s.tagName) continue;
+          if (s.gatewayId && String(r?.gateway_id || "") !== s.gatewayId) continue;
+          const t = toTsMs(r?.ts || r?.ts_utc);
+          const n = Number(r?.value);
+          if (Number.isFinite(t) && Number.isFinite(n) && t >= best) { best = t; val = n; }
+        }
+        if (val === null && stats[base] && Number.isFinite(Number(stats[base].latest))) val = Number(stats[base].latest);
+        if (val !== null) out[s.key] = val;
+      } else if (stats[base] && Number.isFinite(Number(stats[base][s.agg]))) {
+        out[s.key] = Number(stats[base][s.agg]);
+      }
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [specsKey, stats, liveRows]);
+}
+
+/** A domain from a resolved scale, each open side falling back to `auto`. */
+function domainFromScale(scale, auto) {
+  if (!scale || !scale.fixed) return auto;
+  const a = Array.isArray(auto) ? auto : ["auto", "auto"];
+  return [scale.lo !== null ? scale.lo : a[0], scale.hi !== null ? scale.hi : a[1]];
+}
+
 function LiveTagChart({
   widget,
-  dataLogView,
+  dataLogView: dataLogViewIn,
   fetchWidgetRows,
+  fetchWidgetStats = null,
   gatewayIntervalMs,
   resolvedGatewayId,
   tagName,
   formatTagForDisplay,
 }) {
-  const cfg = widget?.config || {};
+  const cfg = chartAggregationConfig(widget?.type, widget?.config);
+  // 2026-11-16: live rows obey the widget's data filter like the stored ones.
+  const dataLogView = useMemo(() => rowsPassDataFilter(dataLogViewIn, cfg?.data_filter), [dataLogViewIn, cfg?.data_filter]);
   const widgetType = String(widget?.type || "line_chart");
   const capacity = Math.max(5, Math.min(5000, Number(cfg?.readings_count || 60)));
 
@@ -1028,6 +1289,11 @@ function LiveTagChart({
       cfg?.window_stop_operator, cfg?.window_stop_value]);
 
   const [trigWin, setTrigWin] = useState({ start: 0, end: 0 });
+  // 2026-11-16: the bucket the history was loaded with (ms), a floor for
+  // what counts as a gap; and the latest live rows, for the history replay.
+  const [seedBucketMs, setSeedBucketMs] = useState(0);
+  const liveRowsRef = useRef(dataLogView);
+  useEffect(() => { liveRowsRef.current = dataLogView; });
   const trigWinRef = useRef({ start: 0, end: 0, on: false, seen: -Infinity });
   // A run can be far longer than `readings_count`, so the ring buffer must
   // not be sized by it while a window is in force.
@@ -1255,9 +1521,10 @@ function LiveTagChart({
     const trigLimit = trigStart > 0
       ? (trigBucket > 0 ? Math.min(20000, Math.ceil(trigSpanS / trigBucket) + 20) : 20000)
       : seedLimit;
+    setSeedBucketMs(Math.max(0, Number(trigBucket || 0)) * 1000);
     Promise.all(seriesDefs.map(async (s) => {
       try {
-        const rows = await fetcher({
+        const rows = await fetcher({ dataFilter: _dfOf(cfg),
           fromUtc: trigStart > 0 ? new Date(trigStart).toISOString() : "",
           toUtc: trigEnd > 0 ? new Date(trigEnd).toISOString() : "",
           limit: trigLimit,
@@ -1299,7 +1566,8 @@ function LiveTagChart({
   // The fetcher is read from a ref so its unstable identity doesn't
   // restart the seed on every parent render.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [seriesKey, capacity, groupBucketMs, pollMs, trigCfg, trigWin?.start, trigWin?.end]);
+  }, [seriesKey, capacity, groupBucketMs, pollMs, trigCfg, trigWin?.start, trigWin?.end,
+      cfg?.bucket_interval, cfg?.bucket_custom_seconds, cfg?.bucket_aggregation]);
 
   // Ingest WS samples: append rows from dataLogView whose ts is strictly
   // newer than the last seen ts for that series. Runs on every parent
@@ -1390,7 +1658,7 @@ function LiveTagChart({
       const got = [];
       for (const t of want) {
         try {
-          const rows = await fetcher({
+          const rows = await fetcher({ dataFilter: _dfOf(cfg),
             fromUtc: "", toUtc: "", limit: 5000, offset: 0,
             gateway: trigCfg.gatewayId || "", tag: t,
             timeoutMs: 8000, maxAttempts: 1,
@@ -1399,7 +1667,14 @@ function LiveTagChart({
         } catch (_) { /* the live stream still drives the window */ }
       }
       if (cancelled || !got.length) return;
-      applyTriggerRows(got, trigCfg, trigWinRef, setTrigWin);
+      // 2026-11-16, measured: a run that started 12 min ago showed 1 min.
+      // The live rows arrive first, and the first live "1" was taken as the
+      // rising edge; the history then could not move the start back, since
+      // every older row was "already seen". Replay from scratch instead:
+      // history, then the live rows, in time order.
+      trigWinRef.current = { start: 0, end: 0, on: false, seen: -Infinity };
+      const liveNow = Array.isArray(liveRowsRef.current) ? liveRowsRef.current : [];
+      applyTriggerRows(got.concat(liveNow), trigCfg, trigWinRef, setTrigWin);
     })();
     return () => { cancelled = true; };
   }, [trigCfg]);
@@ -1597,6 +1872,11 @@ function LiveTagChart({
     if (groupBucketMs > 0) {
       for (const s of seriesDefs) gapByIdMs.set(s.id, groupBucketMs * 1.5);
     }
+    // 2026-11-16: history loaded in buckets is spaced by the bucket; live rows
+    // arriving every 0.5 s must not make every bucket look like a gap.
+    if (seedBucketMs > 0) {
+      for (const s of seriesDefs) gapByIdMs.set(s.id, Math.max(gapByIdMs.get(s.id) || 0, seedBucketMs * 3));
+    }
 
     // Per-series carry-forward walker.
     const walkers = seriesDefs.map((s) => ({
@@ -1679,10 +1959,11 @@ function LiveTagChart({
       const a = String(s.axis || "left").toLowerCase();
       axesUsed.add(a === "left" ? "left1" : a === "right" ? "right1" : (["left1", "left2", "right1", "right2"].includes(a) ? a : "left1"));
     }
-    return { rows, hasRightAxis, axesUsed };
+    // 2026-11-16: never more rows than a widget can show (peaks kept).
+    return { rows: decimateRows(rows, seriesDefs.map((sd) => sd.id), CHART_DRAW_CAP), hasRightAxis, axesUsed };
     // tick changes are the signal that buffers mutated.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick, seriesDefs, capacity, pollMs, groupBucketMs, reducerKey, showGaps, trigWin]);
+  }, [tick, seriesDefs, capacity, pollMs, groupBucketMs, reducerKey, showGaps, trigWin, seedBucketMs]);
 
   // Y axis: auto (data-fit) or manual. When manual is ON but the
   // operator has not yet typed values, we still pin the axis to a
@@ -1691,7 +1972,18 @@ function LiveTagChart({
   //   - missing max → "auto" callback that hugs the data top
   // That way the user sees the axis snap to a 0-anchored frame the
   // moment they flip the toggle, then types min/max/step to refine.
+  // 2026-11-16: every bound on its own (Auto / Manual / Tag) - axisBounds.js.
+  const axisTagValues = useAxisTagValues(cfg, fetchWidgetStats, dataLogView, () => {
+    const span = Math.max(60000, Number(capacity || 120) * Math.max(200, Number(gatewayIntervalMs || 1000)));
+    return { fromUtc: new Date(Date.now() - span).toISOString(), toUtc: "" };
+  });
   const buildManualDomain = (modeKey, minKey, maxKey, stepKey) => {
+    const sc = resolveAxisScale(cfg, { mode: modeKey, min: minKey, max: maxKey, step: stepKey }, axisTagValues);
+    if (!sc.fixed && !sc.ticks) return null;
+    return { lo: sc.lo, hi: sc.hi, ticks: sc.ticks, partial: false, scale: sc };
+  };
+  // eslint-disable-next-line no-unused-vars
+  const _legacyBuildManualDomain = (modeKey, minKey, maxKey, stepKey) => {
     if (String(cfg[modeKey] || "auto").toLowerCase() !== "manual") return null;
     const loRaw = cfg[minKey];
     const hiRaw = cfg[maxKey];
@@ -1748,6 +2040,7 @@ function LiveTagChart({
   // auto mode; if auto → both callbacks.
   const buildDomain = (m) => {
     if (!m) return autoDomain;
+    if (m.scale) return domainFromScale(m.scale, autoDomain);
     if (m.partial) return [m.lo, autoDomain[1]];
     return [m.lo, m.hi];
   };
@@ -1947,6 +2240,7 @@ function LiveTagChart({
   const allBars = Array.isArray(seriesDefs)
     && seriesDefs.length > 0
     && seriesDefs.every((s) => s?.chartKind === "bar");
+  const anyBars = Array.isArray(seriesDefs) && seriesDefs.some((s) => s?.chartKind === "bar");
   const margin = {
     top: 4,
     right: rightAxisLabel ? 32 : 4,
@@ -2021,7 +2315,11 @@ function LiveTagChart({
                 fontSize={10}
                 interval="preserveStartEnd"
                 minTickGap={18}
-                padding={{ left: 6, right: 6 }}
+                /* 2026-11-16, reported with a screenshot: with "show gaps"
+                   off a line/area chart takes this axis too, and the 6 px
+                   meant for bars left a blank strip at both Y axes. Only
+                   bars keep the room; a line starts and ends on the axis. */
+                padding={allBars ? { left: 6, right: 6 } : { left: 0, right: 0 }}
                 angle={xTickAngle}
                 textAnchor={xTickAngle === 0 ? "middle" : (xTickAngle < 0 ? "end" : "start")}
                 height={(() => {
@@ -2038,7 +2336,20 @@ function LiveTagChart({
                 dataKey="tsMs"
                 type="number"
                 scale="time"
-                domain={["dataMin", "dataMax"]}
+                domain={(() => {
+                  const base = trigCfg && trigWin.start > 0
+                    ? [trigWin.start, trigWin.end > 0 ? trigWin.end : "dataMax"]
+                    : ["dataMin", "dataMax"];
+                  if (!anyBars) return base;
+                  // 2026-11-16: a bar on a time axis is centred on its stamp;
+                  // half a slot of room at both ends keeps the edge bars in.
+                  const ts = (renderedData?.rows || []).map((r) => Number(r?.tsMs)).filter(Number.isFinite).sort((a, b) => a - b);
+                  if (!ts.length) return base;
+                  const half = _halfSlotMs(ts);
+                  return [(typeof base[0] === "number" ? base[0] : ts[0]) - half,
+                          (typeof base[1] === "number" ? base[1] : ts[ts.length - 1]) + half];
+                })()}
+                allowDataOverflow={Boolean(trigCfg && trigWin.start > 0)}
                 tickFormatter={xTickFormatter}
                 fontSize={10}
                 interval="preserveStartEnd"
@@ -2229,7 +2540,7 @@ function DashboardWidgetCardImpl({
   };
   const onPanPointerMove = () => {};
   const onPanPointerUp = () => {};
-  const cfg = widget?.config || {};
+  const cfg = chartAggregationConfig(widget?.type, widget?.config);
   const gatewayId = cfg.gateway_id || "";
   const tagName = cfg.tag_name || "";
   // SERIES UNIFICATION (2026-07-27): chart widgets may configure every tag
@@ -2442,6 +2753,7 @@ function DashboardWidgetCardImpl({
     // the widget kept fetching its own "live tail" and the filter
     // bar above it lied. Now historical from/to wins when set.
     let range = resolveTimeFilterRange(cfg);
+    if (!range && !historicalMode && TREND_WINDOW_TYPES.includes(widgetType)) range = rollingBucketRange(cfg, cfgReadingsCount);
     if (historicalMode) {
       const histFromMs = historicalFromLocal ? new Date(historicalFromLocal).getTime() : NaN;
       const histToMs = historicalToLocal ? new Date(historicalToLocal).getTime() : NaN;
@@ -2462,15 +2774,20 @@ function DashboardWidgetCardImpl({
       queryRowsReqKeyRef.current = "";
       return () => {};
     }
+    // 2026-11-16, reported: "data aggregation is not working". A pie never
+    // fetched rows when the stats endpoints existed, so its "Time grouping"
+    // and "last N" ran over the live buffer alone (a minute). A pie whose
+    // query is shaped fetches its rows (one per group when grouping).
+    const pieShaped = String(cfgGroupInterval || "none") !== "none" || cfgRowSelection === "last_n";
     // Direct pie widgets read from historian stats endpoint; avoid heavy full-row scans.
-    if (isDirectPie && typeof fetchWidgetStatsRef.current === "function") {
+    if (isDirectPie && !pieShaped && typeof fetchWidgetStatsRef.current === "function") {
       setServerQueryRows([]);
       setServerQueryError("");
       setServerQueryRowsLoading(false);
       queryRowsReqKeyRef.current = "";
       return () => {};
     }
-    if (isComputedPie && typeof fetchWidgetRuleStatsRef.current === "function") {
+    if (isComputedPie && !pieShaped && typeof fetchWidgetRuleStatsRef.current === "function") {
       setServerQueryRows([]);
       setServerQueryError("");
       setServerQueryRowsLoading(false);
@@ -2515,6 +2832,7 @@ function DashboardWidgetCardImpl({
     // Params-only key (no tick). Polling re-fires won't cancel an in-flight fetch
     // when SQL latency exceeds the refresh interval.
     const paramsKey = JSON.stringify({
+      df: JSON.stringify(_dfOf(cfg) || null),
       gatewayId: String(resolvedGatewayId || ""),
       tagName: String(tagName || ""),
       fromUtc: String(range?.fromUtc || ""),
@@ -2528,6 +2846,10 @@ function DashboardWidgetCardImpl({
       tf: cfgTimePreset,
       tfFrom: cfgTimeFrom,
       tfTo: cfgTimeTo,
+      // 2026-11-16, measured: changing "Aggregate every" / "Using" did not
+      // re-fetch - the chart kept the old buckets until the 30 s tick.
+      bkt: bucketSecondsFor(cfg),
+      bagg: bucketAggFor(cfg),
     });
     const paramsChanged = paramsKey !== queryRowsReqKeyRef.current;
     if (!paramsChanged && queryRowsInFlightRef.current) {
@@ -2538,9 +2860,17 @@ function DashboardWidgetCardImpl({
     const chartReads = cfgReadingsCount;
     // 2026-11-04: a time window with no explicit bucket is bucketed to the
     // reading count (see autoBucketSecondsFor); explicit buckets win.
+    // 2026-11-16, reported: "data aggregation is not working" on a computed
+    // pie. Its "Time grouping" was applied in the browser to the newest raw
+    // rows only (capped), and never when the server rule stats answered. A
+    // pie with a grouping now fetches one row per group (the last value,
+    // what bucketRows kept) over the whole window.
+    const pieGroupSeconds = (isComputedPie || isDirectPie) && bucketSecondsFor(cfg) <= 0
+      ? (Number(bucketMsFromInterval(cfgGroupInterval)) || 0) / 1000 : 0;
     const effectiveBucketSeconds = isTrendWidget
       ? effectiveBucketSeconds_(cfg, range, cfgReadingsCount, gatewayIntervalMs)
-      : bucketSecondsFor(cfg);
+      : (pieGroupSeconds > 0 ? pieGroupSeconds : bucketSecondsFor(cfg));
+    const bucketAggUsed = pieGroupSeconds > 0 ? "last" : bucketAggFor(cfg);
     const rowTagFilter =
       isComputedPie
         ? (() => {
@@ -2569,22 +2899,29 @@ function DashboardWidgetCardImpl({
       try {
         let rows = [];
         if (!shouldPaginateAll) {
-          rows = await fetchWidgetRowsRef.current({
+          // 2026-11-16, measured: 2 s buckets over 1 h are 1 800 rows; asking
+          // for the reading-point count left the window's start blank. A
+          // bucketed window asks for every bucket in it (the extras already
+          // did); the draw cap keeps what is drawn light.
+          const _span = windowSpanSeconds(range);
+          const _bucketLimit = effectiveBucketSeconds > 0 && _span > 0
+            ? Math.min(20000, Math.ceil(_span / effectiveBucketSeconds) + 20) : 0;
+          rows = await fetchWidgetRowsRef.current({ dataFilter: _dfOf(cfg),
             fromUtc: range?.fromUtc || "",
             toUtc: range?.toUtc || "",
-            limit,
+            limit: Math.max(Number(limit) || 0, _bucketLimit),
             offset: 0,
             gateway: String(resolvedGatewayId || ""),
             tag: rowTagFilter,
             timeoutMs: 12000,
             maxAttempts: 2,
-            bucketSeconds: effectiveBucketSeconds, bucketAgg: bucketAggFor(cfg),
+            bucketSeconds: effectiveBucketSeconds, bucketAgg: bucketAggUsed,
           });
           const safeFirst = Array.isArray(rows) ? rows : [];
           // Backward-compat fallback: some saved widgets may carry stale gateway ids.
           // If scoped fetch returns empty, retry by tag-only scope.
           if (safeFirst.length === 0 && String(resolvedGatewayId || "").trim()) {
-            rows = await fetchWidgetRowsRef.current({
+            rows = await fetchWidgetRowsRef.current({ dataFilter: _dfOf(cfg),
               fromUtc: range?.fromUtc || "",
               toUtc: range?.toUtc || "",
               limit,
@@ -2593,7 +2930,7 @@ function DashboardWidgetCardImpl({
               tag: rowTagFilter,
               timeoutMs: 12000,
               maxAttempts: 2,
-              bucketSeconds: effectiveBucketSeconds, bucketAgg: bucketAggFor(cfg),
+              bucketSeconds: effectiveBucketSeconds, bucketAgg: bucketAggUsed,
             });
           }
         } else {
@@ -2605,7 +2942,7 @@ function DashboardWidgetCardImpl({
             ? 1000000
             : Math.max(5000, Math.min(250000, requestedLimit * 50 || 50000));
           while (offset < maxRows) {
-            const page = await fetchWidgetRowsRef.current({
+            const page = await fetchWidgetRowsRef.current({ dataFilter: _dfOf(cfg),
               fromUtc: range?.fromUtc || "",
               toUtc: range?.toUtc || "",
               limit,
@@ -2621,7 +2958,7 @@ function DashboardWidgetCardImpl({
               offset === 0 &&
               String(resolvedGatewayId || "").trim()
             ) {
-              const fallbackPage = await fetchWidgetRowsRef.current({
+              const fallbackPage = await fetchWidgetRowsRef.current({ dataFilter: _dfOf(cfg),
                 fromUtc: range?.fromUtc || "",
                 toUtc: range?.toUtc || "",
                 limit,
@@ -2675,11 +3012,15 @@ function DashboardWidgetCardImpl({
     cfgTimePreset,
     cfgTimeFrom,
     cfgTimeTo,
+    cfg?.data_filter,
     historicalMode,
     historicalFromLocal,
     historicalToLocal,
     rulesDepKey,
     windowQueryTick,
+    cfg?.bucket_interval,
+    cfg?.bucket_custom_seconds,
+    cfg?.bucket_aggregation,
   ]);
 
   useEffect(() => {
@@ -2701,6 +3042,7 @@ function DashboardWidgetCardImpl({
     const range = resolveTimeFilterRange(cfg);
     // Params-only key (no tick) so polling never cancels an in-flight request.
     const paramsKey = JSON.stringify({
+      df: JSON.stringify(_dfOf(cfg) || null),
       widgetId: String(widget?.id || ""),
       gatewayId: String(resolvedGatewayId || ""),
       tagName: String(tagName || ""),
@@ -2724,7 +3066,7 @@ function DashboardWidgetCardImpl({
     setServerQueryStatsLoading(true);
     (async () => {
       try {
-        let rows = await fetchWidgetStatsRef.current({
+        let rows = await fetchWidgetStatsRef.current({ dataFilter: _dfOf(cfg),
           fromUtc: range?.fromUtc || "",
           toUtc: range?.toUtc || "",
           gateway: String(resolvedGatewayId || ""),
@@ -2734,7 +3076,7 @@ function DashboardWidgetCardImpl({
         });
         const safeFirst = Array.isArray(rows) ? rows : [];
         if (safeFirst.length === 0 && String(resolvedGatewayId || "").trim()) {
-          rows = await fetchWidgetStatsRef.current({
+          rows = await fetchWidgetStatsRef.current({ dataFilter: _dfOf(cfg),
             fromUtc: range?.fromUtc || "",
             toUtc: range?.toUtc || "",
             gateway: "",
@@ -2776,6 +3118,7 @@ function DashboardWidgetCardImpl({
     cfgTimePreset,
     cfgTimeFrom,
     cfgTimeTo,
+    cfg?.data_filter,
     refreshTickMedium,
   ]);
 
@@ -2795,6 +3138,7 @@ function DashboardWidgetCardImpl({
     // only drives polling; if params haven't changed and a request is already
     // in flight we let it finish instead of cancelling and re-firing.
     const paramsKey = JSON.stringify({
+      df: JSON.stringify(_dfOf(cfg) || null),
       widgetId: String(widget?.id || ""),
       gatewayId: String(resolvedGatewayId || ""),
       fromUtc: String(range?.fromUtc || ""),
@@ -2836,7 +3180,7 @@ function DashboardWidgetCardImpl({
           ...r,
           operator: normalizeRuleOperator(r?.operator),
         }));
-        const rows = await fetchWidgetRuleStatsRef.current({
+        const rows = await fetchWidgetRuleStatsRef.current({ dataFilter: _dfOf(cfg),
           rules: normalizedRules,
           fromUtc: range?.fromUtc || "",
           toUtc: range?.toUtc || "",
@@ -2880,6 +3224,7 @@ function DashboardWidgetCardImpl({
     cfgTimePreset,
     cfgTimeFrom,
     cfgTimeTo,
+    cfg?.data_filter,
     rulesDepKey,
     refreshTickMedium,
   ]);
@@ -2909,7 +3254,8 @@ function DashboardWidgetCardImpl({
     // baseRows' newest ts. Each new row in dataLogView is real PLC data,
     // so appending it is safe and keeps the chart moving in lockstep
     // with the header value.
-    const live = Array.isArray(dataLogView) ? dataLogView : [];
+    // 2026-11-16: live rows obey the widget's data filter like the stored ones.
+    const live = rowsPassDataFilter(Array.isArray(dataLogView) ? dataLogView : [], cfg?.data_filter);
     if (live.length === 0) return baseRows;
     // Find baseRows' newest ts so we only append strictly fresher rows.
     let newestTs = -Infinity;
@@ -2922,15 +3268,15 @@ function DashboardWidgetCardImpl({
     // server bucket ends, folded into the same bucket. Raw rows here would
     // be hundreds of points per bucket and push the history out.
     const bucketMs = Number(serverQueryBucket) * 1000;
-    const after = bucketMs > 0 && Number.isFinite(newestTs) ? newestTs + bucketMs : newestTs;
+    if (bucketMs > 0) return mergeLiveBuckets(baseRows, live, serverQueryBucket, bucketAggFor(cfg));
     for (let i = 0; i < live.length; i += 1) {
       const r = live[i];
       const ts = toTsMs(r?.ts || r?.ts_utc);
-      if (Number.isFinite(ts) && ts > after) append.push(r);
+      if (Number.isFinite(ts) && ts > newestTs) append.push(r);
     }
     if (!append.length) return baseRows;
-    return baseRows.concat(bucketMs > 0 ? bucketLiveTail(append, serverQueryBucket, bucketAggFor(cfg)) : append);
-  }, [serverQueryRows, serverQueryError, lastGoodServerQueryRows, dataLogView, widget?.id, serverQueryBucket, cfg?.bucket_aggregation]);
+    return baseRows.concat(append);
+  }, [serverQueryRows, serverQueryError, lastGoodServerQueryRows, dataLogView, widget?.id, serverQueryBucket, cfg?.bucket_aggregation, cfg?.data_filter]);
 
   const directScopedRows = useMemo(
     () => {
@@ -3014,7 +3360,13 @@ function DashboardWidgetCardImpl({
     // Threshold = 3 × gateway poll interval (anything longer than that
     // means the PLC stopped reporting, not just normal jitter).
     if (scaled.length < 2) return scaled;
-    const tickMs = Math.max(500, Number(gatewayIntervalMs || 1000));
+    // 2026-11-16, measured: a 15 min / 1 h / 6 h chart drew (almost) nothing.
+    // Its points are BUCKETS 10 s - 5 min apart, and a gap was "3 gateway
+    // intervals" (1.5 s at a 0.5 s gateway), so a null landed between every
+    // pair and no segment could be drawn. A gap is 3 x the chart's real point
+    // spacing, and "Show gaps" off means no gap markers here either.
+    if (cfg?.show_gaps === false) return scaled;
+    const tickMs = Math.max(500, Number(gatewayIntervalMs || 1000), Number(serverQueryBucket || 0) * 1000);
     const gapThresholdMs = tickMs * 3;
     const out = [];
     for (let i = 0; i < scaled.length; i += 1) {
@@ -3029,7 +3381,9 @@ function DashboardWidgetCardImpl({
       }
     }
     return out;
-  }, [directScopedRowsAggregated, resolvedGatewayId, tagName, cfgReadingsCount, primaryMultiplier, primaryOffset, gatewayIntervalMs, serverQueryBucket]);
+  }, [directScopedRowsAggregated, resolvedGatewayId, tagName, cfgReadingsCount, primaryMultiplier, primaryOffset, gatewayIntervalMs, serverQueryBucket, cfg?.show_gaps]);
+  // 2026-11-16: what the single-series chart DRAWS - at most CHART_DRAW_CAP rows.
+  const seriesDrawn = useMemo(() => decimateRows(series, ["value"], CHART_DRAW_CAP), [series]);
 
   // -------- multi-series support --------------------------------------------
   // Additional series for trend charts. Each extra entry is rendered alongside
@@ -3108,6 +3462,7 @@ function DashboardWidgetCardImpl({
     // — the chart rendered as a single-series chart instead of
     // multi-series.
     let localRange = resolveTimeFilterRange(cfg);
+    if (!localRange && !historicalMode) localRange = rollingBucketRange(cfg, cfgReadingsCount);
     if (historicalMode) {
       const histFromMs = historicalFromLocal ? new Date(historicalFromLocal).getTime() : NaN;
       const histToMs = historicalToLocal ? new Date(historicalToLocal).getTime() : NaN;
@@ -3147,7 +3502,7 @@ function DashboardWidgetCardImpl({
         : reads;
       for (const def of extraSeriesDefs) {
         try {
-          let rows = await fetcher({
+          let rows = await fetcher({ dataFilter: _dfOf(cfg),
             fromUtc: localRange?.fromUtc || "",
             toUtc: localRange?.toUtc || "",
             limit: extraLimit,
@@ -3161,7 +3516,7 @@ function DashboardWidgetCardImpl({
           if (!Array.isArray(rows) || rows.length === 0) {
             // Fallback: drop gateway scope (handles tags emitted under a
             // different gateway_id alias).
-            rows = await fetcher({
+            rows = await fetcher({ dataFilter: _dfOf(cfg),
               fromUtc: localRange?.fromUtc || "",
               toUtc: localRange?.toUtc || "",
               limit: extraLimit,
@@ -3209,9 +3564,13 @@ function DashboardWidgetCardImpl({
   }, [
     JSON.stringify(extraSeriesDefs.map((d) => `${d.gateway_id}::${d.tag_name}`)),
     windowQueryTick,
+    cfg?.bucket_interval,
+    cfg?.bucket_custom_seconds,
+    cfg?.bucket_aggregation,
     cfgTimePreset,
     cfgTimeFrom,
     cfgTimeTo,
+    cfg?.data_filter,
     cfgReadingsCount,
     historicalMode,
     historicalFromLocal,
@@ -3221,8 +3580,16 @@ function DashboardWidgetCardImpl({
   // Combined source: prefer the server-fetched historian rows; fall back to
   // the live broadcast (dataLogView) so freshly-emitted samples appear
   // between fetches.
+  // 2026-11-16, measured: under a rolling / trigger chart (LiveTagChart draws
+  // it) the card still rebuilt the windowed chart's rows on every live tick -
+  // work nobody saw. Same rule as the render branch below.
+  const usesLiveChart = TREND_WINDOW_TYPES.includes(widgetType) && !historicalMode
+    && ((String(cfg?.window_mode || "count") === "trigger" && !!String(cfg?.window_tag_name || "").trim())
+      || (cfgTimePreset === "none" && !cfgTimeFrom.trim() && !cfgTimeTo.trim()))
+    && !(Array.isArray(cfg?.series_extra) && cfg.series_extra.some((s) => String(s?.chart_type || "").toLowerCase() === "limit"))
+    && bucketSecondsFor(cfg) <= 0;
   const extraSeriesRowsByDef = useMemo(() => {
-    if (!extraSeriesDefs.length) return {};
+    if (!extraSeriesDefs.length || usesLiveChart) return {};
     const liveRows = Array.isArray(dataLogView) ? dataLogView : [];
     const out = {};
     for (const def of extraSeriesDefs) {
@@ -3238,19 +3605,14 @@ function DashboardWidgetCardImpl({
       // 2026-11-04: a bucketed series is joined by buckets after its newest
       // server bucket, exactly like the primary.
       let liveTail = filteredLive;
+      let serverPart = fromServer;
       if (extraSeriesBucket > 0) {
-        let newest = -Infinity;
-        for (const r of fromServer) {
-          const t = toTsMs(r?.ts || r?.ts_utc);
-          if (Number.isFinite(t) && t > newest) newest = t;
-        }
-        const after = Number.isFinite(newest) ? newest + extraSeriesBucket * 1000 : -Infinity;
-        liveTail = bucketLiveTail(filteredLive.filter((r) => toTsMs(r?.ts || r?.ts_utc) > after),
-          extraSeriesBucket, bucketAggFor(cfg));
+        serverPart = mergeLiveBuckets(fromServer, filteredLive, extraSeriesBucket, bucketAggFor(cfg));
+        liveTail = [];
       }
       const seen = new Set();
       const merged = [];
-      for (const r of [...fromServer, ...liveTail]) {
+      for (const r of [...serverPart, ...liveTail]) {
         const k = `${String(r?.ts || r?.ts_utc || "")}|${String(r?.tag || r?.tag_name || "")}`;
         if (seen.has(k)) continue;
         seen.add(k);
@@ -3259,7 +3621,7 @@ function DashboardWidgetCardImpl({
       out[def.id] = applyWidgetTimeFilter(merged, cfg);
     }
     return out;
-  }, [extraSeriesDefs, extraSeriesServerRowsByDef, dataLogView, cfgTimePreset, cfgTimeFrom, cfgTimeTo, extraSeriesBucket, cfg?.bucket_aggregation]);
+  }, [extraSeriesDefs, extraSeriesServerRowsByDef, dataLogView, cfgTimePreset, cfgTimeFrom, cfgTimeTo, extraSeriesBucket, cfg?.bucket_aggregation, usesLiveChart]);
 
   // Build a combined dataset on the **union of all sample timestamps** from
   // every series. Each timestamp becomes one row; series that don't have a
@@ -3303,6 +3665,7 @@ function DashboardWidgetCardImpl({
   }, [limitLineDefs, dataLogView]);
 
   const multiSeriesData = useMemo(() => {
+    if (usesLiveChart) return [];
     // When only limit lines are configured (no extra data series) we still
     // want to draw the ComposedChart so the limit shows up — fall back to
     // the primary series points so the X axis has a timeline.
@@ -3338,6 +3701,7 @@ function DashboardWidgetCardImpl({
     };
 
     const primaryPts = series
+      .filter((p) => !(p.value === null && !Number.isInteger(p.idx)))   // its own gap markers
       .map((p) => ({ ts: p.ts || "", tsMs: tsToMs(p.ts), value: p.value }))
       .filter((p) => Number.isFinite(p.tsMs));
 
@@ -3395,13 +3759,18 @@ function DashboardWidgetCardImpl({
     // keeping the newest N timestamps is what cut 6 hours to 30 seconds.
     // A very long window is thinned evenly instead, so it stays light.
     if (hasExplicitWindow) {
-      sortedTs = thinTimestamps(sortedTs, Math.max(readingsCap * 4, 1500));
+      sortedTs = thinTimestamps(sortedTs, Math.max(readingsCap * 4, CHART_DRAW_CAP));
     } else if (sortedTs.length > readingsCap) {
       sortedTs = sortedTs.slice(-readingsCap);
     }
     if (!hasExplicitWindow && sortedTs.length > 1) {
       const newest = sortedTs[sortedTs.length - 1];
-      const tickForWindow = Math.max(500, Number(gatewayIntervalMs || 1000));
+      // 2026-11-16, reported with a screenshot: two aggregated series, no
+      // preset, 50 points at 5 s drew 8 bars over 35 s. The recency trim
+      // below was 50 GATEWAY ticks (0.5 s) - 37 s - applied to 5 s buckets.
+      // A point is one bucket when the series are bucketed.
+      const tickForWindow = Math.max(500, Number(gatewayIntervalMs || 1000),
+        Number(serverQueryBucket || 0) * 1000, Number(extraSeriesBucket || 0) * 1000);
       const windowMs = readingsCap * tickForWindow * 1.5;
       const trimmed = sortedTs.filter((t) => newest - t <= windowMs);
       if (trimmed.length >= 2) sortedTs = trimmed;
@@ -3419,7 +3788,10 @@ function DashboardWidgetCardImpl({
     // batch processes where the operator wants a continuous line showing
     // "the data we actually collected" without visual blank spans.
     const gapsVisible = cfg?.show_gaps !== false;
-    const tickMs = Math.max(500, Number(gatewayIntervalMs || 1000));
+    // 2026-11-16: 3 x the chart's real point spacing (the bucket when the
+    // window is bucketed), not 3 gateway intervals - see the primary series.
+    const chartSpacingMs = Math.max(Number(serverQueryBucket || 0), Number(extraSeriesBucket || 0)) * 1000;
+    const tickMs = Math.max(500, Number(gatewayIntervalMs || 1000), chartSpacingMs);
     const gapThresholdMs = tickMs * 3;
     const out = [];
     for (let i = 0; i < sortedTs.length; i += 1) {
@@ -3445,7 +3817,39 @@ function DashboardWidgetCardImpl({
       }
     }
     return out;
-  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length, cfgReadingsCount, gatewayIntervalMs, cfg?.show_gaps, cfg?.query_time_filter_preset, cfg?.query_time_filter_from, cfg?.query_time_filter_to, historicalMode]);
+  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length, cfgReadingsCount, gatewayIntervalMs, cfg?.show_gaps, cfg?.query_time_filter_preset, cfg?.query_time_filter_from, cfg?.query_time_filter_to, historicalMode, serverQueryBucket, extraSeriesBucket, usesLiveChart]);
+
+  // 2026-11-16: a chart with a window shows THE WINDOW on its time axis -
+  // 15 min is 15 min even when collection stopped for part of it. Preset
+  // windows end now (the fetch window is rounded for stable requests).
+  const windowDomain = (() => {
+    if (!TREND_WINDOW_TYPES.includes(widgetType)) return null;
+    let a = Number.NaN;
+    let b = Number.NaN;
+    if (historicalMode) {
+      a = new Date(historicalFromLocal).getTime();
+      b = new Date(historicalToLocal).getTime();
+    } else {
+      const preset = String(cfg?.query_time_filter_preset || "none");
+      const presetMs = preset !== "custom" && preset !== "today" ? resolvePresetWindowMs(preset) : 0;
+      if (presetMs) {
+        b = Date.now();
+        a = b - presetMs;
+      } else {
+        const r = resolveTimeFilterRange(cfg);
+        if (r) {
+          a = Date.parse(String(r.fromUtc || ""));
+          b = r.toUtc ? Date.parse(String(r.toUtc)) : Date.now();
+        }
+      }
+    }
+    return Number.isFinite(a) && Number.isFinite(b) && b > a ? [a, b] : null;
+  })();
+  // A LIVE preset window (15 min, 1 h ...) slides with the data, like rolling
+  // mode: the axis ends at the newest point, so no blank strip opens on the
+  // right between refreshes. A custom range or historical view is fixed.
+  const windowFollowsData = Boolean(windowDomain) && !historicalMode
+    && !["custom", "today", "none"].includes(String(cfg?.query_time_filter_preset || "none"));
 
   const hasMultiSeries = extraSeriesDefs.length > 0 || resolvedLimitLines.length > 0;
   const anyRightAxis =
@@ -3474,10 +3878,19 @@ function DashboardWidgetCardImpl({
         : Array.isArray(lastGoodServerRuleStats) && lastGoodServerRuleStats.length > 0
           ? lastGoodServerRuleStats
           : [];
-    if (chosenRuleStats.length > 0) {
+    // 2026-11-16: the server rule stats are computed over every raw row of
+    // the window with each rule's own aggregation - they know nothing of the
+    // widget's "Time grouping", "Row selection: last N", row limit, yet they were preferred whenever they answered, so those
+    // settings did nothing on an edge. With any of them set, the rows
+    // fetched for the window (grouped by the server when a grouping is on)
+    // are evaluated here, where every setting is honoured.
+    const shapedQuery = String(cfgGroupInterval || "none") !== "none"
+      || String(cfgRowSelection || "all") === "last_n";
+    if (chosenRuleStats.length > 0 && !shapedQuery) {
       return chosenRuleStats.map((row, idx) => ({
         id: String(row?.id || `rule-${idx + 1}`),
-        label: String(row?.label || `Item ${idx + 1}`),
+        label: String(row?.label || "").trim()
+          || describeRule((Array.isArray(rules) ? rules : []).find((r) => String(r?.id || "") === String(row?.id || "")) || {}, idx),
         value: Number.isFinite(Number(row?.value)) ? Number(row.value) : 0,
         color: String(row?.color || "#14a89a"),
         gateway_id: String(row?.gateway_id || ""),
@@ -3489,7 +3902,7 @@ function DashboardWidgetCardImpl({
     }
     // Keep UI live: while backend rule-stats is loading/slow, compute from currently available rows.
     return evaluateComputedRules(computedRowsTimeFiltered, rules, queryOptions);
-  }, [serverRuleStats, lastGoodServerRuleStats, computedRowsTimeFiltered, rulesDepKey, queryOptions]);
+  }, [serverRuleStats, lastGoodServerRuleStats, computedRowsTimeFiltered, rulesDepKey, queryOptions, cfgGroupInterval, cfgRowSelection]);
   // Widget-level TYPOGRAPHY scales (2026-07-27): every text family in the
   // widget is operator-sizable. 1 = default; free range 0.3..4.
   const fontScale = (key) => {
@@ -3510,67 +3923,83 @@ function DashboardWidgetCardImpl({
   // specifies min, max, optional tick step). Empty / invalid manual values
   // fall back to auto so the chart never goes blank when the operator
   // leaves a field empty mid-edit.
-  const yAxisMode = String(cfg?.y_axis_mode || "auto").toLowerCase();
-  const manualY = useMemo(() => {
-    if (yAxisMode !== "manual") return null;
-    const lo = Number(cfg?.y_min);
-    const hi = Number(cfg?.y_max);
-    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
-    return { lo, hi };
-  }, [yAxisMode, cfg?.y_min, cfg?.y_max]);
-  const manualYTicks = useMemo(() => {
-    if (!manualY) return null;
-    const step = Number(cfg?.y_tick_step);
-    if (!Number.isFinite(step) || step <= 0) return null;
-    const ticks = [];
-    // Cap at 50 ticks so a tiny step on a huge range can't render thousands
-    // of grid lines and lock the browser.
-    const maxTicks = 50;
-    for (let v = manualY.lo, i = 0; v <= manualY.hi + step * 1e-9 && i < maxTicks; v += step, i += 1) {
-      ticks.push(Number(v.toFixed(10)));
-    }
-    return ticks;
-  }, [manualY, cfg?.y_tick_step]);
-  const yDomain = useMemo(() => {
-    if (manualY) {
-      // Honor the operator's typed min exactly. Earlier we forced the
-      // axis to start at 0 unless the typed min was negative, which
-      // ignored ranges like min=100 max=200 (the chart painted 0..200
-      // instead of 100..200). The form widget already exposes the
-      // toggle + the three fields; if the operator typed it, that's
-      // what they want.
-      return [manualY.lo, manualY.hi];
-    }
-    return buildAutoYDomain(series);
-  }, [manualY, series]);
+  // 2026-11-16: every bound on its own (Auto / Manual / Tag) - axisBounds.js,
+  // the same rule the rolling chart and the editor use.
+  const axisTagValues = useAxisTagValues(cfg, fetchWidgetStatsRef.current, dataLogView, () => {
+    const r = resolveTimeFilterRange(cfg);
+    if (r) return r;
+    const span = Math.max(60000, Number(cfgReadingsCount || 120) * Math.max(200, Number(gatewayIntervalMs || 1000)));
+    return { fromUtc: new Date(Date.now() - span).toISOString(), toUtc: "" };
+  });
+  // 2026-11-16: a table of TEST RESULTS - the generated reports of a schedule
+  // with their stored columns (Part #, Result ...) - read on the slow tick.
+  const isResultsTable = widgetType === "table_list" && String(cfg?.table_mode || "rows") === "test_results";
+  const [resultRows, setResultRows] = useState([]);
+  useEffect(() => {
+    if (!isResultsTable) return undefined;
+    let cancelled = false;
+    const r = resolveTimeFilterRange(cfg);
+    listGeneratedReports({
+      limit: Math.max(1, Math.min(500, Number(cfg?.list_limit || 20) || 20)),
+      scheduleName: String(cfg?.results_schedule_name || ""), column: String(cfg?.results_column || ""),
+      value: String(cfg?.results_value || ""), fromUtc: r?.fromUtc || "", toUtc: r?.toUtc || "",
+    }).then((res) => { if (!cancelled) setResultRows(Array.isArray(res?.generated) ? res.generated : []); })
+      .catch(() => { /* keep the last rows */ });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isResultsTable, windowQueryTick, cfg?.list_limit, cfg?.results_schedule_name, cfg?.results_column, cfg?.results_value, cfgTimePreset, cfgTimeFrom, cfgTimeTo]);
 
-  const yRightAxisMode = String(cfg?.y_right_axis_mode || "auto").toLowerCase();
-  const manualYRight = useMemo(() => {
-    if (yRightAxisMode !== "manual") return null;
-    const lo = Number(cfg?.y_right_min);
-    const hi = Number(cfg?.y_right_max);
-    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
-    return { lo, hi };
-  }, [yRightAxisMode, cfg?.y_right_min, cfg?.y_right_max]);
-  const manualYRightTicks = useMemo(() => {
-    if (!manualYRight) return null;
-    const step = Number(cfg?.y_right_tick_step);
-    if (!Number.isFinite(step) || step <= 0) return null;
-    const ticks = [];
-    const maxTicks = 50;
-    for (let v = manualYRight.lo, i = 0; v <= manualYRight.hi + step * 1e-9 && i < maxTicks; v += step, i += 1) {
-      ticks.push(Number(v.toFixed(10)));
-    }
-    return ticks;
-  }, [manualYRight, cfg?.y_right_tick_step]);
-  const yRightDomain = useMemo(() => {
-    if (manualYRight) {
-      // Honor operator-typed min exactly (matches the left axis fix).
-      return [manualYRight.lo, manualYRight.hi];
-    }
-    return undefined; // recharts auto-domain on the right axis when undefined
-  }, [manualYRight]);
-  // Multi-axis (2026-07-19): 2nd left + 2nd right axis for the heavy widget.
+  // 2026-11-16: X-axis labels from a tag (a part number per test) - the tag's
+  // raw rows over the window, read on the slow tick; a point takes the label
+  // of the newest reading at or before its own time.
+  const xLabelTag = String(cfg?.x_label_tag || "").trim();
+  const [xLabelRows, setXLabelRows] = useState([]);
+  useEffect(() => {
+    if (!xLabelTag || typeof fetchWidgetRowsRef.current !== "function") return undefined;
+    let cancelled = false;
+    const r = resolveTimeFilterRange(cfg) || rollingBucketRange(cfg, cfgReadingsCount) || { fromUtc: "", toUtc: "" };
+    fetchWidgetRowsRef.current({ dataFilter: _dfOf(cfg), fromUtc: r.fromUtc || "", toUtc: r.toUtc || "", limit: 5000, offset: 0,
+      gateway: String(cfg?.x_label_gateway_id || resolvedGatewayId || ""), tag: xLabelTag, timeoutMs: 12000, maxAttempts: 1, bucketSeconds: 0 })
+      .then((rows) => {
+        if (cancelled) return;
+        const list = (Array.isArray(rows) ? rows : []).map((row) => ({
+          ms: toTsMs(row?.ts || row?.ts_utc),
+          label: (row?.value_text !== null && row?.value_text !== undefined && row?.value_text !== "") ? String(row.value_text)
+            : (row?.value !== null && row?.value !== undefined ? String(Number(row.value) === Math.round(Number(row.value)) ? Math.round(Number(row.value)) : row.value) : ""),
+        })).filter((x) => Number.isFinite(x.ms) && x.label).sort((a, b) => a.ms - b.ms);
+        setXLabelRows(list);
+      }).catch(() => { /* keep */ });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [xLabelTag, cfg?.x_label_gateway_id, windowQueryTick, cfgTimePreset, cfgTimeFrom, cfgTimeTo, cfgReadingsCount, resolvedGatewayId]);
+  const xLabelOf = useMemo(() => {
+    if (!xLabelTag || !xLabelRows.length) return null;
+    const rows = xLabelRows;
+    const tol = Math.max(Number(serverQueryBucket || 0), Number(extraSeriesBucket || 0), 0) * 1000 + 1000;
+    return (ms) => {
+      let lo = 0; let hi = rows.length - 1; let best = -1;
+      const limit = ms + tol;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (rows[mid].ms <= limit) { best = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      return best >= 0 ? rows[best].label : "";
+    };
+  }, [xLabelTag, xLabelRows, serverQueryBucket, extraSeriesBucket]);
+
+  const scaleOf = (id) => resolveAxisScale(cfg, AXIS_BOUND_KEYS.find((a) => a.id === id), axisTagValues);
+  const scaleLeft1 = scaleOf("left1");
+  const scaleRight1 = scaleOf("right1");
+  const scaleLeft2 = scaleOf("left2");
+  const scaleRight2 = scaleOf("right2");
+  const manualY = scaleLeft1.fixed ? { lo: scaleLeft1.lo, hi: scaleLeft1.hi } : null;
+  const manualYTicks = scaleLeft1.ticks || null;
+  const yDomain = useMemo(() => domainFromScale(scaleLeft1, buildAutoYDomain(series)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [scaleLeft1.lo, scaleLeft1.hi, scaleLeft1.fixed, series]);
+  const manualYRight = scaleRight1.fixed ? { lo: scaleRight1.lo, hi: scaleRight1.hi } : null;
+  const manualYRightTicks = scaleRight1.ticks || null;
+  const yRightDomain = scaleRight1.fixed ? domainFromScale(scaleRight1, ["auto", "auto"]) : undefined;
   const _buildManual2 = (modeK, minK, maxK, stepK) => {
     if (String(cfg?.[modeK] || "auto") !== "manual") return null;
     const lo = Number(cfg?.[minK]); const hi = Number(cfg?.[maxK]);
@@ -3583,10 +4012,11 @@ function DashboardWidgetCardImpl({
     }
     return { lo, hi, ticks };
   };
-  const manualYLeft2 = _buildManual2("y_left2_axis_mode", "y_left2_min", "y_left2_max", "y_left2_tick_step");
-  const manualYRight2 = _buildManual2("y_right2_axis_mode", "y_right2_min", "y_right2_max", "y_right2_tick_step");
-  const yLeft2Domain = manualYLeft2 ? [manualYLeft2.lo, manualYLeft2.hi] : undefined;
-  const yRight2Domain = manualYRight2 ? [manualYRight2.lo, manualYRight2.hi] : undefined;
+  void _buildManual2;
+  const manualYLeft2 = scaleLeft2.fixed || scaleLeft2.ticks ? { lo: scaleLeft2.lo, hi: scaleLeft2.hi, ticks: scaleLeft2.ticks } : null;
+  const manualYRight2 = scaleRight2.fixed || scaleRight2.ticks ? { lo: scaleRight2.lo, hi: scaleRight2.hi, ticks: scaleRight2.ticks } : null;
+  const yLeft2Domain = scaleLeft2.fixed ? domainFromScale(scaleLeft2, ["auto", "auto"]) : undefined;
+  const yRight2Domain = scaleRight2.fixed ? domainFromScale(scaleRight2, ["auto", "auto"]) : undefined;
   const left2AxisLabel = String(cfg?.y_left2_label || "");
   const right2AxisLabel = String(cfg?.y_right2_label || "");
   // Per-axis unit + suffix appended to each Y-axis tick (heavy path), so
@@ -3994,6 +4424,7 @@ function DashboardWidgetCardImpl({
             widget={widget}
             dataLogView={dataLogView}
             fetchWidgetRows={typeof fetchWidgetRowsRef.current === "function" ? fetchWidgetRowsRef.current : null}
+            fetchWidgetStats={typeof fetchWidgetStatsRef.current === "function" ? fetchWidgetStatsRef.current : null}
             gatewayIntervalMs={gatewayIntervalMs}
             resolvedGatewayId={resolvedGatewayId}
             tagName={tagName}
@@ -4089,9 +4520,9 @@ function DashboardWidgetCardImpl({
               <div className="dashboard-widget-chart">
                 {widgetKind === "line_area_chart" ? (
                   <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={series} margin={chartMargin}>
+                    <AreaChart data={seriesDrawn} margin={chartMargin}>
                       <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                      <XAxis {...buildXAxisProps(series, cfg)} />
+                      <XAxis {...buildXAxisProps(seriesDrawn, cfg, { domain: windowDomain, followData: windowFollowsData, categorical: Boolean(xLabelOf), labelOf: xLabelOf })} />
                       <YAxis {...yAxisPresetProps} domain={yDomain} ticks={manualYTicks || undefined} allowDataOverflow={!!manualY} />
                       <Tooltip
                         {...chartTooltipProps}
@@ -4120,10 +4551,10 @@ function DashboardWidgetCardImpl({
                         first/last bar from straddling the axis line.
                         maxBarSize caps width on sparse data so a tall
                         bar doesn't bleed past the right edge. */}
-                    <BarChart data={series} margin={chartMargin} barCategoryGap="20%" barGap={2}>
+                    <BarChart data={seriesDrawn} margin={chartMargin} barCategoryGap="20%" barGap={2}>
                       {renderBarPattern(primaryColor)}
                       <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                      <XAxis {...buildXAxisProps(series, cfg, { categorical: true })} />
+                      <XAxis {...buildXAxisProps(seriesDrawn, cfg, { categorical: true, labelOf: xLabelOf })} />
                       <YAxis {...yAxisPresetProps} domain={yDomain} ticks={manualYTicks || undefined} allowDataOverflow={!!manualY} />
                       <Tooltip
                         {...chartTooltipProps}
@@ -4146,9 +4577,9 @@ function DashboardWidgetCardImpl({
                   </ResponsiveContainer>
                 ) : (
                   <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={series} margin={chartMargin}>
+                    <LineChart data={seriesDrawn} margin={chartMargin}>
                       <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                      <XAxis {...buildXAxisProps(series, cfg)} />
+                      <XAxis {...buildXAxisProps(seriesDrawn, cfg, { domain: windowDomain, followData: windowFollowsData, categorical: Boolean(xLabelOf), labelOf: xLabelOf })} />
                       <YAxis {...yAxisPresetProps} domain={yDomain} ticks={manualYTicks || undefined} allowDataOverflow={!!manualY} />
                       <Tooltip
                         {...chartTooltipProps}
@@ -4177,7 +4608,7 @@ function DashboardWidgetCardImpl({
       }
 
       // ---- Multi-series ComposedChart ---------------------------------------
-      const data = multiSeriesData;
+      const data = decimateRows(multiSeriesData, ["value", ...extraSeriesDefs.map((d) => `s_${d.id}`)], CHART_DRAW_CAP);
       const dataNonEmpty = data.length > 0;
       // Debug aid: count how many points each series has in the combined
       // dataset. Surfaced as a hidden HTML attribute so we can inspect via
@@ -4268,7 +4699,13 @@ function DashboardWidgetCardImpl({
                       the first bar sits to the right of the Y axis instead
                       of straddling it (same fix as the dedicated BarChart
                       branch above). Mixed bar+line keeps the time scale. */}
-                  <XAxis {...buildXAxisProps(data, cfg, { categorical: seriesDescriptors.length > 0 && seriesDescriptors.every((s) => s.kind === "bar_chart") })} />
+                  {/* 2026-11-16: an extra bar series is kind "bar", so the
+                      all-bars test above never held with two bar series and
+                      the edge bars straddled both axis lines. Any bar on the
+                      time axis now pads the domain by half a slot instead;
+                      the window is kept and lines stay aligned. */}
+                  <XAxis {...buildXAxisProps(data, cfg, { domain: windowDomain, followData: windowFollowsData, labelOf: xLabelOf, categorical: Boolean(xLabelOf),
+                    padBars: seriesDescriptors.some((s) => s.kind === "bar" || s.kind === "bar_chart") })} />
                   <YAxis
                     yAxisId="left1"
                     {...yAxisPresetProps}
@@ -4534,7 +4971,11 @@ function DashboardWidgetCardImpl({
               const v = Number.isFinite(raw) ? raw : null;
               if (v !== null) latestByTag.set(nm, v);
             }
-            const directStats = effectiveStats.length
+            // 2026-11-16: with a "Time grouping" or "last N" the local rows are
+            // the shaped ones; the server stats are over every raw row.
+            const shapedDirect = String(cfg.query_group_interval || "none") !== "none"
+              || String(cfg.query_row_selection || "all") === "last_n";
+            const directStats = effectiveStats.length && !(shapedDirect && localDirectStats.length)
               ? effectiveStats
                   .filter((r) => {
                     const nm = String(r?.tag || "").trim().toLowerCase();
@@ -4590,8 +5031,12 @@ function DashboardWidgetCardImpl({
         ? visiblePieData
         : visiblePieData.map((item) => ({ ...item, value: 1 }));
       const compact = Number(widget?.w || 0) <= 3 || Number(widget?.h || 0) <= 3;
-      const innerRadius = compact ? "50%" : "58%";
-      const outerRadius = compact ? "84%" : "94%";
+      // 2026-11-16: "Chart size" (40..100 %) scales the ring inside its box.
+      const pieSizeRaw = Number(cfg?.pie_size);
+      const pieSize = Number.isFinite(pieSizeRaw) && pieSizeRaw > 0 ? Math.max(40, Math.min(100, pieSizeRaw)) / 100 : 1;
+      const outerPct = Math.round((compact ? 84 : 94) * pieSize);
+      const innerRadius = `${Math.round(outerPct * (compact ? 0.6 : 0.62))}%`;
+      const outerRadius = `${outerPct}%`;
       const centerTotal = Number.isFinite(total) ? total.toFixed(total >= 1000 ? 0 : 2) : "0";
       const legendRows = pieData.map((item, idx) => {
         const raw = Number(item?.value || 0);
@@ -4984,6 +5429,46 @@ function DashboardWidgetCardImpl({
       // ones), because each column independently picks its tag.
       const baseRows = Array.isArray(effectiveRows) ? effectiveRows : [];
 
+      if (isResultsTable) {
+        // 2026-11-16: one row per test run (a generated report) with its
+        // stored result columns.
+        const wanted = Array.isArray(cfg?.results_columns) && cfg.results_columns.length
+          ? cfg.results_columns.map((c) => String(c || "").trim()).filter(Boolean)
+          : (() => { const seen = []; for (const g of resultRows) for (const k of Object.keys(g?.meta?.columns || {})) if (!seen.includes(k)) seen.push(k); return seen; })();
+        const fmtWhen = (s) => { const ms = Date.parse(String(s || "").replace(" ", "T") + "Z"); return Number.isFinite(ms) ? new Date(ms).toLocaleString() : String(s || ""); };
+        return (
+          <div className="dashboard-widget-block dashboard-widget-block-table">
+            <div className="dashboard-table-scroll">
+              <table className="dashboard-table">
+                <thead>
+                  <tr>
+                    <th>Run</th>
+                    {cfg?.results_show_schedule !== false ? <th>Schedule</th> : null}
+                    {wanted.map((k) => <th key={k}>{k}</th>)}
+                    <th>State</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {resultRows.map((g) => {
+                    const cols = g?.meta?.columns || {};
+                    const st = String(g?.render_state || "ready");
+                    return (
+                      <tr key={g.id}>
+                        <td>{fmtWhen(g.created_utc)}</td>
+                        {cfg?.results_show_schedule !== false ? <td>{g.schedule_name || g.template_name || "-"}</td> : null}
+                        {wanted.map((k) => <td key={k}>{cols[k] === undefined || cols[k] === null || cols[k] === "" ? "-" : String(cols[k])}</td>)}
+                        <td>{st === "ready" ? "ready" : st}</td>
+                      </tr>
+                    );
+                  })}
+                  {!resultRows.length ? <tr><td colSpan={2 + wanted.length + 1} className="muted">No test results in this window.</td></tr> : null}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      }
+
       // ── LATEST-PER-TAG MODE (2026-07-26) ───────────────────────────────
       // Same Grafana-style "Reduce" idea as the bar-gauge: ONE row per tag
       // showing a single calculated value (Last / Min / Max / Average) over
@@ -5180,6 +5665,16 @@ function DashboardWidgetCardImpl({
                 .filter((r) => String(r?.tag || r?.tag_name || "").trim() === t)
                 .sort((a, b) => toTsMs(a?.ts || a?.ts_utc) - toTsMs(b?.ts || b?.ts_utc));
               cellValues[col.id] = aggregate(sorted, String(col.aggregation || "last"));
+              // 2026-11-16: a STRING tag (a part number) showed "-". For last /
+              // first the row's text travels with the number.
+              const _agg = String(col.aggregation || "last");
+              if (sorted.length && (_agg === "last" || _agg === "first")) {
+                const pick = _agg === "first" ? sorted[0] : sorted[sorted.length - 1];
+                const txt = pick?.value_text;
+                if (txt !== null && txt !== undefined && txt !== "") {
+                  cellValues[`${col.id}__text`] = String(txt);
+                }
+              }
             } else if (col.source === "limit") {
               // Configured bound from Tags Limits & Triggers — constant per
               // row; lets one table show last | min | max | limit side by side.
@@ -5256,9 +5751,14 @@ function DashboardWidgetCardImpl({
                             return <td key={`${idx}-${col.id}`}>{String(cell || "-")}</td>;
                           }
                           const n = Number(cell);
+                          const txt = row.cellValues[`${col.id}__text`];
+                          // 2026-11-16: a mask ("1=PASS,0=FAIL") and text values.
+                          const masked = col.mask ? (parseValueMask(col.mask) || (() => null))(cell, txt) : null;
                           return (
                             <td key={`${idx}-${col.id}`}>
-                              {Number.isFinite(n) ? formatWidgetValue(cfg, n) : "-"}
+                              {masked !== null && masked !== undefined ? masked
+                                : Number.isFinite(n) ? formatWidgetValue(cfg, n)
+                                : (txt !== undefined && txt !== null && txt !== "" ? txt : "-")}
                             </td>
                           );
                         })}
@@ -5450,7 +5950,7 @@ const EnergyTariffsWidget = React.memo(EnergyTariffsWidgetImpl);
 //   * table  — table list (name / kWh / cost / share %)
 // Operator 2026-06-16. Wrapped in React.memo at bottom of file.
 function EnergyTariffsWidgetImpl({ widget, tagRowsByGateway }) {
-  const cfg = widget?.config || {};
+  const cfg = chartAggregationConfig(widget?.type, widget?.config);
   const gid = String(cfg.gateway_id || "");
   const mode = String(cfg.tariff_value_mode || "cost"); // cost | kwh
   const view = String(cfg.display_mode || "donut"); // donut | bars | table
@@ -5622,7 +6122,7 @@ function EnergyTariffsWidgetImpl({ widget, tagRowsByGateway }) {
 // in Scheduled Reports while quick triggers stay on the widget.
 // =====================================================================
 function ReportCardWidget({ widget }) {
-  const cfg = widget?.config || {};
+  const cfg = chartAggregationConfig(widget?.type, widget?.config);
   const templateId = String(cfg.report_template_id || "").trim();
   const viewMode = (() => {
     const m = String(cfg.report_view_mode || "").toLowerCase();

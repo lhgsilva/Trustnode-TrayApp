@@ -503,6 +503,7 @@ class ReportScheduler:
         reports_store,
         *,
         live_lookup: Callable[[str, str], float | None],
+        live_text_lookup: Callable[[str, str], str | None] | None = None,
         email_settings_lookup: Callable[[], dict[str, Any] | None] | None = None,
         is_any_gateway_running: Callable[[], bool] | None = None,
         tick_seconds: int = 15,
@@ -511,6 +512,7 @@ class ReportScheduler:
         self.runner = runner
         self.store = reports_store
         self.live_lookup = live_lookup
+        self.live_text_lookup = live_text_lookup
         self.email_settings_lookup = email_settings_lookup or (lambda: None)
         # Returns True when at least one PLC gateway is actively collecting.
         # Optional — schedules without `require_gateway_running` ignore this.
@@ -607,7 +609,7 @@ class ReportScheduler:
                 continue
 
     def _conditions_hit(self, conditions: list, logic: str, since: str,
-                        now_stamp: str) -> tuple[bool, str]:
+                        now_stamp: str, live_fallback: bool = True) -> tuple[bool, str]:
         """Were the conditions satisfied at any point since `since`?
 
         Returns (hit, when). `when` is the reading's OWN timestamp, so a cycle
@@ -654,6 +656,18 @@ class ReportScheduler:
                     hit_at = str(ts)
                     break
             if not hit_at:
+                # 2026-11-16: nothing stored since `since` (collection gated,
+                # or no new row yet) - the LIVE value still answers "is it
+                # true now". The 0 that ends a gated test is never stored.
+                ok_live = False
+                if live_fallback:
+                    try:
+                        ok_live, _ = _evaluate_tag_conditions([c], "all", self.live_lookup)
+                    except Exception:
+                        ok_live = False
+                if ok_live:
+                    hit_at = now_stamp
+            if not hit_at:
                 if str(logic or "all").strip().lower() == "all":
                     return False, ""          # one unmet condition ends it
                 continue
@@ -663,6 +677,56 @@ class ReportScheduler:
         # ALL -> satisfied once the LAST of them came true; ANY -> the first.
         when = max(firsts) if str(logic or "all").strip().lower() == "all" else min(firsts)
         return True, when
+
+    def _start_dropped_since(self, schedule: dict[str, Any], since: str, now_stamp: str) -> bool:
+        """Did the start condition read FALSE at some point since `since`?
+
+        2026-11-16: with start_edge, a new cycle waits for the start bit to
+        drop. That was asked of the LIVE value on the next tick - a part that
+        ended and the next one that began inside one 15 s tick looked like a
+        bit that never dropped, and the second part was merged or missed.
+        History says when it dropped, to the reading."""
+        conds = [c for c in (schedule.get("tag_conditions") or []) if isinstance(c, dict)]
+        if not conds or not self.history_lookup or not since:
+            return not self._start_true_now(schedule)
+        logic = str(schedule.get("condition_logic") or "all").strip().lower()
+        considered = 0
+        dropped_count = 0
+        for c in conds:
+            gw = str(c.get("gateway_id") or "").strip()
+            tag = str(c.get("tag_name") or c.get("tag") or "").strip()
+            if not tag:
+                continue
+            try:
+                rows = self.history_lookup(gw, tag, since, now_stamp) or []
+            except Exception:
+                rows = []
+            try:
+                threshold = float(c.get("value"))
+            except (TypeError, ValueError):
+                continue
+            second = c.get("value2")
+            try:
+                second = float(second) if second not in (None, "") else None
+            except (TypeError, ValueError):
+                second = None
+            dropped = False
+            for _ts, value in rows:
+                try:
+                    num = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if not _compare(num, str(c.get("operator") or ">="), threshold, second):
+                    dropped = True
+                    break
+            considered += 1
+            if dropped:
+                if logic == "all":
+                    return True       # one condition false = the set is false
+                dropped_count += 1
+        if considered and logic != "all" and dropped_count == considered:
+            return True               # ANY: every condition read false
+        return not self._start_true_now(schedule)
 
     def _start_true_now(self, schedule: dict[str, Any]) -> bool:
         """Is the start condition set satisfied by the LIVE values?
@@ -690,38 +754,58 @@ class ReportScheduler:
         The open cycle lives in the schedule row (`cycle_started_utc`), so a
         restart part-way through still closes against the real start time
         instead of inventing one.
+
+        2026-11-16: one tick may now open AND close a cycle, and open the
+        next - a test shorter than the 15 s tick, or two tests inside one
+        tick, used to merge or be missed. Each step continues from the last
+        boundary it found (a start or a stop time), up to a bound, so a tick
+        stays short.
         """
         sched_id = str(schedule.get("id") or "")
-        stamp = now_utc.strftime("%Y-%m-%d %H:%M:%S")
-        started = str(schedule.get("cycle_started_utc") or "").strip()
-
+        now_stamp = now_utc.strftime("%Y-%m-%d %H:%M:%S")
         since = self._last_seen.get(sched_id) or ""
-        self._last_seen[sched_id] = stamp
+        self._last_seen[sched_id] = now_stamp
+        schedule = dict(schedule)
+        for _step in range(20):
+            boundary = self._consider_cycle_once(schedule, now_stamp, since)
+            if not boundary or boundary >= now_stamp or boundary == since:
+                return
+            since = boundary
+
+    def _consider_cycle_once(self, schedule: dict[str, Any], stamp: str, since: str) -> str:
+        """One open-or-close step from `since`. Returns the boundary it found
+        (the start or stop time, in the store's stamp format) so the caller
+        can continue from there, or "" when nothing happened."""
+        sched_id = str(schedule.get("id") or "")
+        started = str(schedule.get("cycle_started_utc") or "").strip()
+        # start_edge=false is the explicit LEVEL mode kept from 2026-10-11:
+        # "no new reading since the tick" counts as the start being false and
+        # the cycle re-opens on the next tick. It keeps that exact behaviour.
+        legacy_level = schedule.get("start_edge") is False
         start_ok, start_at = self._conditions_hit(
             schedule.get("tag_conditions") or [],
-            schedule.get("condition_logic") or "all", since, stamp)
+            schedule.get("condition_logic") or "all", since, stamp,
+            live_fallback=not legacy_level)
 
         if not started:
-            # 2026-10-11, reported: "when a condifition is start rigger =1 but
-            # this keep on until is off". The cycle closed (its stop condition
-            # fired, or a stop-less cycle saw the start go false for one
-            # reading) while the start bit was STILL high, so the very next
-            # 15 s tick found a satisfying reading in history and opened
-            # another cycle - one physical run generating a report every
-            # quarter minute until the operator noticed.
-            #
-            # Rising edge: once a cycle has closed, the start set must be seen
-            # FALSE before it can open another. Set start_edge=false on the
-            # schedule for the old level-triggered behaviour.
+            # 2026-10-11, reported: "when a condition is start trigger =1 but
+            # this keeps on until it is off". The cycle closed while the start
+            # bit was STILL high, so the very next tick found a satisfying
+            # reading in history and opened another cycle. Rising edge: once a
+            # cycle has closed, the start set must be seen FALSE before it can
+            # open another (start_edge=false restores level triggering).
             if self._await_low.get(sched_id):
-                if self._start_true_now(schedule):
-                    return
+                if not self._start_dropped_since(schedule, since, stamp):
+                    return ""
                 self._await_low.pop(sched_id, None)
-                # The bit has only just dropped, so nothing read during this
-                # tick can be the next rising edge. Wait for the next one.
-                return
+                # The bit dropped - and may have risen again inside this same
+                # tick (a short part): the start hit found above counts only
+                # when it is AFTER the drop, which `since` guarantees for the
+                # next step; for this step, require a hit newer than the close.
             if not start_ok:
-                return
+                return ""
+            if not legacy_level and since and start_at and start_at <= since:
+                return ""             # a hit older than the last boundary is not a new rise
             # Stamp the cycle with the READING's time, not the tick's.
             stamp = start_at or stamp
             # Capture the identifier NOW: a serial or batch number read at the
@@ -729,43 +813,60 @@ class ReportScheduler:
             report_id = ""
             id_tag = str(schedule.get("id_tag") or "").strip()
             if id_tag:
-                # live_lookup is (gateway, tag) - the same contract the
-                # condition evaluator uses. An id tag may name its gateway
-                # explicitly, or come from the same gateway as the start
-                # condition.
                 id_gateway = str(schedule.get("id_gateway") or "").strip()
                 if not id_gateway:
                     first = (schedule.get("tag_conditions") or [{}])[0]
                     id_gateway = str((first or {}).get("gateway_id") or "").strip()
                 try:
-                    value = self.live_lookup(id_gateway, id_tag)
-                    report_id = "" if value is None else str(value).strip()
+                    # 2026-11-16: text first (a part number may be text), and
+                    # a whole number without ".0".
+                    txt = self.live_text_lookup(id_gateway, id_tag) if self.live_text_lookup else None
+                    if txt not in (None, ""):
+                        report_id = str(txt).strip()
+                    else:
+                        value = self.live_lookup(id_gateway, id_tag)
+                        if value is None:
+                            report_id = ""
+                        else:
+                            try:
+                                f = float(value)
+                                report_id = (str(int(f)) if f == int(f) else str(f)).strip()
+                            except (TypeError, ValueError):
+                                report_id = str(value).strip()
                 except Exception:
                     report_id = ""
-            # A new run starts with no segments; the first read of the
-            # segment tag opens the first one on the next tick.
             self.store.set_cycle_state(sched_id, stamp, report_id, segments_json="[]")
+            schedule["cycle_started_utc"] = stamp
+            schedule["cycle_report_id"] = report_id
+            schedule["cycle_segments"] = []
             logger.info("report cycle opened: schedule=%s at %s id=%r",
                      sched_id, stamp, report_id)
-            return
+            return stamp
 
         # While the cycle is open, watch the segment tag. Each new value closes
-        # the previous sub-period and opens the next - that is what turns "the
-        # second test repeated N times" into N windows the report can address.
+        # the previous sub-period and opens the next.
         segments = self._track_segment(schedule, sched_id, started, stamp)
 
         stop_conditions = schedule.get("stop_conditions") or []
         if not stop_conditions:
             # No stop condition means the START condition going false closes it.
-            stop_ok, stop_at = (not start_ok), stamp
+            # 2026-11-16: from history when there is any - the reading's time -
+            # else the tick's.
+            if legacy_level or not self.history_lookup:
+                stop_ok, stop_at = (not start_ok), stamp
+            else:
+                dropped = self._start_dropped_since(schedule, max(since, started), stamp)
+                stop_ok, stop_at = dropped, (self._first_false_at(schedule, max(since, started), stamp) or stamp)
         else:
             stop_ok, stop_at = self._conditions_hit(
                 stop_conditions, schedule.get("stop_condition_logic") or "all",
-                since, stamp)
+                max(since, started), stamp)
         if not stop_ok:
-            return
+            return ""
         # Close on the reading's own timestamp, so the window is the cycle.
         stamp = stop_at or stamp
+        if stamp < started:
+            return ""
 
         segments = self._close_segments(segments, stamp)
         # Arm the rising-edge guard unless the schedule opted out.
@@ -792,6 +893,48 @@ class ReportScheduler:
                 next_run_utc=None)
         except Exception:
             pass
+        schedule["cycle_started_utc"] = ""
+        schedule["cycle_report_id"] = ""
+        schedule["cycle_segments"] = []
+        return stamp
+
+    def _first_false_at(self, schedule: dict[str, Any], since: str, now_stamp: str) -> str:
+        """The first reading since `since` at which the start set is false
+        (logic ALL: any condition false), or "" when none / no history."""
+        conds = [c for c in (schedule.get("tag_conditions") or []) if isinstance(c, dict)]
+        if not conds or not self.history_lookup:
+            return ""
+        firsts: list[str] = []
+        for c in conds:
+            gw = str(c.get("gateway_id") or "").strip()
+            tag = str(c.get("tag_name") or c.get("tag") or "").strip()
+            if not tag:
+                continue
+            try:
+                rows = self.history_lookup(gw, tag, since, now_stamp) or []
+            except Exception:
+                rows = []
+            try:
+                threshold = float(c.get("value"))
+            except (TypeError, ValueError):
+                continue
+            second = c.get("value2")
+            try:
+                second = float(second) if second not in (None, "") else None
+            except (TypeError, ValueError):
+                second = None
+            for ts, value in rows:
+                try:
+                    num = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if not _compare(num, str(c.get("operator") or ">="), threshold, second):
+                    firsts.append(str(ts))
+                    break
+        if not firsts:
+            return ""
+        logic = str(schedule.get("condition_logic") or "all").strip().lower()
+        return min(firsts) if logic == "all" else max(firsts)
 
     def _segment_streams(self, schedule: dict[str, Any]) -> list[dict[str, str]]:
         """The tags that divide a run, one stream each.

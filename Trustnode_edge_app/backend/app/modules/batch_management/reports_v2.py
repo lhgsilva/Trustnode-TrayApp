@@ -142,23 +142,21 @@ def seed_report_templates() -> int:
     try:
         existing = {t.get("id"): t for t in rs.list_templates()}
     except Exception:
-        existing = {}
+        return 0          # cannot tell what exists: write nothing
+    # 2026-11-16, from the owner: never change an existing template, and an
+    # update never adds templates. So: only the FIRST time (none of the
+    # built-ins exists in this tenant) are they created - one the customer
+    # deleted is not put back - and an existing one is never re-saved. The
+    # old `elif` re-wrote a built-in's whole definition when `batch_scope`
+    # was missing, wiping the customer's edits.
+    if any(tpl_id in existing for tpl_id, _n, _d, _b in _SEED_SPECS):
+        return 0
     for tpl_id, name, desc, builder in _SEED_SPECS:
-        cur = existing.get(tpl_id)
-        if cur is None:
-            try:
-                rs.upsert_template({"id": tpl_id, "name": name, "description": desc, "definition": builder()})
-                created += 1
-            except Exception:
-                continue
-        elif not str(((cur.get("definition") or {}) or {}).get("batch_scope") or "").strip():
-            # backfill the batch_scope tag onto a template seeded before scoping
-            # so it classifies in the wizard dropdown (idempotent re-upsert).
-            try:
-                rs.upsert_template({"id": tpl_id, "name": cur.get("name") or name,
-                                    "description": cur.get("description") or desc, "definition": builder()})
-            except Exception:
-                continue
+        try:
+            rs.upsert_template({"id": tpl_id, "name": name, "description": desc, "definition": builder()})
+            created += 1
+        except Exception:
+            continue
     return created
 
 

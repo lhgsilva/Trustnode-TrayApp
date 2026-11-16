@@ -12,7 +12,25 @@ function norm(v) {
   return String(v ?? "").trim().toLowerCase();
 }
 
+// 2026-11-16, measured: at 5 000 points a chart widget spent ~130 ms per live
+// tick, most of it re-parsing the SAME timestamp strings (15 000 rows, several
+// passes) with a regex. A parsed string never changes, so remember it.
+const _TS_CACHE = new Map();
+const _TS_CACHE_MAX = 60000;
+
 export function toTsMs(value) {
+  if (typeof value === "string") {
+    const hit = _TS_CACHE.get(value);
+    if (hit !== undefined) return hit;
+    const ms = _toTsMsUncached(value);
+    if (_TS_CACHE.size >= _TS_CACHE_MAX) _TS_CACHE.clear();
+    _TS_CACHE.set(value, ms);
+    return ms;
+  }
+  return _toTsMsUncached(value);
+}
+
+function _toTsMsUncached(value) {
   if (typeof value === "number" && Number.isFinite(value)) {
     // Accept Unix seconds or milliseconds.
     return value < 1e12 ? value * 1000 : value;
@@ -160,6 +178,19 @@ export function getLatestTagRow(rows, gatewayId, tagName) {
   };
 }
 
+/** "Flow > 10", "Temp between 5 and 9", "Press (any)" - the legend entry of a
+ * rule the operator did not label (2026-11-16: every slice read "Item"). */
+export function describeRule(rule, idx = 0) {
+  const tag = String(rule?.tag_name || "").trim() || `Item ${idx + 1}`;
+  const op = String(rule?.operator || "any");
+  const v1 = String(rule?.value1 ?? "").trim();
+  const v2 = String(rule?.value2 ?? "").trim();
+  const sym = { eq: "=", ne: "≠", lt: "<", lte: "≤", gt: ">", gte: "≥" }[op];
+  if (sym && v1 !== "") return `${tag} ${sym} ${v1}`;
+  if (op === "between" && v1 !== "" && v2 !== "") return `${tag} ${v1}..${v2}`;
+  return tag;
+}
+
 function ruleMatch(value, op, v1, v2) {
   const n = toNum(value);
   const a = toNum(v1);
@@ -260,7 +291,7 @@ export function evaluateComputedRules(rows, rules, options = {}) {
     const metric = aggregate(matched.map((r) => r?.value), effectiveAgg);
     return {
       id: String(rule?.id || `rule-${idx + 1}`),
-      label: String(rule?.label || `Item ${idx + 1}`),
+      label: String(rule?.label || "").trim() || describeRule(rule, idx),
       value: Number.isFinite(Number(metric)) ? Number(metric) : 0,
       color: String(rule?.color || "#14a89a"),
       gateway_id: gatewayId,

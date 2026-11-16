@@ -263,7 +263,7 @@ check("the renderer calls the bounding function",
   /sorted = boundRowsToWindow\(/.test(WIDGETS),
   "the dataset is built without it");
 check("the window is a dependency of the rendered dataset",
-  /showGaps, trigWin\]/.test(WIDGETS),
+  /showGaps, trigWin(,|\])/.test(WIDGETS),
   "without this the chart would not redraw when a run starts");
 // 2026-10-30, reported with a screenshot: the window was configured and the
 // chart still showed two full cycles. "Time range: Last 15 minutes" - the

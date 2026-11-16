@@ -851,7 +851,17 @@ class ReportsStore:
         limit: int = 200,
         schedule_id: str | None = None,
         template_id: str | None = None,
+        from_utc: str | None = None,
+        to_utc: str | None = None,
+        column: str | None = None,
+        value: str | None = None,
+        schedule_name: str | None = None,
     ) -> list[dict[str, Any]]:
+        """2026-11-16: the generated reports ARE the test results - each cycle
+        run carries the values read at the time (meta.columns: Part #, Result
+        ...). Filters by date, by a column's value (a part number, PASS) and by
+        schedule name make "the last 5 tests of part X" and "today's results"
+        one read of this table."""
         tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
         lim = max(1, min(int(limit or 200), 2000))
         clauses = ["tenant_id = ?"]
@@ -862,6 +872,27 @@ class ReportsStore:
         if template_id:
             clauses.append("template_id = ?")
             params.append(str(template_id))
+        f_txt = self._norm_stamp(from_utc)
+        t_txt = self._norm_stamp(to_utc)
+        if f_txt:
+            clauses.append("created_utc >= ?")
+            params.append(f_txt)
+        if t_txt:
+            clauses.append("created_utc <= ?")
+            params.append(t_txt)
+        if schedule_name:
+            clauses.append("LOWER(COALESCE(schedule_name, '')) LIKE ?")
+            params.append("%" + str(schedule_name).strip().lower() + "%")
+        col = str(column or "").strip()
+        if col:
+            # meta_json.columns is {label: value}; a label may hold spaces.
+            path = '$.columns."%s"' % col.replace('"', "")
+            clauses.append("json_extract(meta_json, ?) IS NOT NULL")
+            params.append(path)
+            if value not in (None, ""):
+                clauses.append("LOWER(CAST(json_extract(meta_json, ?) AS TEXT)) LIKE ?")
+                params.append(path)
+                params.append("%" + str(value).strip().lower() + "%")
         sql = (
             "SELECT * FROM generated_reports WHERE "
             + " AND ".join(clauses)
@@ -871,6 +902,36 @@ class ReportsStore:
         with self._connect_read() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_generated(r) for r in rows]
+
+    @staticmethod
+    def _norm_stamp(value: Any) -> str:
+        """'2026-11-16T10:00:00Z' / '2026-11-16 10:00' -> 'YYYY-MM-DD HH:MM:SS' or ''."""
+        txt = str(value or "").strip()
+        if not txt:
+            return ""
+        txt = txt.replace("T", " ").replace("Z", "")
+        if "+" in txt[10:]:
+            txt = txt[: txt.index("+", 10)]
+        return (txt + ":00:00")[:19] if len(txt) >= 10 else ""
+
+    def export_generated_table(self, **filters) -> tuple[list[str], list[list[Any]]]:
+        """The filtered generated reports as one table: when, template,
+        schedule, state, file, and one column per stored result column (the
+        union of every row's meta.columns, in first-seen order)."""
+        rows = self.list_generated(**filters)
+        labels: list[str] = []
+        for g in rows:
+            for k in ((g.get("meta") or {}).get("columns") or {}).keys():
+                if k not in labels:
+                    labels.append(str(k))
+        header = ["Generated (UTC)", "Template", "Schedule", "State", "File", *labels]
+        body: list[list[Any]] = []
+        for g in rows:
+            cols = (g.get("meta") or {}).get("columns") or {}
+            body.append([str(g.get("created_utc") or "")[:19], str(g.get("template_name") or ""),
+                         str(g.get("schedule_name") or ""), str(g.get("render_state") or "ready"),
+                         str(g.get("file_name") or "")] + [cols.get(k, "") for k in labels])
+        return header, body
 
     def get_generated(self, generated_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
         tid = (tenant_id or get_current_tenant() or "default").strip() or "default"

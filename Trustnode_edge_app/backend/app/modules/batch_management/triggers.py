@@ -165,12 +165,37 @@ def _collect_watched_tags(batch_types: List[Dict[str, Any]]) -> Dict[str, Any]:
     return out
 
 
+def _gate_latest(tags: List[str]) -> Dict[str, tuple]:
+    """{tag: (value, ts_epoch)} from the collection gate's cache (every read,
+    stored or not) - see state._gate_cache_value. 2026-11-16."""
+    out: Dict[str, tuple] = {}
+    try:
+        from app.state import plc_manager as _pm
+        cache = getattr(_pm, "global_live_values", None) or {}
+        wanted = {str(t).lower(): str(t) for t in tags}
+        for key, entry in list(cache.items()):
+            tag = str(key).split("::", 1)[-1]
+            if tag.lower() in wanted and isinstance(entry, dict) and entry.get("value") is not None:
+                prev = out.get(wanted[tag.lower()])
+                ts = float(entry.get("ts_epoch") or 0)
+                if prev is None or ts > prev[1]:
+                    out[wanted[tag.lower()]] = (float(entry.get("value")), ts)
+    except Exception:
+        pass
+    return out
+
+
 def _latest_values(tags: List[str]) -> Dict[str, Any]:
     """Return the most-recent historian value per tag (across all DBs).
     Returns dict {tag: value} omitting tags with no data."""
     if not tags:
         return {}
     out: Dict[str, Any] = {}
+    # 2026-11-16: a stop bit whose 0 is never STORED (collection gated on the
+    # same bit) is still READ by the gate every cycle; it wins when newer.
+    gate = _gate_latest(tags)
+    for t, (v, _ts) in gate.items():
+        out[t] = v
     try:
         import sqlite3 as _sql
         # Reuse the scope helper from the intelligence module which

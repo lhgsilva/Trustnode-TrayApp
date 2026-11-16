@@ -1,4 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import DataFilterEditor from "../DataFilter/DataFilterEditor";
+import { cleanDataFilter, describeDataFilter } from "../DataFilter/dataFilter.js";
+import { axisBoundSource, AXIS_TAG_AGGS } from "./axisBounds.js";
 
 
 /* Stacking for dialogs opened FROM other dialogs.
@@ -83,7 +86,52 @@ function axesInUseFromConfig(cfg) {
 
 // One modal to configure every Y axis in use: label, prefix/unit/suffix,
 // decimals, value format, and the scale (auto or manual min/max/tick).
-function AxisConfigModal({ config, onChange, onClose, widgetValueFormat, widgetType }) {
+// 2026-11-16: one bound (Min / Max / Tick step) - Auto, Manual or a Tag.
+function AxisBoundField({ config, field, legacyMode, label, set, onChange, gatewayOptions }) {
+  const src = axisBoundSource(config, field, legacyMode);
+  const ref = String(config?.[`${field}_tag`] || "");
+  const cut = ref.indexOf("::");
+  const gw = cut >= 0 ? ref.slice(0, cut) : "";
+  const tag = cut >= 0 ? ref.slice(cut + 2) : ref;
+  const gwList = Array.isArray(gatewayOptions) ? gatewayOptions : [];
+  const tagsOf = (id) => (gwList.find((g) => g.id === id)?.tags || []);
+  return (
+    <label className="dashboard-query-field">
+      <span>{label}</span>
+      <div className="tn-bound-controls">
+      <select value={src} onChange={(e) => onChange({ [`${field}_src`]: e.target.value })}
+        title="Auto from the data, a fixed number, or a tag's value">
+        <option value="auto">Auto</option>
+        <option value="manual">Manual</option>
+        <option value="tag">Tag</option>
+      </select>
+      {src === "manual" ? (
+        <input type="number" step="any" value={config?.[field] ?? ""} placeholder="value"
+          onChange={(e) => set(field, e.target.value === "" ? "" : Number(e.target.value))} />
+      ) : null}
+      {src === "tag" ? (
+        <>
+          <select value={gw} onChange={(e) => onChange({ [`${field}_tag`]: `${e.target.value}::` })}>
+            <option value="">Gateway…</option>
+            {gwList.map((g) => <option key={g.id} value={g.id}>{g.name || g.id}</option>)}
+          </select>
+          <select value={tag} onChange={(e) => onChange({ [`${field}_tag`]: `${gw}::${e.target.value}` })}>
+            <option value="">Tag…</option>
+            {tagsOf(gw).map((t) => <option key={t} value={t}>{t}</option>)}
+            {tag && !tagsOf(gw).includes(tag) ? <option value={tag}>{tag}</option> : null}
+          </select>
+          <select value={String(config?.[`${field}_tag_agg`] || "latest")}
+            onChange={(e) => onChange({ [`${field}_tag_agg`]: e.target.value })}>
+            {AXIS_TAG_AGGS.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
+          </select>
+        </>
+      ) : null}
+      </div>
+    </label>
+  );
+}
+
+function AxisConfigModal({ config, onChange, onClose, widgetValueFormat, widgetType, gatewayOptions = [] }) {
   const isStacked = String(widgetType || "") === "stacked_trend";
   const used = axesInUseFromConfig(config);
   const shown = isStacked ? [] : AXIS_DEFS.filter((a) => used.has(a.id));
@@ -206,23 +254,13 @@ function AxisConfigModal({ config, onChange, onClose, widgetValueFormat, widgetT
                   </select>
                 </label>
               </div>
-              {/* Row 2 — scale */}
+              {/* Row 2 — scale: 2026-11-16, each bound on its own -
+                  Auto (from data), Manual (a number) or Tag (a tag's value). */}
               <div className="dashboard-query-grid" style={{ marginTop: 6 }}>
-                <label className="dashboard-query-field">
-                  <span>Scale</span>
-                  <select value={manual ? "manual" : "auto"}
-                    onChange={(e) => set(k.mode, e.target.value === "manual" ? "manual" : "auto")}>
-                    <option value="auto">Auto (from data)</option>
-                    <option value="manual">Manual (min / max / step)</option>
-                  </select>
-                </label>
-                {manual ? (
-                  <>
-                    {num(k.min, "Min", "")}
-                    {num(k.max, "Max", "")}
-                    {num(k.step, "Tick step", "auto", { min: 0 })}
-                  </>
-                ) : null}
+                {void manual}
+                <AxisBoundField config={config} field={k.min} legacyMode={k.mode} label="Min" set={set} onChange={onChange} gatewayOptions={gatewayOptions} />
+                <AxisBoundField config={config} field={k.max} legacyMode={k.mode} label="Max" set={set} onChange={onChange} gatewayOptions={gatewayOptions} />
+                <AxisBoundField config={config} field={k.step} legacyMode={k.mode} label="Tick step" set={set} onChange={onChange} gatewayOptions={gatewayOptions} />
               </div>
             </fieldset>
           );
@@ -325,6 +363,7 @@ const CHART_BUCKET_OPTIONS = [
   { value: "5m", label: "5 minutes" },
   { value: "15m", label: "15 minutes" },
   { value: "1h", label: "1 hour" },
+  { value: "custom", label: "Custom (seconds)" },
 ];
 const CHART_BUCKET_AGG_OPTIONS = [
   { value: "avg", label: "Average" },
@@ -801,6 +840,12 @@ function TableAdvancedColumns({ form, setForm, selectedGatewayTags, formatTagFor
                 >
                   {TABLE_ADV_AGGREGATIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
                 </select>
+                <input
+                  value={c.mask || ""}
+                  placeholder="mask: 1=PASS,0=FAIL"
+                  title={"Show a word instead of the value.\n1=PASS,0=FAIL   *=OTHER catches anything unlisted."}
+                  onChange={(e) => update(idx, { mask: e.target.value })}
+                />
               </>
             ) : c.source === "limit" ? (
               <>
@@ -907,6 +952,7 @@ function buildDefaultForm(type = "line_chart") {
       query_time_filter_preset: "none",
       query_time_filter_from: "",
       query_time_filter_to: "",
+      data_filter: null,
       query_table_columns: ["ts", "tag", "value"],
       compute_rules: [],
       pie_show_legend: true,
@@ -914,6 +960,7 @@ function buildDefaultForm(type = "line_chart") {
       pie_show_count: true,
       pie_show_percent: true,
       pie_legend_layout: "side",
+      pie_size: 100,
       chart_show_legend: false,
       chart_show_point_labels: false,
       chart_value_format: "auto",
@@ -1357,6 +1404,7 @@ export function DashboardDesigner({
   // type isn't known (see tagTypes.js). Never used for rendering.
   const tagRowsForTypes = Array.isArray(dataLogView) ? dataLogView : (Array.isArray(tagRows) ? tagRows : []);
   const [computedModalOpen, setComputedModalOpen] = useState(false);
+  const [dataFilterModalOpen, setDataFilterModalOpen] = useState(false);   // 2026-11-16
   const [resizingId, setResizingId] = useState("");
   const gridRef = useRef(null);
   const importInputRef = useRef(null);
@@ -1744,7 +1792,10 @@ export function DashboardDesigner({
         tag_name: unifiedCfg?.tag_name || "",
         readings_count: clamp(widget?.config?.readings_count ?? 120, 5, 5000),
         bucket_interval: CHART_BUCKET_OPTIONS.some((opt) => opt.value === widget?.config?.bucket_interval)
-          ? widget?.config?.bucket_interval : "none",
+          ? widget?.config?.bucket_interval
+          : (["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(String(widget?.type || ""))
+             && CHART_BUCKET_OPTIONS.some((opt) => opt.value !== "none" && opt.value === widget?.config?.query_group_interval)
+            ? widget?.config?.query_group_interval : "none"),
         bucket_aggregation: CHART_BUCKET_AGG_OPTIONS.some((opt) => opt.value === widget?.config?.bucket_aggregation)
           ? widget?.config?.bucket_aggregation : "avg",
         interpolation: CHART_INTERPOLATION_OPTIONS.some((opt) => opt.value === widget?.config?.interpolation)
@@ -1772,6 +1823,7 @@ export function DashboardDesigner({
           : "none",
         query_time_filter_from: String(widget?.config?.query_time_filter_from || ""),
         query_time_filter_to: String(widget?.config?.query_time_filter_to || ""),
+        data_filter: cleanDataFilter(widget?.config?.data_filter),
         query_table_columns: Array.isArray(widget?.config?.query_table_columns)
           ? widget.config.query_table_columns.filter((c) => TABLE_COLUMN_OPTIONS.some((opt) => opt.value === c))
           : ["ts", "tag", "value"],
@@ -1781,6 +1833,7 @@ export function DashboardDesigner({
         pie_show_count: parseBoolLike(widget?.config?.pie_show_count, true),
         pie_show_percent: parseBoolLike(widget?.config?.pie_show_percent, true),
         pie_legend_layout: parseLegendLayoutLike(widget?.config?.pie_legend_layout, "side"),
+        pie_size: Number.isFinite(Number(widget?.config?.pie_size)) && Number(widget?.config?.pie_size) > 0 ? Number(widget.config.pie_size) : 100,
         meter_show_legend: parseBoolLike(widget?.config?.meter_show_legend, true),
         meter_legend_layout: parseLegendLayoutLike(widget?.config?.meter_legend_layout, "side"),
         chart_show_legend: parseBoolLike(widget?.config?.chart_show_legend, false),
@@ -2155,6 +2208,7 @@ export function DashboardDesigner({
           : "none",
         query_time_filter_from: String(form?.config?.query_time_filter_from || ""),
         query_time_filter_to: String(form?.config?.query_time_filter_to || ""),
+        data_filter: cleanDataFilter(form?.config?.data_filter),
         query_table_columns: Array.isArray(form?.config?.query_table_columns)
           ? form.config.query_table_columns.filter((c) => TABLE_COLUMN_OPTIONS.some((opt) => opt.value === c))
           : ["ts", "tag", "value"],
@@ -2164,6 +2218,7 @@ export function DashboardDesigner({
         pie_show_count: parseBoolLike(form?.config?.pie_show_count, true),
         pie_show_percent: parseBoolLike(form?.config?.pie_show_percent, true),
         pie_legend_layout: parseLegendLayoutLike(form?.config?.pie_legend_layout, "side"),
+        pie_size: Number.isFinite(Number(form?.config?.pie_size)) && Number(form?.config?.pie_size) > 0 ? Math.max(40, Math.min(100, Number(form.config.pie_size))) : 100,
         meter_show_legend: parseBoolLike(form?.config?.meter_show_legend, true),
         meter_legend_layout: parseLegendLayoutLike(form?.config?.meter_legend_layout, "side"),
         chart_show_legend: parseBoolLike(form?.config?.chart_show_legend, false),
@@ -3096,11 +3151,15 @@ export function DashboardDesigner({
                               // Value KPI. Custom titles are kept.
                               const prevDefault = getWidgetMeta(prev.type)?.label || "";
                               const titleIsDefault = !prev.title || prev.title === prevDefault;
+                              // 2026-11-16, reported: changing the type of a
+                              // placed widget resized its card. An existing
+                              // widget keeps its size; only a new one takes
+                              // the type's default.
                               return {
                                 ...prev,
                                 type: t.key,
-                                w: t.defaultSize.w,
-                                h: t.defaultSize.h,
+                                w: editingId && Number.isFinite(Number(prev.w)) ? prev.w : t.defaultSize.w,
+                                h: editingId && Number.isFinite(Number(prev.h)) ? prev.h : t.defaultSize.h,
                                 title: titleIsDefault ? t.label : prev.title,
                               };
                             });
@@ -3228,8 +3287,13 @@ export function DashboardDesigner({
                       min="0.6"
                       max="2.5"
                       step="0.1"
-                      value={Number(form.config?.body_text_scale || 1).toFixed(1)}
+                      value={form.config?.body_text_scale ?? 1}
                       onChange={(e) =>
+                        setForm((p) => ({
+                          ...p,
+                          config: { ...p.config, body_text_scale: e.target.value },
+                        }))
+                      } onBlur={(e) =>
                         setForm((p) => ({
                           ...p,
                           config: { ...p.config, body_text_scale: clamp(e.target.value, 0.6, 2.5) },
@@ -3369,8 +3433,38 @@ export function DashboardDesigner({
                       >
                         <option value="rows">Historian rows (default)</option>
                         <option value="latest_per_tag">Latest per tag (one row per tag)</option>
+                        <option value="test_results">Test results (one row per generated report)</option>
                       </select>
                     </label>
+                    {String(form.config.table_mode || "rows") === "test_results" ? (
+                      <div className="row" style={{ flexWrap: "wrap", gap: 8, alignItems: "flex-end" }}>
+                        <label>
+                          Schedule name contains
+                          <input value={form.config.results_schedule_name || ""} placeholder="blank = every schedule"
+                            onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, results_schedule_name: e.target.value } }))} />
+                        </label>
+                        <label>
+                          Column
+                          <input value={form.config.results_column || ""} placeholder="e.g. Part #"
+                            onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, results_column: e.target.value } }))} />
+                        </label>
+                        <label>
+                          Value contains
+                          <input value={form.config.results_value || ""} placeholder="e.g. WO-4471"
+                            onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, results_value: e.target.value } }))} />
+                        </label>
+                        <label>
+                          Columns to show
+                          <input value={(form.config.results_columns || []).join(", ")} placeholder="blank = all (comma-separated)"
+                            onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, results_columns: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) } }))} />
+                        </label>
+                        <label>
+                          Rows
+                          <input type="number" min="1" max="500" value={form.config.list_limit ?? 20}
+                            onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, list_limit: e.target.value } }))} onBlur={(e) => setForm((p) => ({ ...p, config: { ...p.config, list_limit: Math.max(1, Math.min(500, Number(e.target.value) || 20)) } }))} />
+                        </label>
+                      </div>
+                    ) : null}
                     {String(form.config.table_mode || "rows") === "latest_per_tag" ? (
                       <label>
                         Calculation
@@ -3699,6 +3793,27 @@ export function DashboardDesigner({
                         {CHART_BUCKET_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
                       </select>
                     </label>
+                    {String(form.config.bucket_interval || "none") === "custom" ? (
+                      <label>
+                        Seconds
+                        <input type="number" min="1" max="86400" step="1"
+                          value={form.config.bucket_custom_seconds ?? ""}
+                          placeholder="e.g. 3"
+                          onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config,
+                            bucket_custom_seconds: e.target.value === "" ? "" : Math.max(1, Math.min(86400, Math.round(Number(e.target.value)) || 1)) } }))}
+                        />
+                      </label>
+                    ) : null}
+                    <label title="Label each point with this tag's value at that time - a part number per test, instead of the clock">
+                      X labels from tag
+                      <select
+                        value={form.config.x_label_tag || ""}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, x_label_tag: e.target.value } }))}
+                      >
+                        <option value="">Time</option>
+                        {selectedGatewayTags.map((t) => <option key={t} value={t}>{formatTagForDisplay ? formatTagForDisplay(t) : t}</option>)}
+                      </select>
+                    </label>
                     <label>
                       Using
                       <select
@@ -3953,7 +4068,7 @@ export function DashboardDesigner({
                       max="6"
                       step="1"
                       value={Number.isFinite(Number(form.config.value_decimals)) ? Number(form.config.value_decimals) : 3}
-                      onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, value_decimals: clamp(e.target.value, 0, 6) } }))}
+                      onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, value_decimals: e.target.value } }))} onBlur={(e) => setForm((p) => ({ ...p, config: { ...p.config, value_decimals: clamp(e.target.value, 0, 6) } }))}
                     />
                   </label>
                 ) : null}
@@ -4041,7 +4156,7 @@ export function DashboardDesigner({
                       min="1"
                       max="500"
                       value={form.config.list_limit}
-                      onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, list_limit: clamp(e.target.value, 1, 500) } }))}
+                      onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, list_limit: e.target.value } }))} onBlur={(e) => setForm((p) => ({ ...p, config: { ...p.config, list_limit: clamp(e.target.value, 1, 500) } }))}
                     />
                   </label>
                 ) : null}
@@ -4346,7 +4461,7 @@ export function DashboardDesigner({
                     min="5"
                     max="3600"
                     step="5"
-                    value={Number(carouselIntervalSec) || 30}
+                    value={carouselIntervalSec ?? 30}
                     onChange={(e) => {
                       const v = Number(e.target.value || 30);
                       setCarouselIntervalSec(Math.max(5, Math.min(3600, Number.isFinite(v) ? v : 30)));
@@ -4552,6 +4667,7 @@ export function DashboardDesigner({
       {axisModalOpen && form ? (
         <AxisConfigModal
           config={form.config || {}}
+          gatewayOptions={gatewayOptions}
           widgetType={form.type}
           widgetValueFormat={form.config?.chart_value_format || "auto"}
           onChange={(patch) => setForm((p) => ({ ...p, config: { ...p.config, ...patch } }))}
@@ -4573,6 +4689,21 @@ export function DashboardDesigner({
                 <div className="dashboard-query-grid">
                   <label className="dashboard-query-field">
                     <span>Time grouping</span>
+                    {/* 2026-11-16: for a chart this is the same setting as
+                        "Aggregate every" (one control, server-side buckets,
+                        2 s and Custom included); tables and KPIs keep their
+                        own grouping. */}
+                    {["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(form.type) ? (
+                      <select
+                        value={form.config.bucket_interval || "none"}
+                        title="Same setting as 'Aggregate every' on the chart"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, bucket_interval: e.target.value, query_group_interval: "none" } }))}
+                      >
+                        {CHART_BUCKET_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))}
+                      </select>
+                    ) : (
                     <select
                       value={form.config.query_group_interval || "none"}
                       onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, query_group_interval: e.target.value } }))}
@@ -4581,6 +4712,7 @@ export function DashboardDesigner({
                         <option key={opt.value} value={opt.value}>{opt.label}</option>
                       ))}
                     </select>
+                    )}
                   </label>
                   <label className="dashboard-query-field">
                     <span>Result aggregation</span>
@@ -4617,6 +4749,11 @@ export function DashboardDesigner({
                       onChange={(e) =>
                         setForm((p) => ({
                           ...p,
+                          config: { ...p.config, query_row_limit: e.target.value },
+                        }))
+                      } onBlur={(e) =>
+                        setForm((p) => ({
+                          ...p,
                           config: { ...p.config, query_row_limit: clamp(e.target.value, 10, 5000) },
                         }))
                       }
@@ -4632,6 +4769,14 @@ export function DashboardDesigner({
                       <option value="all">All conditions (AND)</option>
                     </select>
                   </label>
+                  <div className="dashboard-full-row dashboard-rules-summary">
+                    <div className="dashboard-rules-summary-text">
+                      Data filter: <strong>{describeDataFilter(form.config?.data_filter, (t) => (formatTagForDisplay ? formatTagForDisplay(t) : t)) || "none - every reading in the window"}</strong>
+                    </div>
+                    <button type="button" className="dashboard-type-btn" onClick={() => setDataFilterModalOpen(true)}>
+                      Open Data Filter
+                    </button>
+                  </div>
                   <label className="dashboard-query-field">
                     <span>Time filter</span>
                     <select
@@ -4695,6 +4840,19 @@ export function DashboardDesigner({
                         <option value="side">Side (vertically centered)</option>
                         <option value="bottom">Bottom (single centered row)</option>
                       </select>
+                    </label>
+                    <label className="dashboard-query-field">
+                      <span>Chart size (%)</span>
+                      <input
+                        type="number"
+                        min={40}
+                        max={100}
+                        step={5}
+                        value={form.config?.pie_size ?? 100}
+                        onChange={(e) =>
+                          setForm((p) => ({ ...p, config: { ...p.config, pie_size: e.target.value === "" ? "" : Number(e.target.value) } }))
+                        }
+                      />
                     </label>
                     {[
                       { key: "pie_show_legend", label: "Show legend" },
@@ -4899,8 +5057,13 @@ export function DashboardDesigner({
                           min="1"
                           max="8"
                           step="1"
-                          value={Number(form.config?.chart_line_width || 2)}
+                          value={form.config?.chart_line_width ?? 2}
                           onChange={(e) =>
+                            setForm((p) => ({
+                              ...p,
+                              config: { ...p.config, chart_line_width: e.target.value },
+                            }))
+                          } onBlur={(e) =>
                             setForm((p) => ({
                               ...p,
                               config: { ...p.config, chart_line_width: clamp(e.target.value, 1, 8) },
@@ -4936,8 +5099,13 @@ export function DashboardDesigner({
                           min="0"
                           max="120"
                           step="1"
-                          value={Number(form.config?.chart_bar_width ?? 0)}
+                          value={form.config?.chart_bar_width ?? 0}
                           onChange={(e) =>
+                            setForm((p) => ({
+                              ...p,
+                              config: { ...p.config, chart_bar_width: e.target.value },
+                            }))
+                          } onBlur={(e) =>
                             setForm((p) => ({
                               ...p,
                               config: { ...p.config, chart_bar_width: clamp(e.target.value, 0, 120) },
@@ -4952,8 +5120,13 @@ export function DashboardDesigner({
                           min="10"
                           max="100"
                           step="5"
-                          value={Number(form.config?.chart_bar_opacity ?? 100)}
+                          value={form.config?.chart_bar_opacity ?? 100}
                           onChange={(e) =>
+                            setForm((p) => ({
+                              ...p,
+                              config: { ...p.config, chart_bar_opacity: e.target.value },
+                            }))
+                          } onBlur={(e) =>
                             setForm((p) => ({
                               ...p,
                               config: { ...p.config, chart_bar_opacity: clamp(e.target.value, 10, 100) },
@@ -5126,8 +5299,8 @@ export function DashboardDesigner({
                                     min="0"
                                     max="120"
                                     step="1"
-                                    value={Number(row.bar_width ?? 0)}
-                                    onChange={(e) => update({ bar_width: clamp(e.target.value, 0, 120) })}
+                                    value={row.bar_width ?? 0}
+                                    onChange={(e) => update({ bar_width: e.target.value })} onBlur={(e) => update({ bar_width: clamp(e.target.value, 0, 120) })}
                                     title="Bar width (px, 0 = auto)"
                                   />
                                 );
@@ -5138,8 +5311,8 @@ export function DashboardDesigner({
                                   min="1"
                                   max="8"
                                   step="1"
-                                  value={Number(row.line_width ?? 2)}
-                                  onChange={(e) => update({ line_width: clamp(e.target.value, 1, 8) })}
+                                  value={row.line_width ?? 2}
+                                  onChange={(e) => update({ line_width: e.target.value })} onBlur={(e) => update({ line_width: clamp(e.target.value, 1, 8) })}
                                   title="Line thickness (1–8 px)"
                                 />
                               );
@@ -5378,6 +5551,16 @@ export function DashboardDesigner({
           </div>
         </div>
       ) : null}
+
+      <DataFilterEditor
+        open={dataFilterModalOpen}
+        onClose={() => setDataFilterModalOpen(false)}
+        value={form?.config?.data_filter}
+        onChange={(f) => setForm((p) => ({ ...p, config: { ...p.config, data_filter: f } }))}
+        gatewayOptions={gatewayOptions}
+        tagsForGateway={tagsForRuleGateway}
+        formatTagForDisplay={formatTagForDisplay}
+      />
 
       {computedModalOpen ? (
         <div className="modal-backdrop">

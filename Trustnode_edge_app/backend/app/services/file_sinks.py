@@ -61,6 +61,12 @@ def filter_rows(sink: Dict[str, Any], rows: Iterable[Dict[str, Any]]) -> List[Di
     """
     gateways = {str(g or "").strip() for g in (sink.get("gateway_filters") or []) if g}
     tags = {str(t or "").strip() for t in (sink.get("tag_filters") or []) if t}
+    # 2026-11-16: the data filter decides per cycle (gateway + timestamp),
+    # on every tag of the cycle, before the tag filter narrows the columns.
+    flt = sink.get("data_filter")
+    if isinstance(flt, dict) and flt.get("conditions"):
+        from app.services import historian_filter as _hf
+        rows = _hf.filter_rows(flt, list(rows))
     if not gateways and not tags:
         return list(rows)
     kept: List[Dict[str, Any]] = []
@@ -190,7 +196,7 @@ def row_values(row: Dict[str, Any], ts_local: str) -> List[Any]:
 
 def write_xlsx(file_path: str, rows: List[Dict[str, Any]], rollover: str,
                ts_local_of, now: datetime | None = None,
-               max_file_mb: float = 0) -> str:
+               max_file_mb: float = 0, sink: Dict[str, Any] | None = None) -> str:
     """Append rows to this period's workbook, creating it if needed.
 
     Returns the path actually written, so a caller can log which period the
@@ -204,6 +210,30 @@ def write_xlsx(file_path: str, rows: List[Dict[str, Any]], rollover: str,
                          rollover, now)
     rotate_if_too_big(path, max_file_bytes({"max_file_mb": max_file_mb}))
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # 2026-11-16: the workbook honours the sink's layout too - "wide" is one
+    # row per timestamp with a column per tag - and a STRING tag's text fills
+    # its cell (it was blank). A wide sheet whose header no longer fits the
+    # tags is moved aside, like the CSV.
+    wide = layout_of(sink or {}) == "wide"
+    header = header_for(sink or {}, rows) if wide else list(CANONICAL_HEADER)
+    if wide:
+        current = None
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            try:
+                _b = load_workbook(path, read_only=True)
+                current = [str(c.value) if c.value is not None else "" for c in next(_b.active.iter_rows(min_row=1, max_row=1))]
+                _b.close()
+            except Exception:
+                current = None
+        if current and len(current) >= 3 and current[:3] == header[:3] and not (set(header[3:]) - set(current[3:])):
+            header = current
+        elif current is not None:
+            stamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+            base, ext = os.path.splitext(path)
+            try:
+                os.replace(path, "%s.%s%s" % (base, stamp, ext))
+            except Exception:
+                pass
     if os.path.exists(path) and os.path.getsize(path) > 0:
         book = load_workbook(path)
         sheet = book.active
@@ -211,9 +241,18 @@ def write_xlsx(file_path: str, rows: List[Dict[str, Any]], rollover: str,
         book = Workbook()
         sheet = book.active
         sheet.title = "readings"
-        sheet.append(CANONICAL_HEADER)
-    for r in rows:
-        sheet.append(row_values(r, ts_local_of(str(r.get("ts_utc") or ""))))
+        sheet.append(header)
+    if wide:
+        filled = [dict(r, value=(r.get("value") if r.get("value") is not None else (r.get("value_text") or None)))
+                  for r in rows]
+        for values in shape_rows(sink or {}, filled, ts_local_of, header):
+            sheet.append(values)
+    else:
+        for r in rows:
+            vals = row_values(r, ts_local_of(str(r.get("ts_utc") or "")))
+            if vals[5] is None and r.get("value_text") not in (None, ""):
+                vals[5] = str(r.get("value_text"))
+            sheet.append(vals)
     # Write to a temporary file and replace, so a crash mid-save cannot leave
     # a half-written zip where the previous good workbook was.
     tmp = path + ".part"

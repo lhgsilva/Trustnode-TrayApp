@@ -283,6 +283,32 @@ class _EmailSettingsHolder:
 scheduler_email_settings_holder = _EmailSettingsHolder()
 
 
+def _gate_cache_value(gw: str, tag: str) -> tuple:
+    """(value, ts_epoch) from the collection gate's own cache, or (None, 0).
+
+    2026-11-16: when collection is gated ("collect only while Test_Running"),
+    the value that ENDS the gate - the 0 - is never written to the historian
+    nor to the live row cache (paused means nothing moves). The gate itself
+    keeps the last READ value of every trigger tag, written on every cycle
+    whether or not that cycle was stored. A stop condition on that tag is
+    answered from here, so a cycle report or a batch can close."""
+    try:
+        from app.state import plc_manager as _pm
+        cache = getattr(_pm, "global_live_values", None) or {}
+        key = "%s::%s" % (gw, tag)
+        entry = cache.get(key)
+        if not isinstance(entry, dict):
+            for k, v in cache.items():
+                if str(k).lower() == key.lower() and isinstance(v, dict):
+                    entry = v
+                    break
+        if isinstance(entry, dict) and entry.get("value") is not None:
+            return float(entry.get("value")), float(entry.get("ts_epoch") or 0)
+    except Exception:
+        pass
+    return None, 0.0
+
+
 def _scheduler_live_lookup(gateway_id: str, tag_name: str) -> float | None:
     """Latest value for (gateway_id, tag_name) using the live row cache.
 
@@ -293,6 +319,27 @@ def _scheduler_live_lookup(gateway_id: str, tag_name: str) -> float | None:
     tag = (tag_name or "").strip().lower()
     if not gw or not tag:
         return None
+    # The gate's cache is written on every read, stored or not; the live row
+    # cache only on a store. Whichever is newer answers.
+    gate_val, gate_ts = _gate_cache_value(gw, str(tag_name or "").strip())
+    if gate_val is not None:
+        try:
+            tenant = str(app_store._current_tenant_id() or "")
+            with app_store._live_cache_lock:
+                items = list(app_store._local_live_latest_cache.items())
+            newest_stored = 0.0
+            for (tnt, cache_gw, cache_tag), v in items:
+                if tnt == tenant and cache_gw == gw and str(cache_tag or "").strip().lower() == tag:
+                    from datetime import datetime as _dt, timezone as _tz
+                    try:
+                        raw = str(v.get("ts_utc") or v.get("ts") or "")[:19].replace("T", " ")
+                        newest_stored = _dt.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_tz.utc).timestamp()
+                    except Exception:
+                        newest_stored = 0.0
+            if gate_ts >= newest_stored:
+                return gate_val
+        except Exception:
+            return gate_val
     # 2026-11-03: one dictionary lookup under the cache's own lock. This
     # went through get_live_rows (a 2000-row list built on every tick, and
     # until today behind the historian writer's lock), so a held writer
@@ -323,6 +370,37 @@ def _scheduler_live_lookup(gateway_id: str, tag_name: str) -> float | None:
             return float(r.get("value"))
         except Exception:
             return None
+    return None
+
+
+def _scheduler_live_text_lookup(gateway_id: str, tag_name: str) -> str | None:
+    """2026-11-16: the id_tag of a cycle report as TEXT. The numeric lookup
+    above returns float(value), so a part number such as "WO-4471" came back
+    None and the report had no id; a numeric one printed as "76668.0". Text
+    when the cache row carries it, else the number without a trailing .0."""
+    gw = (gateway_id or "").strip()
+    tag = (tag_name or "").strip().lower()
+    if not gw or not tag:
+        return None
+    try:
+        tenant = str(app_store._current_tenant_id() or "")
+        with app_store._live_cache_lock:
+            items = list(app_store._local_live_latest_cache.items())
+        for (tnt, cache_gw, cache_tag), v in items:
+            if tnt == tenant and cache_gw == gw and str(cache_tag or "").strip().lower() == tag:
+                txt = v.get("value_text")
+                if txt not in (None, ""):
+                    return str(txt)
+                val = v.get("value")
+                if val in (None, ""):
+                    return None
+                try:
+                    f = float(val)
+                    return str(int(f)) if f == int(f) else str(f)
+                except Exception:
+                    return str(val)
+    except Exception:
+        pass
     return None
 
 
@@ -442,6 +520,7 @@ report_scheduler = ReportScheduler(
     runner=report_runner,
     reports_store=reports_store,
     live_lookup=_scheduler_live_lookup,
+    live_text_lookup=_scheduler_live_text_lookup,
     history_lookup=_scheduler_history_lookup,
     email_settings_lookup=scheduler_email_settings_holder.get,
     is_any_gateway_running=_is_any_gateway_running,

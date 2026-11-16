@@ -12,7 +12,24 @@ import {
   stopBatch,
   listBatchSummaries,
   bmv2ScanBatch,
+  bmv2ListBatches,
 } from "../../api";
+
+// 2026-11-16: these widgets read the LEGACY batch table (listBatches ->
+// /api/batch-management/batches), while the Batch pages write v2 (`batch`),
+// so a dashboard never showed a current batch. They read v2 now, and show
+// the v2 RESULT (quality_status) the way the Batch Overview does.
+const v2List = (params) => bmv2ListBatches(params);
+const v2Result = (b) => {
+  const q = String(b?.quality_status || "not_evaluated");
+  if (q === "within_specification") return { label: "PASSED", cls: "status-online", pass: true, fail: false };
+  if (q === "with_warnings") return { label: "PASSED (warnings)", cls: "status-warning", pass: true, fail: false };
+  if (q === "out_of_specification") return { label: "FAILED", cls: "status-offline", pass: false, fail: true };
+  if (q === "data_incomplete") return { label: "INCOMPLETE", cls: "status-warning", pass: false, fail: false };
+  return { label: "PENDING", cls: "status-warning", pass: false, fail: false };
+};
+const v2Id = (b) => b?.reference || b?.identifier || b?.id;
+const v2Who = (b) => b?.operator || b?.owner || b?.actor || "";
 import BarcodeScanInput from "./BarcodeScanInput";
 
 
@@ -82,7 +99,7 @@ function useBatchPolling(fetcher, deps = [], intervalMs = 5000) {
 export function BatchCurrentWidget({ widget }) {
   const cfg = widget?.config || {};
   const { data, unlicensed } = useBatchPolling(
-    () => listBatches({ status: "running", limit: 1 }),
+    () => v2List({ status: "running", limit: 1 }),
     [],
     3000,
   );
@@ -100,10 +117,10 @@ export function BatchCurrentWidget({ widget }) {
     <div className="widget-pad">
       <div className="widget-title">{cfg.title || "Current Batch"}</div>
       <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: 4, alignItems: "baseline" }}>
-        <strong>ID:</strong><span>{batch.identifier || batch.id}</span>
+        <strong>ID:</strong><span>{v2Id(batch)}</span>
         <strong>Status:</strong><span><StatusPill status={batch.status} /></span>
         <strong>Product:</strong><span>{batch.product || "—"}</span>
-        <strong>Operator:</strong><span>{batch.operator || "—"}</span>
+        <strong>Operator:</strong><span>{v2Who(batch) || "—"}</span>
         <strong>Started:</strong><span>{_fmt(batch.started_utc)}</span>
         <strong>Duration:</strong><span>{_humanDuration(_durationMs(batch.started_utc, batch.ended_utc))}</span>
       </div>
@@ -117,7 +134,7 @@ export function BatchListWidget({ widget }) {
   const cfg = widget?.config || {};
   const limit = Math.max(1, Math.min(Number(cfg.limit || 10), 50));
   const { data, unlicensed } = useBatchPolling(
-    () => listBatches({ limit }),
+    () => v2List({ limit }),
     [limit],
     8000,
   );
@@ -128,15 +145,15 @@ export function BatchListWidget({ widget }) {
       <div className="widget-title">{cfg.title || "Recent Batches"}</div>
       <div className="table" style={{ fontSize: 12 }}>
         <div className="thead">
-          <span>ID</span><span>Status</span><span>Started</span><span>Duration</span><span>Operator</span>
+          <span>ID</span><span>Status</span><span>Result</span><span>Started</span><span>Duration</span>
         </div>
         {rows.map((b) => (
           <div key={b.id} className="trow">
-            <span>{b.identifier || b.id}</span>
+            <span>{v2Id(b)}</span>
             <span><StatusPill status={b.status} /></span>
+            <span><span className={`status-pill ${v2Result(b).cls}`}>{v2Result(b).label}</span></span>
             <span>{_fmt(b.started_utc)}</span>
             <span>{_humanDuration(_durationMs(b.started_utc, b.ended_utc))}</span>
-            <span>{b.operator || "—"}</span>
           </div>
         ))}
         {rows.length === 0 ? <div className="trow"><span>No batches.</span></div> : null}
@@ -150,17 +167,18 @@ export function BatchListWidget({ widget }) {
 export function BatchKpiWidget({ widget }) {
   const cfg = widget?.config || {};
   const { data, unlicensed } = useBatchPolling(
-    () => listBatches({ limit: 200 }),
+    () => v2List({ limit: 200 }),
     [],
     15000,
   );
   if (unlicensed) return <div className="widget-empty">Batch module not licensed.</div>;
   const rows = data?.rows || [];
   const total = rows.length;
-  const completed = rows.filter((b) => b.status === "completed" || b.status === "validated").length;
-  const failed = rows.filter((b) => b.status === "failed").length;
+  const completed = rows.filter((b) => ["completed", "validated", "stopped"].includes(String(b.status || ""))).length;
+  const passed = rows.filter((b) => v2Result(b).pass).length;
+  const failed = rows.filter((b) => v2Result(b).fail).length;
   const running = rows.filter((b) => b.status === "running").length;
-  const passRate = total ? Math.round((completed / total) * 100) : 0;
+  const passRate = (passed + failed) ? Math.round((passed / (passed + failed)) * 100) : 0;
   const durations = rows
     .filter((b) => b.started_utc && b.ended_utc)
     .map((b) => _durationMs(b.started_utc, b.ended_utc));
@@ -172,7 +190,7 @@ export function BatchKpiWidget({ widget }) {
         <div><strong>Total:</strong> {total}</div>
         <div><strong>Running:</strong> {running}</div>
         <div><strong>Completed:</strong> {completed}</div>
-        <div><strong>Failed:</strong> {failed}</div>
+        <div><strong>Passed / Failed:</strong> {passed} / {failed}</div>
         <div><strong>Pass rate:</strong> {passRate}%</div>
         <div><strong>Avg cycle:</strong> {_humanDuration(avgDur)}</div>
       </div>
@@ -186,7 +204,7 @@ export function BatchTimelineWidget({ widget }) {
   const cfg = widget?.config || {};
   const limit = Math.max(5, Math.min(Number(cfg.limit || 20), 100));
   const { data, unlicensed } = useBatchPolling(
-    () => listBatches({ limit }),
+    () => v2List({ limit }),
     [limit],
     10000,
   );
@@ -218,8 +236,8 @@ export function BatchTimelineWidget({ widget }) {
           const left = ((startTimes[i] - t0) / span) * 100;
           const width = Math.max(0.5, ((endTimes[i] - startTimes[i]) / span) * 100);
           const color =
-            b.status === "completed" || b.status === "validated" ? "#2c8a4a" :
-            b.status === "failed" ? "#c0382b" :
+            v2Result(b).fail ? "#c0382b" :
+            v2Result(b).pass ? "#2c8a4a" :
             b.status === "running" ? "#2a7ab8" :
             "#888";
           return (

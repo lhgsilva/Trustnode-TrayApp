@@ -1,4 +1,5 @@
 import asyncio
+from app.services import historian_filter as _hf
 import json
 import logging
 import os
@@ -101,6 +102,86 @@ def _dist_stage():
         return str(_dist_health().get("stage") or "") or None
     except Exception:
         return None
+
+
+_FILE_SINK_ENGINES = ("csv_file", "txt_file", "xlsx_file")
+
+
+def _saved_sink(conn: Dict[str, Any]) -> Dict[str, Any]:
+    """A saved connection as the worker receives it - field for field what
+    the app's own Start payload sends (App.jsx toSink)."""
+    c = conn or {}
+
+    def _num(v: Any) -> float:
+        try:
+            return float(v or 0) or 0
+        except Exception:
+            return 0
+    return {
+        "id": str(c.get("id") or ""), "name": str(c.get("name") or ""), "engine": c.get("engine"),
+        "host": str(c.get("host") or ""), "port": int(_num(c.get("port"))),
+        "database": str(c.get("database") or ""), "username": str(c.get("username") or ""),
+        "password": c.get("password") or "", "sqlite_path": str(c.get("sqlite_path") or ""),
+        "file_path": str(c.get("file_path") or ""), "legacy_url": str(c.get("legacy_url") or ""),
+        "legacy_api_token": str(c.get("legacy_api_token") or ""), "source": str(c.get("source") or ""),
+        "site": str(c.get("site") or ""), "area": str(c.get("area") or ""),
+        "equipment": str(c.get("equipment") or ""), "schema": str(c.get("schema") or "public"),
+        "table": str(c.get("table") or "plc_readings"), "tls": bool(c.get("tls")),
+        "tag_filters": [str(t).strip() for t in (c.get("tag_filters") or []) if str(t or "").strip()],
+        "gateway_filters": [str(g).strip() for g in (c.get("gateway_filters") or []) if str(g or "").strip()],
+        "csv_format": str(c.get("csv_format") or ""), "csv_header": str(c.get("csv_header") or ""),
+        "export_interval_s": _num(c.get("export_interval_s")),
+        "rollover": str(c.get("rollover") or "none"), "layout": str(c.get("layout") or "long"),
+        "max_file_mb": _num(c.get("max_file_mb")),
+        # 2026-11-16: the data filter - a cycle is exported only when other
+        # tags read at the same time meet the conditions (historian_filter).
+        "data_filter": _hf.parse_filter(c.get("data_filter")),
+    }
+
+
+# 2026-11-16: a sink's data filter may name a tag of ANOTHER gateway; it is
+# read from the manager's live cache (the collection gate's own values).
+_LIVE_MANAGER: "PLCManager | None" = None
+
+
+def _live_value_of(gateway_id: str, tag: str) -> Any:
+    m = _LIVE_MANAGER
+    if m is None:
+        return None
+    entry = m.global_live_values.get(f"{gateway_id}::{tag}")
+    return entry.get("value") if isinstance(entry, dict) else None
+
+
+def saved_gateway_sinks(gw: Dict[str, Any], db_rows: List[Dict[str, Any]]) -> tuple:
+    """(primary_sink, all_sinks) for a gateway restarted from its SAVED config.
+
+    2026-11-16: the boot auto-resume and the supervisor each rebuilt the sink
+    by hand - the primary connection only, with layout, filters, row format,
+    rate and rollover reset - so after any restart a CSV export lost its
+    "one row per timestamp" layout and every PARALLEL export (a second CSV, a
+    SQLite copy) stopped receiving rows until someone pressed Start. This is
+    the app's own Start rule (buildGatewayRuntimePayload): the gateway's
+    connection, else the first SQLite, else the local default; plus every
+    enabled connection marked "use for gateways" that is a file or SQLite.
+    Each export keeps its own gateway/tag selection and layout."""
+    rows = [d for d in (db_rows or []) if isinstance(d, dict)]
+    db_id = str((gw or {}).get("database_id") or "")
+    primary = next((d for d in rows if str(d.get("id") or "") == db_id), None) if db_id else None
+    if primary is None:
+        primary = next((d for d in rows if str(d.get("engine") or "").lower() == "sqlite"), None)
+    if primary is None:
+        primary = {"id": "local-sqlite-default", "name": "Local SQLite", "engine": "sqlite",
+                   "sqlite_path": "./data/trustnode_app_store.db", "table": "plc_readings"}
+    sinks = [_saved_sink(primary)]
+    for d in rows:
+        if str(d.get("id") or "") == str(primary.get("id") or ""):
+            continue
+        if d.get("enabled") is False or d.get("use_gateway") is False:
+            continue
+        engine = str(d.get("engine") or "").lower()
+        if engine in _FILE_SINK_ENGINES or engine == "sqlite":
+            sinks.append(_saved_sink(d))
+    return sinks[0], sinks
 
 
 class GatewayWorker:
@@ -756,8 +837,13 @@ class GatewayWorker:
                 self.last_error = all_bad_msg or partial or None
                 persisted_local = False
                 persisted_edge_record_id: str | None = None
+                self._one_time_cycle = False
                 if self._collection_gate_cb:
                     collection_allowed, block_reason = self._collection_gate_cb(self.gateway_id, readings)
+                    _mgr = getattr(self._collection_gate_cb, "__self__", None)
+                    self._one_time_cycle = bool(
+                        collection_allowed and _mgr is not None
+                        and getattr(_mgr, "one_time_released", {}).get(self.gateway_id))
                 else:
                     collection_allowed, block_reason = self._is_collection_allowed(readings)
                 self.collection_blocked = not collection_allowed
@@ -881,7 +967,8 @@ class GatewayWorker:
                         # on; the persist keeps draining on its own pool and the
                         # historian buffer + outbox already hold the data.
                         await asyncio.wait_for(
-                            self._run_persist_io(self._persist_readings, readings),
+                            self._run_persist_io(self._persist_readings, readings,
+                                                 bool(getattr(self, "_one_time_cycle", False))),
                             timeout=max(5.0, self._read_timeout_s),
                         )
                     except asyncio.TimeoutError:
@@ -2965,7 +3052,7 @@ class GatewayWorker:
             row = rs.first()
             return int(row[0] if row else 0)
 
-    def _persist_readings(self, readings: List[GatewayReading]) -> None:
+    def _persist_readings(self, readings: List[GatewayReading], one_time: bool = False) -> None:
         if not readings or not self.db_sink:
             return
         engine = (self.db_sink.get("engine") or "").strip().lower()
@@ -3063,7 +3150,10 @@ class GatewayWorker:
             # the file to find. Rate 0 (the default) passes everything
             # through, so existing sinks are untouched.
             sink_readings = readings
-            if sink_engine in ("csv_file", "txt_file", "xlsx_file"):
+            # 2026-11-16: rows released by a one-time trigger edge are THE
+            # rows the operator asked for. An export interval held them, and
+            # the next edge then replaced them before they were written.
+            if sink_engine in ("csv_file", "txt_file", "xlsx_file") and not one_time:
                 sink_readings = _file_sinks.due_rows(
                     str(sink.get("id") or sink_label), sink, readings,
                     key_of=lambda r: (self.gateway_id,
@@ -3376,6 +3466,14 @@ class GatewayWorker:
             allowed_gws = {str(g or "").strip() for g in gateway_filters if g}
             if allowed_gws and str(gateway_id or "") not in allowed_gws:
                 return []
+        # 2026-11-16: the data filter decides on the WHOLE cycle (every tag
+        # the gateway read this time), before the tag filter narrows what is
+        # written. A cycle that fails writes nothing to this sink.
+        flt = sink.get("data_filter")
+        if isinstance(flt, dict) and flt.get("conditions"):
+            cycle = {str(r.tag_name or ""): r.value for r in readings}
+            if not _hf.cycle_passes(flt, cycle, str(gateway_id or ""), _live_value_of):
+                return []
         if tag_filters:
             allowed_tags = {str(t or "").strip() for t in tag_filters if t}
             if allowed_tags:
@@ -3462,6 +3560,7 @@ class GatewayWorker:
                     "gateway_name": str(getattr(self.config, "name", "") or ""),
                     "tag_name": r.tag_name,
                     "value": r.value,
+                    "value_text": getattr(r, "value_text", None),
                     "quality": r.quality,
                     "quality_label": r.quality_label,
                     "source": r.source,
@@ -3471,13 +3570,30 @@ class GatewayWorker:
             _file_sinks.write_xlsx(file_path, rows,
                                    str((sink or {}).get("rollover") or "daily"),
                                    _utc_str_to_local_iso,
-                                   max_file_mb=(sink or {}).get("max_file_mb") or 0)
+                                   max_file_mb=(sink or {}).get("max_file_mb") or 0,
+                                   sink=sink)
             return True
         except Exception as exc:
             self._mark_db_write_error(
                 f"XLSX sink '{sink_label}' write failed: {type(exc).__name__}: {exc}"
             )
             return False
+
+    def _write_csv_wide(self, sink: Dict[str, Any], readings: List[GatewayReading]) -> None:
+        """2026-11-16, reported: "arranged by timestamp per row is still not
+        showing the tags in different columns". The PLC writers never read
+        `layout`; only the power-meter path called file_sinks.write_csv, which
+        does. Wide files go through that one writer now (header = tag
+        columns, a new tag rotates the file, rollover and size limits apply).
+        A STRING tag fills its cell with its text."""
+        rows = []
+        for r in readings:
+            v = getattr(r, "value", None)
+            rows.append({"ts_utc": str(r.ts_utc or ""), "gateway_id": str(self.gateway_id or ""),
+                         "tag_name": str(r.tag_name or ""),
+                         "value": v if v is not None else (getattr(r, "value_text", "") or "")})
+        _file_sinks.write_csv(self._resolve_output_file_path((sink or {}).get("file_path") or "", "trustnode_log.csv"),
+                              sink or {}, rows, _utc_str_to_local_iso)
 
     def _persist_csv_file_for_sink(self, sink: Dict[str, Any], readings: List[GatewayReading]) -> bool:
         import csv
@@ -3487,6 +3603,13 @@ class GatewayWorker:
         sink_label = str((sink or {}).get("name") or (sink or {}).get("id") or "csv_file")
         custom_format = str((sink or {}).get("csv_format") or "").strip()
         custom_header = str((sink or {}).get("csv_header") or "").strip()
+        if not custom_format and _file_sinks.layout_of(sink or {}) == "wide":
+            try:
+                self._write_csv_wide(sink, filtered)
+                return True
+            except Exception as exc:                                 # noqa: BLE001
+                _GW_LOG.warning("csv wide write failed sink=%s: %s", sink_label, exc)
+                return False
         try:
             file_path = self._resolve_output_file_path((sink or {}).get("file_path") or "", "trustnode_log.csv")
             write_header = (not os.path.exists(file_path)) or os.path.getsize(file_path) == 0
@@ -3996,6 +4119,20 @@ class GatewayWorker:
     def _persist_csv_file(self, readings: List[GatewayReading]) -> bool:
         import csv
 
+        # 2026-11-16: the gateway's OWN CSV connection honours its layout and
+        # its tag/gateway selection too (it wrote every tag, one per row).
+        _sink = self.db_sink or {}
+        if (_file_sinks.layout_of(_sink) == "wide"
+                and not str(_sink.get("csv_format") or "").strip()):
+            try:
+                picked = self._filter_readings_for_sink(_sink, readings)
+                if picked:
+                    self._write_csv_wide(_sink, picked)
+                self._mark_db_write_success(len(readings))
+                return True
+            except Exception as exc:                                 # noqa: BLE001
+                _GW_LOG.warning("csv wide write failed (primary): %s", exc)
+                return False
         try:
             file_path = self._resolve_output_file_path((self.db_sink or {}).get("file_path") or "", "trustnode_log.csv")
             write_header = (not os.path.exists(file_path)) or os.path.getsize(file_path) == 0
@@ -4003,7 +4140,9 @@ class GatewayWorker:
                 writer = csv.writer(f)
                 if write_header:
                     writer.writerow(["ts_local", "ts_utc", "tag_name", "value", "value_text", "quality", "quality_label", "source", "site", "area", "equipment"])
-                for r in readings:
+                # 2026-11-16: the connection's own tag/gateway selection, as
+                # every parallel export already does (none set = every row).
+                for r in self._filter_readings_for_sink(_sink, readings):
                     writer.writerow([
                         _utc_str_to_local_iso(r.ts_utc),
                         r.ts_utc,
@@ -4425,7 +4564,11 @@ class PLCManager:
         self.global_collection_triggers: List[Dict[str, Any]] = []
         self.global_collection_trigger_mode: str = "any"
         self.global_live_values: Dict[str, Dict[str, Any]] = {}
+        global _LIVE_MANAGER
+        _LIVE_MANAGER = self
         self.global_trigger_latches: Dict[str, bool] = {}
+        # gateway id -> "this cycle was released by a one-time trigger edge"
+        self.one_time_released: Dict[str, bool] = {}
         self.global_collection_allowed: bool = True
         self.global_collection_reason: str | None = None
         # Operator 2026-06-23: per-gateway watchdog. A single asyncio
@@ -4680,7 +4823,8 @@ class PLCManager:
         self.global_collection_triggers = merged
         self.global_collection_trigger_mode = mode
         # Drop stale latches that do not belong to current trigger set.
-        self.global_trigger_latches = {k: v for k, v in self.global_trigger_latches.items() if k in keep_latches}
+        self.global_trigger_latches = {k: v for k, v in self.global_trigger_latches.items()
+                                       if k.split("##", 1)[-1] in keep_latches}
         # Recompute gate immediately when trigger set changes.
         self._evaluate_global_collection_gate("", [])
 
@@ -4734,9 +4878,17 @@ class PLCManager:
             mode = "any"
         evaluated = 0
         satisfied = 0
+        one_time_fired = False
         schedule_reasons: List[str] = []
         for tr in triggers:
             trig_gid = str(tr.get("gateway_id") or "").strip()
+            # 2026-11-16: "*" / "all" is a scope ("every gateway"), not a
+            # gateway id. It was looked up as the key "*::Tag", which never
+            # exists, so an All-gateways tag rule never evaluated and kept the
+            # gateway paused forever. A wildcard rule reads the tag of the
+            # gateway being evaluated, else the first gateway that has it.
+            if trig_gid in ("*", "all", "ALL"):
+                trig_gid = ""
 
             # A SCHEDULE rule needs no tag and no live value - it asks the
             # clock. Evaluated through the same gate as a tag rule so both
@@ -4762,6 +4914,10 @@ class PLCManager:
                 if isinstance(entry, dict):
                     value = entry.get("value")
                     value_ts = entry.get("ts_epoch")
+            elif gid and isinstance(self.global_live_values.get(f"{gid}::{tag}"), dict):
+                entry = self.global_live_values.get(f"{gid}::{tag}")
+                value = entry.get("value")
+                value_ts = entry.get("ts_epoch")
             else:
                 for k, entry in self.global_live_values.items():
                     if k.endswith(f"::{tag}"):
@@ -4771,7 +4927,7 @@ class PLCManager:
                         break
             if value is None:
                 continue
-            worker = self.workers.get(trig_gid) if trig_gid else None
+            worker = self.workers.get(trig_gid or gid) if (trig_gid or gid) else None
             interval_ms = max(200, int(getattr(worker.config, "interval_ms", 1000) if worker else 1000))
             stale_after_sec = max(5.0, (interval_ms / 1000.0) * 4.0)
             if value_ts is None or (now_epoch - float(value_ts)) > stale_after_sec:
@@ -4781,11 +4937,19 @@ class PLCManager:
             trigger_type = str(tr.get("trigger_type") or "continuous").strip().lower()
             trigger_key = str(tr.get("trigger_key") or f"{trig_gid}|{tag}|{tr.get('operator')}|{tr.get('value')}|continuous")
             if trigger_type == "one_time":
-                was_true = bool(self.global_trigger_latches.get(trigger_key, False))
+                # 2026-11-16: the rising edge belongs to the GATEWAY being
+                # evaluated. One shared latch let any other evaluation use the
+                # edge up - the dry run on every save/start/stop above all -
+                # so the gateway that should log "once when it becomes true"
+                # never saw it. A dry run (no gateway) never moves a latch.
+                latch_key = f"{gid or '-'}##{trigger_key}"
+                was_true = bool(self.global_trigger_latches.get(latch_key, False))
                 fired = bool(cur_ok and not was_true)
-                self.global_trigger_latches[trigger_key] = bool(cur_ok)
+                if gid:
+                    self.global_trigger_latches[latch_key] = bool(cur_ok)
                 if fired:
                     satisfied += 1
+                    one_time_fired = True
             elif cur_ok:
                 satisfied += 1
 
@@ -4805,6 +4969,14 @@ class PLCManager:
         # whether the gateway is broken.
         if not allowed and schedule_reasons:
             reason = "%s %s" % (reason or "", schedule_reasons[0])
+        if gid:
+            # Read by the worker for THIS cycle: rows released by a one-time
+            # edge are written at once, never held by an export interval.
+            _otr = getattr(self, "one_time_released", None)
+            if _otr is None:
+                _otr = {}
+                self.one_time_released = _otr
+            _otr[gid] = bool(allowed and one_time_fired)
 
         # The GLOBAL flags describe the whole site (the footer reads them), so
         # only a rule that gates everything may set them. A rule scoped to one
@@ -5795,11 +5967,14 @@ class PLCManager:
                 schedule_stop=str(gw.get("schedule_stop") or "18:00"),
                 auto_recover_enabled=bool(gw.get("auto_recover_enabled")),
             )
+            # 2026-11-16: the full saved sinks - every parallel export, each
+            # with its layout and filters - not the primary alone.
+            sink, _all_sinks = saved_gateway_sinks(gw, list(db_by_id.values()))
             await self.start_gateway(
                 gateway_id=gateway_id,
                 config=config,
                 db_sink=sink,
-                db_sinks=[sink] if sink else [],
+                db_sinks=_all_sinks,
             )
             try:
                 import logging
@@ -5860,18 +6035,15 @@ class PLCManager:
         db_sink: Dict[str, Any] | None,
         db_sinks: List[Dict[str, Any]] | None = None,
     ) -> None:
-        # Keep runtime deterministic: only one active worker per physical endpoint.
-        # Duplicate workers on the same PLC endpoint produce visible chart jitter/noise.
-        target_key = self._endpoint_key(config)
-        stale_workers: List[str] = []
-        for existing_id, existing_worker in list(self.workers.items()):
-            if existing_id == gateway_id:
-                continue
-            existing_key = self._endpoint_key(existing_worker.config)
-            if target_key[1] and existing_key == target_key:
-                stale_workers.append(existing_id)
-        for stale_id in stale_workers:
-            await self.stop_gateway(stale_id)
+        # 2026-11-16, from the owner: two gateways on the SAME PLC address (one
+        # exporting to CSV, one to the database) must each have their own
+        # start and stop, "even if it would be duplicating some information".
+        # Starting one used to silently STOP the other ("only one worker per
+        # physical endpoint"), and since the eviction never marked the other
+        # as user-stopped, the supervisor restarted it - which evicted the
+        # first: the two swapped about every 30 s. Every worker is keyed by
+        # its own gateway id and holds its own connection, so two can read
+        # one PLC side by side; each writes its rows under its own gateway id.
 
         # 2026-07-19 RECOVERY FIX: if a worker already exists but is NOT
         # cleanly running (watchdog cooled it down after a PLC power-cycle, a
