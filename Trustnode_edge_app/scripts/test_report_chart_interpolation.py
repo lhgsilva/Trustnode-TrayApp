@@ -51,7 +51,9 @@ from app.state import app_store                                   # noqa: E402
 from app.services.report_renderer import (                        # noqa: E402
     _section_chart, _build_styles, _interpolate, _thin_evenly,
     norm_interpolation, CHART_INTERPOLATIONS)
-from reportlab.graphics.shapes import Drawing, Group, Line         # noqa: E402
+from reportlab.graphics.shapes import Drawing, Group, Line, PolyLine  # noqa: E402
+# 2026-11-17: series have been drawn as ONE PolyLine per series since
+# 2026-11-02; counting Line shapes alone measured nothing since then.
 
 print("TrustNode - chart interpolation and equal samples for equal triggers")
 print()
@@ -212,6 +214,8 @@ def segments(section):
                 walk(sh)
             elif isinstance(sh, Line) and not sh.strokeDashArray and sh.strokeWidth > 0.5:
                 n += 1
+            elif isinstance(sh, PolyLine) and not sh.strokeDashArray and sh.strokeWidth > 0.5:
+                n += max(0, len(sh.points) // 2 - 1)
 
     for f in story:
         if isinstance(f, Drawing):

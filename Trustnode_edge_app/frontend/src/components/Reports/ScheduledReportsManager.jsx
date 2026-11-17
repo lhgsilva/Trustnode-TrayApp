@@ -477,6 +477,8 @@ function emptySchedule(templateId = "") {
     stop_conditions: [],
     stop_condition_logic: "all",
     start_edge: true,
+    cycle_end: "",
+    start_drop: "",
     id_tag: "",
     segment_tag: "",
     file_name_pattern: "",
@@ -1429,6 +1431,39 @@ export function ScheduledReportsManager({
                       />
                       Only re-open on a new rising edge
                     </label>
+                    {/* 2026-11-17, from the owner: start and stop as a held
+                        signal or a pulse, one tag or two, and what a start
+                        that drops before the stop means. Both triggers react
+                        to turning TRUE: a stop still true from the last part
+                        must go false and back before it ends a new cycle. */}
+                    <div className="schedule-form-grid">
+                      <label>
+                        The cycle ends
+                        <select
+                          value={draft.cycle_end || ""}
+                          title="How a running cycle is closed."
+                          onChange={(e) => setDraft((p) => ({ ...p, cycle_end: e.target.value }))}
+                        >
+                          <option value="">Automatic: the stop conditions if set, else the start going false</option>
+                          <option value="start_false">When the start goes false (one signal held while running)</option>
+                          <option value="stop">When the stop conditions turn true (a separate signal)</option>
+                          <option value="next_start">At the next start pulse (one tag: pulse to start, pulse to stop)</option>
+                        </select>
+                      </label>
+                      <label>
+                        If the start goes false before the stop
+                        <select
+                          value={draft.start_drop || ""}
+                          disabled={!((draft.stop_conditions || []).length) || ["start_false", "next_start"].includes(draft.cycle_end)}
+                          title="Only with stop conditions. A start pulse that drops at once is normal: keep running."
+                          onChange={(e) => setDraft((p) => ({ ...p, start_drop: e.target.value }))}
+                        >
+                          <option value="">Keep running until the stop</option>
+                          <option value="end">End the cycle there and make the report</option>
+                          <option value="discard">Discard the cycle (no report)</option>
+                        </select>
+                      </label>
+                    </div>
                     <div className="schedule-form-grid">
                       <label>
                         Report ID tag
@@ -1866,7 +1901,13 @@ export function ScheduledReportsManager({
                       <td>{g.schedule_name || "-"}</td>
                       <td>{g.triggered_by || "-"}</td>
                       <td title={g.render_error || ""}>
-                        {String(g.render_state || "ready") === "pending"
+                        {/* 2026-11-17: a cycle is listed from its start as
+                            "Collecting"; a discarded one as "Cancelled". */}
+                        {String(g.render_state || "ready") === "collecting"
+                          ? <span className="muted">Collecting…</span>
+                          : String(g.render_state || "ready") === "cancelled"
+                            ? <span className="muted">Cancelled</span>
+                            : String(g.render_state || "ready") === "pending"
                           ? <span className="muted">Generating…</span>
                           : String(g.render_state || "ready") === "failed"
                             ? <span className="warn">Failed</span>
@@ -1912,7 +1953,7 @@ export function ScheduledReportsManager({
                             title={isRowBusy(g.id, "regen") ? "Starting…" : "Rebuild the PDF for the same window"}
                             aria-label="Regenerate"
                             aria-busy={isRowBusy(g.id, "regen")}
-                            disabled={String(g.render_state || "ready") === "pending" || isRowBusy(g.id, "regen")}
+                            disabled={["pending", "collecting", "cancelled"].includes(String(g.render_state || "ready")) || isRowBusy(g.id, "regen")}
                             onClick={() => handleRegenerateGenerated(g)}
                           >
                             <IconRefresh />

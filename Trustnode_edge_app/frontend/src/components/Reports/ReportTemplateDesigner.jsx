@@ -226,7 +226,7 @@ const SERIES_CHART_KINDS = [
 // sample (current behaviour). Anything else groups samples into fixed
 // epoch-aligned buckets and applies each series' aggregation.
 const BUCKET_SIZES = [
-  { value: "raw", label: "Raw samples" },
+  { value: "raw", label: "Raw samples (no grouping)" },
   { value: "2s",  label: "2 seconds" },
   { value: "5s",  label: "5 seconds" },
   { value: "10s", label: "10 seconds" },
@@ -2068,6 +2068,28 @@ function SectionTrigger({ section, onChange, gatewayOptions, tagList,
               covers the window the schedule's own start/end trigger
               produced, and the section caption says so - rather than
               printing an empty chart or inventing a 24h range. */}
+          {/* 2026-11-17: the same start / stop rules as the schedule's
+              cycle - a held signal or a pulse, one tag or two. The stop
+              reacts to turning TRUE after the start. */}
+          <label className="tn-inline-label" title="How this section's period ends.">
+            The section ends
+            <select value={trigger.end || ""}
+                    onChange={(e) => setTrigger({ ...trigger, end: e.target.value })}>
+              <option value="">Automatic: the stop if set, else the start going false</option>
+              <option value="start_false">When the start goes false (held signal)</option>
+              <option value="stop">When the stop turns true</option>
+              <option value="next_start">At the next start pulse (one pulsed tag)</option>
+            </select>
+          </label>
+          <label className="tn-inline-label" title="Only with a stop condition.">
+            If the start drops before the stop
+            <select value={trigger.start_drop || ""}
+                    onChange={(e) => setTrigger({ ...trigger, start_drop: e.target.value })}>
+              <option value="">Keep going until the stop</option>
+              <option value="end">End the section there</option>
+              <option value="discard">Skip that run, use the next one</option>
+            </select>
+          </label>
           <label className="tn-inline-label" title="What to do when this trigger never becomes true inside the report window.">
             If it never fires
             <select value={trigger.on_miss || "window"}
@@ -3417,7 +3439,7 @@ function SectionEditor({
                 <select
                   value={section.bucket || "raw"}
                   onChange={(e) => onChange({ bucket: e.target.value })}
-                  title="Summarise samples per minute / hour / day. Each series applies its own aggregation inside the bucket."
+                  title="Raw samples: every reading of the time range, never averaged (a window holding more than 20 000 readings per series is drawn as the low and high reading of short intervals - the caption says so). Any other choice groups the readings and applies each series' own Aggregation inside each group."
                 >
                   {BUCKET_SIZES.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
                 </select>

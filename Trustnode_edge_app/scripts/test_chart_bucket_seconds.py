@@ -142,10 +142,14 @@ def main() -> int:
     raw3h = {"type": "line_chart", "title": "raw 3 h", "readings_count": 5000,
              "time_range": {"preset": "custom", "from_utc": a, "to_utc": b}, "series": [ser("Temp")]}
     meta, aligned = rr._fetch_multi_series(raw3h)
-    check("a raw section over 3 h is bucketed at 2 s, not at 1 minute",
-          5390 <= len(aligned[0]) <= 5401, "%d points" % len(aligned[0]))
-    check("  and the section carries a caption saying so",
-          "averaged every 2s" in str(raw3h.get("_auto_bucket_note") or ""), repr(raw3h.get("_auto_bucket_note")))
+    # 2026-11-17, from the owner: "it is aggregating automatically without
+    # any instructions". A raw section over 3 h at 1 Hz (10 800 readings,
+    # under the per-series cap) is every reading of the window, unaveraged.
+    check("a raw section over 3 h is every reading, never averaged",
+          10790 <= len(aligned[0]) <= 10801 and not raw3h.get("_auto_bucket_note"),
+          "%d points, note %r" % (len(aligned[0]), raw3h.get("_auto_bucket_note")))
+    check("  and a window over the cap says how it is drawn (no averaging)",
+          "nothing averaged" in inspect.getsource(rr._bucketed_or_raw_rows))
     check("  which the chart prints", '_fetch_section.get("_auto_bucket_note")' in inspect.getsource(rr._section_chart))
     raw1h = {"type": "line_chart", "title": "raw 1 h", "readings_count": 5000,
              "time_range": {"preset": "custom", "from_utc": _ts(start), "to_utc": _ts(start + 3599)},

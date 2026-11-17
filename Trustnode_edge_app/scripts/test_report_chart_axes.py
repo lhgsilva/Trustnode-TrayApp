@@ -148,7 +148,9 @@ check("  two are left of the plot and two right",
 
 print()
 print("[the legend accounts for every series]")
-for want in ("Pressure", "Temperature (L2)", "Flow (R)", "Power (R2)"):
+# 2026-11-17: the legend names the series; the "(L2)"/"(R)" suffix was
+# dropped on purpose (each axis carries its own title and unit).
+for want in ("Pressure", "Temperature", "Flow", "Power"):
     check("  %s" % want, want in texts,
           "the legend used to `break` on running out of width and drop series")
 
@@ -183,6 +185,8 @@ def shape_counts(stype):
     sec["type"] = stype
     story: list = []
     _section_chart(sec, _build_styles(), story)
+# 2026-11-17: series have been drawn as ONE PolyLine per series since
+# 2026-11-02; counting Line shapes alone measured nothing since then.
     counts = {"Line": 0, "Rect": 0, "Polygon": 0}
 
     def walk(o):
@@ -190,6 +194,8 @@ def shape_counts(stype):
             n = type(sh).__name__
             if n in counts:
                 counts[n] += 1
+            if n == "PolyLine":
+                counts["Line"] += max(0, len(sh.points) // 2 - 1)
             if isinstance(sh, (Group, Drawing)):
                 walk(sh)
     for f in story:

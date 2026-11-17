@@ -54,7 +54,9 @@ from app.state import app_store                                  # noqa: E402
 from app.services.report_renderer import (                       # noqa: E402
     _section_chart, _build_styles, _empty_chart_reason, _NEVER)
 from reportlab.graphics.shapes import (                          # noqa: E402
-    Circle, Drawing, Group, Line, Rect, String)
+    Circle, Drawing, Group, Line, PolyLine, Rect, String)
+# 2026-11-17: series have been drawn as ONE PolyLine per series since
+# 2026-11-02; counting Line shapes alone measured nothing since then.
 
 print("TrustNode - chart ticks, thickness, legend and thin data")
 print()
@@ -192,7 +194,7 @@ print("[line thickness]")
 
 def widths(section):
     return sorted({round(s.strokeWidth, 2) for s in shapes_of(section)
-                   if isinstance(s, Line) and not s.strokeDashArray
+                   if isinstance(s, (Line, PolyLine)) and not s.strokeDashArray
                    and s.strokeWidth and s.strokeWidth > 0.5})
 
 
@@ -286,12 +288,13 @@ check("  and a real render uses it",
       paragraph_texts(nothing))
 
 print()
-print("[a section whose trigger fell back says so]")
+print("[a section whose trigger fell back prints no note]")
+# 2026-11-17, from the owner: the "section trigger did not fire; showing the
+# report window" note "should not be shown". The section covers the report's
+# window, as configured ("If it never fires: use the report's own window").
 fell = dict(SECTION, _trigger_fell_back=True)
-check("the caption admits the window is not the section's",
-      any("section trigger did not fire" in c for c in paragraph_texts(fell)),
-      "charting the report's window under a section titled 'Heating phase' "
-      "without saying so is a wrong report, not a fallback")
+check("a fallen-back section prints no trigger note",
+      not any("did not fire" in c for c in paragraph_texts(fell)), paragraph_texts(fell))
 check("  and an ordinary section says nothing of the kind",
       not any("did not fire" in c for c in paragraph_texts(SECTION)))
 
@@ -316,7 +319,7 @@ check("  and removes the timestamps",
       [t for t in off if "-" in t and ":" in t])
 check("  the series are still drawn",
       len([s_ for s_ in shapes_of(dict(SECTION, show_x_axis=False))
-           if isinstance(s_, Line) and not s_.strokeDashArray]) > 10,
+           if isinstance(s_, (Line, PolyLine)) and not s_.strokeDashArray]) >= 1,
       "hiding an axis must not hide the data")
 
 
@@ -388,7 +391,7 @@ check("  and the plot gets the width back",
       "a hidden column must not leave a blank margin")
 check("  the series are still drawn",
       len([x for x in shapes_of(_v_off)
-           if isinstance(x, Line) and not x.strokeDashArray]) > 10)
+           if isinstance(x, (Line, PolyLine)) and not x.strokeDashArray]) >= 1)
 _all_off = dict(SECTION, y_axis_show_values=False, y_axis_right_show_values=False)
 check("  both axes' numbers can go", len(tick_columns(_all_off)) == 0,
       tick_columns(_all_off))
@@ -419,14 +422,14 @@ check("  a thin-data warning still shows with the count hidden",
       "hiding build-time detail must not hide a correctness warning: %s"
       % (_thin,))
 _fell = paragraph_texts(dict(SECTION, _trigger_fell_back=True))
-check("  so does the fallen-back-trigger warning",
-      any("did not fire" in c for c in _fell), _fell)
+check("  the fallen-back-trigger note stays hidden (owner, 2026-11-17)",
+      not any("did not fire" in c for c in _fell), _fell)
 check("    and a healthy chart stays silent",
       not [c for c in paragraph_texts(SECTION) if "too few" in c or "did not fire" in c],
       "a warning on every chart is a warning nobody reads")
 check("  the chart itself still renders",
       len([x for x in shapes_of(dict(SECTION, show_sample_caption=False))
-           if isinstance(x, Line) and not x.strokeDashArray]) > 10)
+           if isinstance(x, (Line, PolyLine)) and not x.strokeDashArray]) >= 1)
 
 print()
 print("[the editor offers all of it]")

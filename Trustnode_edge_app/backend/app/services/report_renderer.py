@@ -544,53 +544,104 @@ _AUTO_BUCKET_STEPS = (1, 2, 5, 10, 30, 60, 300, 900, 1800, 3600, 86400)
 _AUTO_BUCKET_CAP = 6000
 
 
-def _bucketed_or_raw_rows(from_utc: str, to_utc: str, gateway: str, tag: str,
-                          limit: int, note: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """Rows for a chart series: raw when the window fits, else the finest
-    bucket that does - and `note["_auto_bucket_note"]` says which.
+#: 2026-11-17, reported at a customer: "the window time for each section is
+#: not being respected ... and worse it is aggregating automatically without
+#: any instructions". Measured on a seeded store, with "Group samples: Raw":
+#: a 1 h window was averaged every 1 s, a 6 h window every 5 s - any window
+#: over two hours, or holding more than 5 000 readings, was bucketed and
+#: averaged without being asked. Raw now means raw. Only a window holding
+#: more readings than this per series is drawn differently, as the real LOW
+#: and HIGH reading of short intervals (nothing averaged, every peak kept),
+#: and the caption says so.
+_RAW_WINDOW_CAP = 20000
+#: Intervals a dense window is drawn as (two real readings each).
+_PEAK_INTERVALS = 1000
 
-    2026-11-02. get_historian_rows_range caps at 5 000 rows, under two hours
-    at 1 Hz. Past that this used to switch to MINUTE buckets regardless, so
-    a 3-hour test drew 180 points however the section was configured. Now
-    the step is the finest in _AUTO_BUCKET_STEPS that fits _AUTO_BUCKET_CAP
-    points (2 s for 3 h), and the caption names it.
+
+def _window_count(from_utc: str, to_utc: str, gateway: str, tag: str) -> int:
+    """Readings of one tag in the window (the stats reader: rollup-backed, cheap)."""
+    try:
+        st = _app_store().get_historian_stats(
+            from_utc=from_utc, to_utc=to_utc, gateway=gateway, tag=tag,
+            prefer_cloud_reads=False, data_filter=_DATA_FILTER.get())
+    except Exception:
+        return -1
+    total = 0
+    for r in st or []:
+        if not tag or str(r.get("tag") or r.get("tag_name") or "") == tag:
+            try:
+                total += int(r.get("count") or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
+def _bucketed_or_raw_rows(from_utc: str, to_utc: str, gateway: str, tag: str,
+                          limit: int, note: dict[str, Any] | None = None,
+                          mode: str = "window") -> list[dict[str, Any]]:
+    """The readings of one series for a section, NEWEST FIRST.
+
+    mode
+      "newest"        the newest `limit` readings of the window (data tables).
+      "window"        every reading of the window; past _RAW_WINDOW_CAP the
+                      LAST reading of each short interval (a real reading).
+      "window_peaks"  every reading of the window; past the cap the LOW and
+                      the HIGH reading of each short interval (charts: no
+                      peak is lost and nothing is averaged).
+    Nothing is averaged here: an average is only ever what the section's own
+    "Group samples" asked for (`bucket`), handled by the caller.
     """
+    st = _app_store()
+    flt = _DATA_FILTER.get()
+    if mode == "newest" or not (from_utc and to_utc):
+        return st.get_historian_rows_range(
+            from_utc=from_utc, to_utc=to_utc, limit=max(1, int(limit or 1)), offset=0,
+            gateway=gateway, tag=tag, prefer_cloud_reads=False, data_filter=flt)
+    total = _window_count(from_utc, to_utc, gateway, tag)
+    if 0 <= total <= _RAW_WINDOW_CAP:
+        rows: list[dict[str, Any]] = []
+        page = 20000
+        off = 0
+        while True:
+            got = st.get_historian_rows_range(
+                from_utc=from_utc, to_utc=to_utc, limit=page, offset=off,
+                gateway=gateway, tag=tag, prefer_cloud_reads=False, data_filter=flt) or []
+            rows.extend(got)
+            if len(got) < page or len(rows) >= _RAW_WINDOW_CAP:
+                break
+            off += len(got)
+        return rows
     span = _span_seconds(from_utc, to_utc)
-    raw: list[dict[str, Any]] = []
-    if span <= 2 * 3600:
-        raw = _app_store().get_historian_rows_range(data_filter=_DATA_FILTER.get(), 
-            from_utc=from_utc, to_utc=to_utc, limit=limit, offset=0,
-            gateway=gateway, tag=tag, prefer_cloud_reads=False)
-        if len(raw) < limit or span <= 120:
-            return raw
-    # Dense: pick the finest step that fits.
-    step = next((n for n in _AUTO_BUCKET_STEPS if span / float(n) <= _AUTO_BUCKET_CAP),
+    step = next((n for n in _AUTO_BUCKET_STEPS if span / float(n) <= _PEAK_INTERVALS),
                 _AUTO_BUCKET_STEPS[-1])
-    if step in (60, 3600, 86400) and not _DATA_FILTER.get():
-        bucket = {60: "minute", 3600: "hour", 86400: "day"}[step]
-        try:
-            rows = _app_store().get_historian_agg_rows(
-                bucket=bucket, from_utc=from_utc, to_utc=to_utc,
-                gateway=gateway, tag=tag, limit=max(500, min(int(span / step) + 2, 20000)))
-        except Exception:
-            rows = []
-    else:
-        try:
-            rows = _app_store().bucket_series_rows(data_filter=_DATA_FILTER.get(), 
-                from_utc=from_utc, to_utc=to_utc, gateway=gateway, tag=tag,
-                bucket_seconds=step)
-            rows = list(reversed(rows))        # callers expect newest-first
-        except Exception:
-            rows = []
-    if not rows:
-        return raw
-    if isinstance(note, dict):
-        total = sum(int(r.get("sample_count") or 0) for r in rows)
+    try:
+        buckets = st.bucket_series_rows(from_utc=from_utc, to_utc=to_utc, gateway=gateway, tag=tag,
+                                        bucket_seconds=step, data_filter=flt) or []
+    except Exception:
+        buckets = []
+    out: list[dict[str, Any]] = []
+    w0 = _ts_epoch(from_utc)
+    for r in buckets:                       # oldest first
+        # the first interval starts on a round time that can precede the
+        # window; its readings are inside it, so is its stamp
+        e = _ts_epoch(r.get("ts"))
+        if w0 is not None and e is not None and e < w0:
+            r = {**r, "ts": str(from_utc)}
+        if mode == "window_peaks":
+            lo, hi = r.get("value_min"), r.get("value_max")
+            out.append({**r, "value": lo})
+            if hi != lo:
+                out.append({**r, "value": hi})
+        else:
+            out.append({**r, "value": r.get("value_last")})
+    if isinstance(note, dict) and out:
         label = ("%ds" % step) if step < 60 else (("%dm" % (step // 60)) if step < 3600
                                                   else (("%dh" % (step // 3600)) if step < 86400 else "1d"))
-        note["_auto_bucket_note"] = ("averaged every %s - %s readings in this window"
-                                     % (label, format(total, ",").replace(",", " ")))
-    return rows
+        what = "the low and high reading" if mode == "window_peaks" else "the last reading"
+        note["_auto_bucket_note"] = ("%s readings in this window - drawn as %s of every %s (nothing averaged). "
+                                     "Choose 'Group samples' to aggregate instead."
+                                     % (format(max(total, 0), ",").replace(",", " "), what, label))
+    return list(reversed(out))
 
 
 def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tuple[list[dict[str, Any]], list[list[tuple[str, float | None, str | None]]]]:
@@ -605,6 +656,10 @@ def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tu
     """
     from_utc, to_utc = _resolve_time_range(section.get("time_range"))
     limit = max(20, min(int(section.get("readings_count") or default_limit), 5000))
+    # 2026-11-17: the window this fetch used, for the chart's X axis - the
+    # same resolution, so the axis and the data cannot disagree.
+    section["_window_used"] = (from_utc, to_utc)
+    fetch_mode = str(section.get("_fetch_mode") or "window")
     series_meta = _normalize_series_list(section)
     bucket_secs = _bucket_seconds(section)
     aligned: list[list[tuple[str, float | None, str | None]]] = []
@@ -643,7 +698,7 @@ def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tu
             points = _apply_series_analytics(points, {**s, "aggregation": ""}, 0)
             aligned.append(points)
             continue
-        rows = _bucketed_or_raw_rows(from_utc, to_utc, gw, tag, limit, note=section)
+        rows = _bucketed_or_raw_rows(from_utc, to_utc, gw, tag, limit, note=section, mode=fetch_mode)
         rows = list(reversed(rows or []))
         for r in rows:
             try:
@@ -2069,6 +2124,87 @@ def _interpolate(coords: list[tuple[float, float]], mode: str) -> list[tuple[flo
 _DRAW_POINT_CAP = 1500
 
 
+def _thin_keep_peaks(points: list, cap: Any) -> list:
+    """At most about `cap` points across the whole list, keeping in each group
+    the LOWEST and the HIGHEST reading in time order (and the first and last
+    reading). 2026-11-17: taking every Nth reading - what _thin_evenly does -
+    can drop exactly the spike an operator is looking for."""
+    try:
+        n = int(float(cap))
+    except (TypeError, ValueError):
+        return points
+    if n < 4 or len(points) <= n:
+        return points
+    groups = max(1, n // 2)
+    size = len(points) / float(groups)
+    keep = {0, len(points) - 1}
+    for g in range(groups):
+        a = int(g * size)
+        b = min(len(points), int((g + 1) * size))
+        if b <= a:
+            continue
+        lo_i = hi_i = None
+        lo_v = hi_v = None
+        for i in range(a, b):
+            v = points[i][1]
+            if v is None or not isinstance(v, (int, float)) or not math.isfinite(v):
+                continue
+            if lo_v is None or v < lo_v:
+                lo_v, lo_i = v, i
+            if hi_v is None or v > hi_v:
+                hi_v, hi_i = v, i
+        if lo_i is None:
+            keep.add(a)
+        else:
+            keep.add(lo_i)
+            keep.add(hi_i)
+    return [points[i] for i in sorted(keep)]
+
+
+def _ts_epoch(ts_raw: Any) -> float | None:
+    """Epoch seconds WITH the fraction ('YYYY-MM-DD HH:MM:SS.fff', ISO, 'Z')."""
+    txt = str(ts_raw or "").strip()
+    if not txt:
+        return None
+    try:
+        clean = txt.replace("Z", "").split("+")[0].replace("T", " ")
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(clean[:26], fmt).replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _align_by_time(aligned: list[list[tuple]]) -> tuple[list[str], list[list[tuple | None]]]:
+    """One timeline for several series: every timestamp any series has, in
+    order; each series' reading AT that timestamp, else the latest reading
+    before it (sample-and-hold), else None. 2026-11-17: rows were paired by
+    POSITION, so a series with fewer readings had its values printed next to
+    another series' timestamps."""
+    stamps: dict[str, float] = {}
+    for pts in aligned:
+        for p in pts:
+            e = _ts_epoch(p[0])
+            if e is not None:
+                stamps.setdefault(str(p[0]), e)
+    timeline = sorted(stamps.keys(), key=lambda k: stamps[k])
+    cols: list[list[tuple | None]] = []
+    for pts in aligned:
+        seq = sorted(((e, p) for p in pts for e in [_ts_epoch(p[0])] if e is not None), key=lambda x: x[0])
+        out: list[tuple | None] = []
+        j = -1
+        for ts in timeline:
+            t = stamps[ts]
+            while j + 1 < len(seq) and seq[j + 1][0] <= t:
+                j += 1
+            out.append(seq[j][1] if j >= 0 else None)
+        cols.append(out)
+    return timeline, cols
+
+
 def _thin_evenly(points: list, cap: Any) -> list:
     """At most `cap` points, spread across the whole list.
 
@@ -2158,13 +2294,15 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
     _cap = section.get("readings_count")
     _fetch_section = dict(section)
     _fetch_section.pop("readings_count", None)
+    _fetch_section["_fetch_mode"] = "window_peaks"
     series_meta, aligned = _fetch_multi_series(_fetch_section, default_limit=5000)
-    aligned = [_thin_evenly(pts, _cap) for pts in aligned]
+    # "Max samples" thins what is DRAWN, keeping every low and high (2026-11-17).
+    aligned = [_thin_keep_peaks(pts, _cap) for pts in aligned]
     # 2026-11-02: a chart is ~450 pt wide, so beyond ~3 points per printer
     # point the extra segments cannot be seen - they only cost drawing time.
     # Thinned evenly, first and last reading kept, after the operator's own
     # cap so a smaller cap still wins.
-    aligned = [_thin_evenly(pts, _DRAW_POINT_CAP) for pts in aligned]
+    aligned = [_thin_keep_peaks(pts, _DRAW_POINT_CAP) for pts in aligned]
     if not series_meta or all(not pts for pts in aligned):
         # 2026-10-11, reported: "the chart for some reason was not printed in
         # the pdf for not enough data". One message covered four different
@@ -2441,12 +2579,39 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
             return chart_bottom
         return chart_bottom + (v - lo) / (hi - lo) * chart_h
 
-    def _x(idx: int) -> float:
+    # 2026-11-17, reported at a customer: "the charts are not graphing the
+    # correct time window of the data". Points were placed by their POSITION
+    # in the list: the X axis ran from the first to the last reading fetched,
+    # a collection hole was squeezed out, and a series with fewer readings
+    # was stretched over the whole width (measured: a tag recorded only in
+    # the last 3 h of a 6 h window was drawn from 0% to 45% of the width).
+    # Points now sit at their TIME on the section's own window.
+    _win = _fetch_section.get("_window_used") or ("", "")
+    _w0, _w1 = _ts_epoch(_win[0]), _ts_epoch(_win[1])
+    _eps_by_series = [[_ts_epoch(p[0]) for p in pts] for pts in aligned]
+    _all_eps = [e for lst in _eps_by_series for e in lst if e is not None]
+    if _w0 is None or _w1 is None or _w1 <= _w0:
+        _w0 = min(_all_eps) if _all_eps else None
+        _w1 = max(_all_eps) if _all_eps else None
+    _time_axis = _w0 is not None and _w1 is not None and _w1 > _w0
+
+    def _x(idx: int, series_i: int = 0) -> float:
+        if _time_axis:
+            e = _eps_by_series[series_i][idx] if series_i < len(_eps_by_series) and idx < len(_eps_by_series[series_i]) else None
+            if e is not None:
+                return chart_left + max(0.0, min(1.0, (e - _w0) / (_w1 - _w0))) * chart_w
         if max_len <= 1:
             # Centred, not flush against the Y axis: a single sample drawn at
             # chart_left sits half outside the plot.
             return chart_left + chart_w / 2.0
         return chart_left + (idx / (max_len - 1)) * chart_w
+
+    def _gap_limit(series_i: int) -> float:
+        """Seconds between two readings that mean 'not collected' (3x the
+        usual spacing, never under 2 s): the line breaks there."""
+        eps = [e for e in _eps_by_series[series_i] if e is not None] if series_i < len(_eps_by_series) else []
+        d = sorted(b - a for a, b in zip(eps, eps[1:]) if b > a)
+        return max(2.0, 3.0 * d[len(d) // 2]) if d else float("inf")
 
     # Grid + axes background
     drawing.add(Rect(chart_left, chart_bottom, chart_w, chart_h, fillColor=colors.HexColor("#f8fafc"),
@@ -2535,13 +2700,24 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
             meta.get("interpolation"),
             norm_interpolation(section.get("interpolation")))
         coords = []
+        runs: list[list[tuple[float, float]]] = [[]]
+        gap_s = _gap_limit(idx) if _time_axis else float("inf")
+        prev_e = None
         # Iterate over 3-tuples (ts, value, value_text); the chart ignores
         # value_text and skips rows where the numeric value is missing.
         for i, point in enumerate(pts):
             v = point[1]
             if v is None or not math.isfinite(v):
                 continue
-            coords.append((_x(i), _y(v, axis)))
+            e = _eps_by_series[idx][i] if idx < len(_eps_by_series) else None
+            if _time_axis and e is not None and prev_e is not None and (e - prev_e) > gap_s and runs[-1]:
+                runs.append([])            # a collection hole: the line breaks here
+            if e is not None:
+                prev_e = e
+            c = (_x(i, idx), _y(v, axis))
+            coords.append(c)
+            runs[-1].append(c)
+        runs = [r for r in runs if r]
         if not coords:
             continue
         # 2026-10-11: "we faced some problems when the chart for some reason
@@ -2558,8 +2734,16 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
         if kind == "bar":
             # Bars are INSET from the axis: drawn flush at chart_left the first
             # bar straddled the Y axis and the last fell outside the plot.
-            bar_w = max(1.5, (chart_w * 0.92) / max(1, len(pts) * len(series_meta)))
-            for cx, cy in coords:
+            # 2026-11-17: on a time axis a bar is as wide as the spacing of its
+            # readings (shared by the series), so a gap stays a gap.
+            n_series = max(1, len(series_meta))
+            xs_sorted = sorted(c[0] for c in coords)
+            dx = sorted(b2 - a2 for a2, b2 in zip(xs_sorted, xs_sorted[1:]) if b2 > a2)
+            slot = dx[len(dx) // 2] if dx else chart_w * 0.5
+            bar_w = max(1.0, min(slot * 0.8 / n_series, (chart_w * 0.92) / max(1, len(pts) * n_series)
+                                 if not _time_axis else slot * 0.8 / n_series))
+            shift = (idx - (n_series - 1) / 2.0) * bar_w if _time_axis else 0.0
+            for cx, cy in [(c[0] + shift, c[1]) for c in coords]:
                 # Clamp inside the plot. Centred on its x position, the first
                 # bar sat half outside the Y axis and the last overhung the
                 # right edge.
@@ -2568,9 +2752,15 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
                 series_group.add(Rect(x0, chart_bottom, bar_w, max(0, cy - chart_bottom),
                                       fillColor=stroke_color, strokeColor=stroke_color, strokeWidth=0))
         else:
+          for run in runs:
+            if len(run) == 1:
+                cx, cy = run[0]
+                series_group.add(Circle(cx, cy, max(1.2, lw * 1.2), fillColor=stroke_color,
+                                        strokeColor=stroke_color, strokeWidth=0))
+                continue
             # Interpolate ONCE, so the line and the area fill below cannot
             # disagree about where the curve runs.
-            coords = _interpolate(coords, interp)
+            coords = _interpolate(run, interp)
             # Polyline (manual): draw segment lines.
             if kind == "area":
                 # Translucent fill: build polygon by hugging the X axis.
@@ -2616,8 +2806,27 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
                                _format_tick(lo + (hi - lo) * i / float(tick_count), fmt),
                                fontName="Helvetica", fontSize=7, textAnchor=anchor,
                                fillColor=colors.HexColor("#64748b")))
-    # X axis a couple of timestamps
-    if show_x_axis and max_len >= 2:
+    # X axis: the WINDOW's start and end (2026-11-17 - it printed the first
+    # and last reading, so a chart missing its first hours still looked
+    # complete), and time ticks between them when there is room.
+    if show_x_axis and _time_axis:
+        _fmt_end = "%Y-%m-%d %H:%M:%S"
+        _span = _w1 - _w0
+        _fmt_mid = "%H:%M:%S" if _span <= 3 * 3600 else ("%H:%M" if _span <= 2 * 86400 else "%m-%d %H:%M")
+        def _lbl(e: float, f: str) -> str:
+            return datetime.fromtimestamp(e, tz=timezone.utc).strftime(f)
+        drawing.add(String(chart_left, ticks_y, _lbl(_w0, _fmt_end),
+                           fontName="Helvetica", fontSize=7, textAnchor="start", fillColor=colors.HexColor("#64748b")))
+        drawing.add(String(chart_right, ticks_y, _lbl(_w1, _fmt_end),
+                           fontName="Helvetica", fontSize=7, textAnchor="end", fillColor=colors.HexColor("#64748b")))
+        if chart_w >= 320:
+            for k in (1, 2, 3):
+                xk = chart_left + chart_w * k / 4.0
+                drawing.add(Line(xk, chart_bottom, xk, chart_bottom + chart_h,
+                                 strokeColor=colors.HexColor("#e5e7eb"), strokeWidth=0.3, strokeDashArray=[1, 2]))
+                drawing.add(String(xk, ticks_y, _lbl(_w0 + _span * k / 4.0, _fmt_mid),
+                                   fontName="Helvetica", fontSize=7, textAnchor="middle", fillColor=colors.HexColor("#64748b")))
+    elif show_x_axis and max_len >= 2:
         # Pick first and last timestamps from the series with the most points
         ref_pts = max(aligned, key=lambda p: len(p)) if aligned else []
         if ref_pts:
@@ -2698,8 +2907,9 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
     warnings: list[str] = []
     if total_samples and total_samples < 3:
         warnings.append("too few readings for a meaningful trend")
-    if section.get("_trigger_fell_back"):
-        warnings.append("section trigger did not fire; showing the report window")
+    # 2026-11-17, from the owner: the "section trigger did not fire; showing
+    # the report window" note is not shown - the section quietly covers the
+    # report's window, which is what it was asked to do.
     if _fetch_section.get("_auto_bucket_note"):
         warnings.append(str(_fetch_section.get("_auto_bucket_note")))
 
@@ -2786,7 +2996,9 @@ def build_chart_section_rows(section: dict[str, Any]) -> tuple[list[str], list[l
     file. Returns `(header, body_rows)`. The first column is always the
     timestamp from the longest series; subsequent columns are one per series.
     """
-    series_meta, aligned = _fetch_multi_series(section)
+    _sec = dict(section)
+    _sec["_fetch_mode"] = "window"
+    series_meta, aligned = _fetch_multi_series(_sec)
     if not series_meta or all(not pts for pts in aligned):
         return [], []
     # Two leading columns: human-friendly local time + the raw UTC. Tools
@@ -2797,22 +3009,23 @@ def build_chart_section_rows(section: dict[str, Any]) -> tuple[list[str], list[l
         label = (s.get("label") or s.get("tag_name") or "Value").strip()
         unit = (s.get("unit") or "").strip()
         header.append(f"{label} [{unit}]" if unit else label)
-    longest = max(range(len(aligned)), key=lambda i: len(aligned[i]))
-    timeline = aligned[longest]
+    # 2026-11-17: one row per timestamp, each series' reading at that time
+    # (rows were paired by position - another tag's value next to this time).
+    timeline, cols = _align_by_time(aligned)
     body: list[list[Any]] = []
-    for i in range(len(timeline)):
-        ts_utc_raw = str(timeline[i][0] or "")
+    for i, ts in enumerate(timeline):
+        ts_utc_raw = str(ts or "")
         ts_local = _utc_str_to_local_iso(ts_utc_raw)[:23]
         row: list[Any] = [ts_local, ts_utc_raw[:23]]
         for j, _meta in enumerate(series_meta):
-            pts = aligned[j]
-            if i < len(pts):
-                v = pts[i][1]
-                # 2026-11-10: a string tag's reading shows its text.
-                t = pts[i][2] if len(pts[i]) > 2 else None
-                row.append(str(t) if t else ("-" if v is None else f"{float(v):.3f}"))
-            else:
+            p = cols[j][i] if j < len(cols) else None
+            if p is None:
                 row.append("-")
+                continue
+            v = p[1]
+            # 2026-11-10: a string tag's reading shows its text.
+            t = p[2] if len(p) > 2 else None
+            row.append(str(t) if t else ("-" if v is None else f"{float(v):.3f}"))
         body.append(row)
     return header, body
 
@@ -2885,7 +3098,13 @@ def build_template_render_data(template: dict[str, Any]) -> dict[str, Any]:
                     "items": rendered,
                 })
             elif stype in ("line_chart", "area_chart", "bar_chart"):
-                series_meta, aligned = _fetch_multi_series(section)
+                # 2026-11-17: the preview reads what the PDF draws - the whole
+                # window (it read the newest 240 readings), thinned with peaks.
+                _psec = dict(section)
+                _psec["_fetch_mode"] = "window_peaks"
+                _psec.pop("readings_count", None)
+                series_meta, aligned = _fetch_multi_series(_psec, default_limit=5000)
+                aligned = [_thin_keep_peaks(pts, section.get("readings_count") or _DRAW_POINT_CAP) for pts in aligned]
                 series = []
                 for i, meta in enumerate(series_meta):
                     pts = aligned[i] if i < len(aligned) else []
@@ -2893,12 +3112,13 @@ def build_template_render_data(template: dict[str, Any]) -> dict[str, Any]:
                         "label": str(meta.get("label") or meta.get("tag_name") or f"Series {i + 1}"),
                         "unit": str(meta.get("unit") or ""),
                         "color": str(meta.get("color") or ""),
-                        # Compact point list: [ts_utc, value]. Cap to 500
-                        # samples per series so the JSON payload stays
-                        # reasonable when an operator picks a broad range.
+                        # Compact point list: [ts_utc, value]. At most ~500
+                        # points across the WHOLE window, lows and highs kept
+                        # (2026-11-17: the newest 500 were kept - the preview
+                        # showed the last minutes of a 6 h section).
                         "points": [
                             [str(p[0] or ""), (None if p[1] is None else float(p[1]))]
-                            for p in pts[-500:]
+                            for p in _thin_keep_peaks(pts, 500)
                         ],
                     })
                 out_sections.append({
@@ -3093,16 +3313,23 @@ def _build_data_table_rows(section: dict[str, Any]) -> tuple[list[str], list[lis
     plus the usual arithmetic operators and python's `math` namespace exposed
     as `math.*`. Anything else is rejected and rendered as `-`.
     """
-    series_meta, aligned = _fetch_multi_series(section, default_limit=int(section.get("row_limit") or 30))
+    # 2026-11-17: the newest readings of the WINDOW, never bucketed unless
+    # the section's "Group samples" asks; rows joined by TIME (they were
+    # paired by position, so a 'calc' column subtracted readings taken at
+    # different times when two tags had different counts).
+    _sec = dict(section)
+    _sec["_fetch_mode"] = "newest"
+    series_meta, aligned = _fetch_multi_series(_sec, default_limit=int(section.get("row_limit") or 30))
     if not series_meta or all(not pts for pts in aligned):
         return [], []
     row_limit = max(1, min(int(section.get("row_limit") or 30), 500))
-    # Choose an index dimension: longest series (treated as the reference timeline).
-    longest_idx = max(range(len(aligned)), key=lambda i: len(aligned[i]))
-    timeline = aligned[longest_idx][-row_limit:]
+    _tl, _cols = _align_by_time(aligned)
+    _tl = _tl[-row_limit:]
+    _cols = [c[-row_limit:] for c in _cols]
+    timeline = [(ts, None, None) for ts in _tl]
     series_by_id = {s["id"]: i for i, s in enumerate(series_meta)}
-    # Trim every series to the same final N samples for alignment.
-    trimmed = [pts[-row_limit:] if pts else [] for pts in aligned]
+    longest_idx = max(range(len(aligned)), key=lambda i: len(aligned[i]))
+    trimmed = [[(p if p is not None else (ts, None, None)) for p, ts in zip(c, _tl)] for c in _cols]
     # Default columns: timestamp + one value column per series.
     columns = section.get("columns")
     if not isinstance(columns, list) or not columns:
@@ -3767,34 +3994,41 @@ def resolve_trigger_window(trigger: dict[str, Any], outer_from: str, outer_to: s
     if not start_conds:
         return outer_from, outer_to
     stop_conds, stop_logic = _trigger_conditions(trigger, "stop")
-
-    timeline = _cond_timeline(start_conds, outer_from, outer_to, fetch)
+    # 2026-11-17: the same start / stop machine as the schedule's cycle
+    # (services/trigger_cycles.py). The STOP reacts to turning true after the
+    # start - a stop bit still true from the last run no longer ends the
+    # section on its first reading - and the section may say how it ends
+    # ("end": start_false | stop | next_start) and what a start dropping
+    # before the stop means ("start_drop": ignore | end | discard - discard
+    # skips that run and takes the next one in the window).
+    from app.services import trigger_cycles as _tc
+    try:
+        n_a = len(start_conds)
+        timeline = _cond_timeline(list(start_conds) + list(stop_conds), outer_from, outer_to, fetch)
+        moments = _tc.moments_from_timeline(
+            timeline,
+            lambda vals: _logic_true(start_conds, vals[:n_a], start_logic),
+            (lambda vals: _logic_true(stop_conds, vals[n_a:], stop_logic)) if stop_conds else None)
+        events, st = _tc.walk(moments, None,
+                              _tc.end_mode_for(trigger.get("end"), bool(stop_conds)),
+                              _tc.drop_action_for(trigger.get("start_drop")))
+    except Exception:
+        events, st = [], {"open": False}
     t0 = ""
-    for ts, values in timeline:
-        if _logic_true(start_conds, values, start_logic):
+    for kind, ts in events:
+        if kind == "open":
             t0 = ts
-            break
-    if not t0:
-        if str(trigger.get("on_miss") or "window").strip().lower() == "empty":
-            return _NEVER, _NEVER
-        return outer_from, outer_to
-
-    if stop_conds:
-        for ts, values in _cond_timeline(stop_conds, t0, outer_to, fetch):
-            if ts <= t0:
-                continue
-            if _logic_true(stop_conds, values, stop_logic):
-                return t0, ts
+        elif kind == "close" and t0:
+            return t0, ts
+        elif kind == "discard":
+            t0 = ""
+    if t0:
         # Still running when the report was made: close at the outer end, so
         # the readings taken since t0 are never dropped.
         return t0, outer_to
-
-    for ts, values in timeline:
-        if ts <= t0:
-            continue
-        if not _logic_true(start_conds, values, start_logic):
-            return t0, ts
-    return t0, outer_to
+    if str(trigger.get("on_miss") or "window").strip().lower() == "empty":
+        return _NEVER, _NEVER
+    return outer_from, outer_to
 
 
 # --------------------------------------------------------------------------- #

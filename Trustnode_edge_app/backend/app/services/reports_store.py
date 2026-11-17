@@ -106,6 +106,11 @@ def _announce_reports_changed() -> None:
         pass
 
 
+
+def _now_text_utc() -> str:
+    from datetime import datetime as _dt, timezone as _tz
+    return _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
+
 class ReportsStore:
     """CRUD for templates, schedules, and generated report records.
 
@@ -556,6 +561,14 @@ class ReportsStore:
         # Default ON: re-opening a cycle while the start bit is still high was
         # the bug, not the feature.
         start_edge = 0 if schedule.get("start_edge") is False else 1
+        # 2026-11-17: how a cycle ends and what a start that drops before the
+        # stop means (services/trigger_cycles.py). Named in BOTH statements.
+        cycle_end = str(schedule.get("cycle_end") or "").strip().lower()
+        if cycle_end not in {"", "start_false", "stop", "next_start"}:
+            cycle_end = ""
+        start_drop = str(schedule.get("start_drop") or "").strip().lower()
+        if start_drop not in {"", "ignore", "end", "discard"}:
+            start_drop = ""
         segment_gateway = str(schedule.get("segment_gateway") or "").strip()
         recurrence = str(schedule.get("recurrence") or "daily").strip().lower()
         if recurrence not in {"daily", "weekly", "monthly", "hourly"}:
@@ -611,7 +624,7 @@ class ReportsStore:
                           segment_tag = ?, segment_gateway = ?,
                           template_ids_json = ?, output_path = ?,
                           start_edge = ?, destination_rules_json = ?,
-                          report_columns_json = ?,
+                          report_columns_json = ?, cycle_end = ?, start_drop = ?,
                           updated_utc = ?
                         WHERE tenant_id = ? AND id = ?
                         """,
@@ -647,6 +660,7 @@ class ReportsStore:
                             # edits a saved schedule so the two statements
                             # cannot drift again.
                             json.dumps(report_columns, ensure_ascii=False),
+                            cycle_end, start_drop,
                             now,
                             tid, sid,
                         ),
@@ -667,8 +681,9 @@ class ReportsStore:
                           segment_tag, segment_gateway,
                           template_ids_json, output_path, start_edge,
                           destination_rules_json, report_columns_json,
+                          cycle_end, start_drop,
                           created_utc, updated_utc
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             sid, tid, name, template_id, enabled, trigger_mode,
@@ -686,6 +701,7 @@ class ReportsStore:
                             start_edge,
                             json.dumps(destination_rules, ensure_ascii=False),
                             json.dumps(report_columns, ensure_ascii=False),
+                            cycle_end, start_drop,
                             now, now,
                         ),
                     )
@@ -814,6 +830,8 @@ class ReportsStore:
             "template_ids": _json_list("template_ids_json"),
             "output_path": _row_text("output_path"),
             "start_edge": _row_flag("start_edge", True),
+            "cycle_end": _row_text("cycle_end"),
+            "start_drop": _row_text("start_drop"),
             "cycle_segments": _json_list("cycle_segments_json"),
             "deliver_email": bool(int(row["deliver_email"] or 0)),
             "recipients": recipients,
@@ -1019,14 +1037,25 @@ class ReportsStore:
         file_bytes: int | None = None,
         file_sha256: str | None = None,
         render_data: Any = None,
+        meta_patch: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Move a generated record to "ready" or "failed" (or back to
-        "pending" for a regenerate), filling in whatever is known."""
+        "pending" for a regenerate), filling in whatever is known.
+
+        2026-11-17: also "collecting" -> "pending" for a cycle's record, with
+        `meta_patch` completing its window; and "cancelled"."""
         tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
         current = self.get_generated(generated_id, tenant_id=tid)
         if not current:
             return None
         meta = dict(current.get("meta") or {})
+        if isinstance(meta_patch, dict):
+            meta.update(meta_patch)
+        if str(render_state or "") == "pending" and str(meta.get("render_state") or "") != "pending":
+            # the hour after which "pending" reads as failed counts from HERE,
+            # not from when the row was made: a cycle's record exists from its
+            # start, and a two-hour test must not read as failed at its end
+            meta["pending_since"] = _now_text_utc()
         meta["render_state"] = str(render_state or "ready")
         if render_error:
             meta["render_error"] = str(render_error)[:500]
@@ -1226,7 +1255,8 @@ class ReportsStore:
             return st
         try:
             from datetime import datetime as _dt, timezone as _tz
-            made = _dt.strptime(str(created_utc)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=_tz.utc)
+            since_txt = str((meta or {}).get("pending_since") or created_utc)
+            made = _dt.strptime(since_txt[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=_tz.utc)
             if (_dt.now(_tz.utc) - made).total_seconds() > ReportsStore.PENDING_MAX_AGE_S:
                 return "failed-stale"
         except Exception:

@@ -5888,6 +5888,12 @@ class AppStore:
                     # 2026-10-27: columns the operator wants beside each
                     # generated report (a work order read from a tag, say).
                     ("report_columns_json", "TEXT NOT NULL DEFAULT '[]'"),
+                    # 2026-11-17: how a cycle ends, and what a start dropping
+                    # before the stop means. Empty = the rule the schedule
+                    # always had (stop conditions if any, else the start
+                    # going false; a dropping start is ignored).
+                    ("cycle_end", "TEXT NOT NULL DEFAULT ''"),
+                    ("start_drop", "TEXT NOT NULL DEFAULT ''"),
                 ):
                     if _col not in sched_cols:
                         conn.execute("ALTER TABLE scheduled_reports ADD COLUMN %s %s"

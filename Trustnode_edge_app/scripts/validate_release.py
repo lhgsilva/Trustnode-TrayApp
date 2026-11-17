@@ -448,6 +448,17 @@ SOURCE_CHECKS = [
     # the four readers, the routes, Data Export and the in-memory evaluator.
     ("data filter", "test_data_filter.py"),
     ("number fields typeable", "test_number_fields_typeable.py"),
+    # 2026-11-17: report sections respect their window - raw is raw, charts
+    # placed by time, tables joined by time - and the three chart tests that
+    # had counted Line shapes (drawn as PolyLines since 2026-11-02) measure
+    # the drawn chart again.
+    ("report chart window", "test_report_chart_window.py"),
+    ("report chart axes", "test_report_chart_axes.py"),
+    ("report chart controls", "test_report_chart_controls.py"),
+    ("report chart interpolation", "test_report_chart_interpolation.py"),
+    # 2026-11-17: every start / stop trigger shape (held, pulse, one tag,
+    # stale stop, start dropping first), the Collecting record, discard.
+    ("trigger modes", "test_trigger_modes.py"),
     # 2026-11-16: report actions queued behind polls; Regenerate lost the
     # name/folder; Duplicate schedule; each Y-axis bound Auto/Manual/Tag.
     ("generated-report actions answer at once", "test_reports_actions_2026_11_16.py"),

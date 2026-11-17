@@ -249,6 +249,7 @@ class ReportRunner:
         window: tuple[str, str] | None = None,
         segments: list[dict[str, Any]] | None = None,
         report_id: str = "",
+        cycle_records: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         tenant_id = (schedule.get("tenant_id") or "default").strip() or "default"
         set_current_tenant(tenant_id)
@@ -264,17 +265,84 @@ class ReportRunner:
         results = []
         for tpl_id in wanted:
             out = self._run_one(schedule, tpl_id, tenant_id, triggered_by,
-                                email_settings, window, segments, report_id)
+                                email_settings, window, segments, report_id,
+                                record_id=(cycle_records or {}).get(tpl_id, ""))
             results.append(out)
         if len(results) == 1:
             return results[0]
         return {"ok": all(r.get("ok") for r in results), "reports": results,
                 "generated": (results[0] or {}).get("generated")}
 
+    def _wanted_templates(self, schedule: dict[str, Any]) -> list[str]:
+        wanted = [str(t).strip() for t in (schedule.get("template_ids") or [])
+                  if str(t or "").strip()]
+        return wanted or [str(schedule.get("template_id") or "").strip()]
+
+    def open_cycle_records(self, schedule: dict[str, Any], started: str,
+                           report_id: str = "") -> dict[str, str]:
+        """2026-11-17, asked: "as soon as it sees a trigger to start it should
+        show on the generated page with status Processing". One record per
+        template, state "collecting", from the cycle's first reading. The
+        close fills the same records in. Never raises."""
+        out: dict[str, str] = {}
+        tenant_id = (schedule.get("tenant_id") or "default").strip() or "default"
+        try:
+            set_current_tenant(tenant_id)
+        except Exception:
+            pass
+        for tpl_id in self._wanted_templates(schedule):
+            try:
+                template = self.store.get_template(tpl_id, tenant_id=tenant_id) or {}
+                rec = self.store.insert_generated({
+                    "tenant_id": tenant_id, "template_id": tpl_id,
+                    "template_name": template.get("name") or tpl_id,
+                    "schedule_id": schedule.get("id"), "schedule_name": schedule.get("name"),
+                    "triggered_by": "cycle", "file_path": "", "file_name": "",
+                    "file_bytes": 0, "file_sha256": "",
+                    "meta": {"window_from": str(started or ""), "window_to": "",
+                             "report_id": str(report_id or ""), "trigger": "cycle",
+                             "render_state": "collecting", "collecting_since": str(started or "")},
+                })
+                if rec.get("id"):
+                    out[tpl_id] = str(rec["id"])
+            except Exception as exc:
+                logger.warning("report cycle: could not list the started cycle (%s)", exc)
+        return out
+
+    def find_cycle_records(self, schedule: dict[str, Any]) -> dict[str, str]:
+        """The schedule's records still collecting (after a restart)."""
+        out: dict[str, str] = {}
+        try:
+            rows = self.store.list_generated(
+                tenant_id=(schedule.get("tenant_id") or "default"), limit=50,
+                schedule_id=str(schedule.get("id") or "")) or []
+        except Exception:
+            return out
+        for r in rows:
+            if str((r.get("meta") or {}).get("render_state") or r.get("render_state") or "") == "collecting":
+                out.setdefault(str(r.get("template_id") or ""), str(r.get("id") or ""))
+        return out
+
+    def cancel_cycle_records(self, schedule: dict[str, Any], records: dict[str, str], reason: str) -> None:
+        tenant_id = (schedule.get("tenant_id") or "default").strip() or "default"
+        for gid in (records or {}).values():
+            try:
+                self.store.update_generated_render(gid, tenant_id=tenant_id, render_state="cancelled",
+                                                   render_error=reason)
+            except Exception:
+                pass
+
     def _run_one(self, schedule, template_id, tenant_id, triggered_by,
-                 email_settings, window, segments, report_id):
+                 email_settings, window, segments, report_id, record_id: str = ""):
         template = self.store.get_template(template_id, tenant_id=tenant_id)
         if not template:
+            if record_id:
+                try:
+                    self.store.update_generated_render(
+                        record_id, tenant_id=tenant_id, render_state="failed",
+                        render_error=f"Template {template_id!r} not found")
+                except Exception:
+                    pass
             return {
                 "ok": False,
                 "error": f"Template {template_id!r} not found",
@@ -285,7 +353,29 @@ class ReportRunner:
         # file - or the failure, which used to leave no trace at all.
         file_name = _cycle_file_name(schedule, template, window, report_id)
         _t_store = _time_rs.perf_counter()
-        record = self.store.insert_generated({
+        _meta_now = {
+            "window_from": str((window or ("", ""))[0] or ""),
+            "window_to": str((window or ("", ""))[1] or ""),
+            "segments": list(segments or [])[:200],
+            "segment_count": len(segments or []),
+            "report_id": str(report_id or ""),
+            "trigger": str(triggered_by or ""),
+            "columns": _resolve_report_columns(schedule, window),
+        }
+        record = None
+        if record_id:
+            # the cycle's record, listed as "collecting" since its start
+            try:
+                record = self.store.update_generated_render(
+                    record_id, tenant_id=tenant_id, render_state="pending",
+                    file_name=os.path.basename(str(file_name or "")) or "",
+                    meta_patch=_meta_now)
+            except Exception:
+                record = None
+        if record:
+            pass
+        else:
+          record = self.store.insert_generated({
             "tenant_id": tenant_id,
             "template_id": template.get("id"),
             "template_name": template.get("name"),
@@ -763,6 +853,15 @@ class ReportScheduler:
         """
         sched_id = str(schedule.get("id") or "")
         now_stamp = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+        if schedule.get("start_edge") is not False and self.history_lookup:
+            # 2026-11-17: the edge-driven machine. Level mode (start_edge
+            # false) keeps the exact path below it always had.
+            try:
+                self._consider_cycle_edges(dict(schedule), now_utc)
+                self._last_seen[sched_id] = now_stamp
+                return
+            except Exception as exc:          # never let a trigger stop a report
+                logger.exception("report cycle: edge machine failed (%s); using the step path this tick", exc)
         since = self._last_seen.get(sched_id) or ""
         self._last_seen[sched_id] = now_stamp
         schedule = dict(schedule)
@@ -771,6 +870,254 @@ class ReportScheduler:
             if not boundary or boundary >= now_stamp or boundary == since:
                 return
             since = boundary
+
+    # ------------------------------------------------------------ edges
+    #: A tag with no stored reading for this long is read LIVE (collection
+    #: gated on the test: the 0 that ends it is never stored).
+    LIVE_WHEN_STALE_S = 10.0
+
+    def _cond_true(self, conds: list[dict], held: dict, logic: str) -> bool:
+        results = []
+        for c in conds:
+            key = (str(c.get("gateway_id") or "").strip(), str(c.get("tag_name") or c.get("tag") or "").strip())
+            v = held.get(key)
+            try:
+                num = float(v)
+                threshold = float(c.get("value"))
+            except (TypeError, ValueError):
+                results.append(False)
+                continue
+            second = c.get("value2")
+            try:
+                second = float(second) if second not in (None, "") else None
+            except (TypeError, ValueError):
+                second = None
+            results.append(bool(_compare(num, str(c.get("operator") or ">="), threshold, second)))
+        if not results:
+            return False
+        return any(results) if str(logic or "all").strip().lower() == "any" else all(results)
+
+    def _cycle_moments(self, schedule: dict[str, Any], st: dict[str, Any], now_utc: datetime):
+        """(ts, start_true, stop_true) for every stored reading of the start
+        and stop tags since the last one seen, sample-and-hold; plus one
+        LIVE moment when a tag has nothing stored lately."""
+        now_stamp = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+        start_c = [c for c in (schedule.get("tag_conditions") or []) if isinstance(c, dict)
+                   and str(c.get("tag_name") or c.get("tag") or "").strip()]
+        stop_c = [c for c in (schedule.get("stop_conditions") or []) if isinstance(c, dict)
+                  and str(c.get("tag_name") or c.get("tag") or "").strip()]
+        logic_a = schedule.get("condition_logic") or "all"
+        logic_b = schedule.get("stop_condition_logic") or "all"
+        keys: list[tuple[str, str]] = []
+        for c in start_c + stop_c:
+            k = (str(c.get("gateway_id") or "").strip(), str(c.get("tag_name") or c.get("tag") or "").strip())
+            if k not in keys:
+                keys.append(k)
+        held: dict = dict(st.get("held") or {})
+        key_ts: dict = dict(st.get("key_ts") or {})
+        first = not st.get("seen")
+        since = st.get("last_ts") or ""
+        sched_id = str(schedule.get("id") or "")
+        if first and self._last_seen.get(sched_id):
+            # the scheduler already looked at this schedule (the step path):
+            # replay what happened since then, edges included
+            since = self._last_seen[sched_id]
+            first = False
+        elif first:
+            since = (now_utc - timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S")
+        watch_since = st.get("watch_since") or now_stamp
+        events: list[tuple[str, tuple[str, str], Any]] = []
+        for k in keys:
+            try:
+                rows = self.history_lookup(k[0], k[1], since, now_stamp) or []
+            except Exception:
+                rows = []
+            for ts, value in rows:
+                ts = str(ts)
+                # never a reading from after "now" (a lookup that ignores its
+                # bounds, or a clock ahead): it is next tick's news
+                if (ts > since or first) and ts[:19] <= now_stamp:
+                    events.append((ts, k, value))
+        events.sort(key=lambda e: e[0])
+        moments: list[tuple[str, bool, bool | None]] = []
+        last_ts = st.get("last_ts") or ""
+        i = 0
+        while i < len(events):
+            ts = events[i][0]
+            while i < len(events) and events[i][0] == ts:
+                held[events[i][1]] = events[i][2]
+                key_ts[events[i][1]] = ts
+                i += 1
+            last_ts = max(last_ts, ts)
+            if not first:
+                moments.append((ts, self._cond_true(start_c, held, logic_a),
+                                self._cond_true(stop_c, held, logic_b) if stop_c else None))
+        # live, for a tag whose readings are not being stored right now
+        changed = False
+        for k in keys:
+            stale = True
+            # a tag with NO stored reading yet is read live only once it has
+            # been watched for a while: its first stored reading may simply
+            # not be written yet, and a live value taken now would be stamped
+            # earlier than the change it shows
+            t_last = key_ts.get(k) or (None if watch_since >= now_stamp else watch_since)
+            if t_last is None:
+                continue
+            if t_last:
+                try:
+                    age = (now_utc - datetime.strptime(str(t_last)[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S")
+                           .replace(tzinfo=timezone.utc)).total_seconds()
+                    stale = age > self.LIVE_WHEN_STALE_S
+                except Exception:
+                    stale = True
+            if not stale:
+                continue
+            try:
+                v = self.live_lookup(k[0], k[1])
+            except Exception:
+                v = None
+            if v is not None and held.get(k) != v:
+                held[k] = v
+                changed = True
+        if first or changed:
+            moments.append((max(now_stamp, last_ts), self._cond_true(start_c, held, logic_a),
+                            self._cond_true(stop_c, held, logic_b) if stop_c else None))
+        st["held"], st["key_ts"], st["last_ts"], st["seen"] = held, key_ts, last_ts, True
+        st["watch_since"] = watch_since
+        return moments, bool(stop_c)
+
+    def _capture_report_id(self, schedule: dict[str, Any]) -> str:
+        report_id = ""
+        id_tag = str(schedule.get("id_tag") or "").strip()
+        if not id_tag:
+            return ""
+        id_gateway = str(schedule.get("id_gateway") or "").strip()
+        if not id_gateway:
+            first = (schedule.get("tag_conditions") or [{}])[0]
+            id_gateway = str((first or {}).get("gateway_id") or "").strip()
+        try:
+            txt = self.live_text_lookup(id_gateway, id_tag) if self.live_text_lookup else None
+            if txt not in (None, ""):
+                return str(txt).strip()
+            value = self.live_lookup(id_gateway, id_tag)
+            if value is None:
+                return ""
+            try:
+                f = float(value)
+                return (str(int(f)) if f == int(f) else str(f)).strip()
+            except (TypeError, ValueError):
+                return str(value).strip()
+        except Exception:
+            return report_id
+
+    def _consider_cycle_edges(self, schedule: dict[str, Any], now_utc: datetime) -> None:
+        """2026-11-17: a cycle opens on the start turning true, ends per the
+        schedule's `cycle_end` (start going false / the stop turning true /
+        the next start pulse) and `start_drop` (ignore / end / discard).
+        See services/trigger_cycles.py. A record is listed as "collecting"
+        from the start; the close fills it in; a discard cancels it."""
+        from app.services import trigger_cycles as _tc
+        sched_id = str(schedule.get("id") or "")
+        now_stamp = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+        if not hasattr(self, "_edge_state"):
+            self._edge_state = {}
+            self._cycle_records = {}
+        st = self._edge_state.get(sched_id) or dict(_tc.new_state())
+        started = str(schedule.get("cycle_started_utc") or "").strip()
+        if started and not st.get("open"):
+            # a cycle open in the store (a restart part-way through): carry
+            # on; a stop already true must still go false and back to true
+            st.update(open=True, opened_at=started, stop_armed=False, start_low_seen=False)
+        if not started and st.get("open"):
+            st.update(open=False, opened_at="")
+        if not st.get("seen") and not started:
+            # first look after a start-up: a record still "collecting" has no
+            # open cycle behind it any more
+            left = self.runner.find_cycle_records(schedule) if hasattr(self.runner, "find_cycle_records") else {}
+            if left:
+                self.runner.cancel_cycle_records(schedule, left, "The cycle was not open when the app started again; no report was made from it.")
+        moments, has_stop = self._cycle_moments(schedule, st, now_utc)
+        end_mode = _tc.end_mode_for(schedule.get("cycle_end"), has_stop)
+        drop = _tc.drop_action_for(schedule.get("start_drop"))
+        events, st2 = _tc.walk(moments, st, end_mode, drop)
+        for k in ("held", "key_ts", "last_ts", "seen", "watch_since"):
+            st2[k] = st.get(k)
+        self._edge_state[sched_id] = st2
+        for kind, ts in events:
+            if kind == "open":
+                stamp = str(ts)[:23]
+                report_id = self._capture_report_id(schedule)
+                self.store.set_cycle_state(sched_id, stamp, report_id, segments_json="[]")
+                schedule["cycle_started_utc"] = stamp
+                schedule["cycle_report_id"] = report_id
+                schedule["cycle_segments"] = []
+                recs = {}
+                try:
+                    recs = self.runner.open_cycle_records(schedule, stamp, report_id) if hasattr(self.runner, "open_cycle_records") else {}
+                except Exception:
+                    recs = {}
+                self._cycle_records[sched_id] = recs
+                logger.info("report cycle opened: schedule=%s at %s id=%r (%s)", sched_id, stamp, report_id, end_mode)
+            elif kind == "discard":
+                started_now = str(schedule.get("cycle_started_utc") or "")
+                recs = self._cycle_records.pop(sched_id, None) or (
+                    self.runner.find_cycle_records(schedule) if hasattr(self.runner, "find_cycle_records") else {})
+                self.store.set_cycle_state(sched_id, "", "", segments_json="[]")
+                schedule["cycle_started_utc"] = ""
+                schedule["cycle_report_id"] = ""
+                schedule["cycle_segments"] = []
+                if hasattr(self.runner, "cancel_cycle_records"):
+                    self.runner.cancel_cycle_records(
+                        schedule, recs, "The start went false at %s before the end trigger; the cycle "
+                        "was discarded (schedule option). No report was made from it." % str(ts)[:19])
+                logger.info("report cycle discarded: schedule=%s %s..%s", sched_id, started_now, ts)
+            elif kind == "close":
+                started_now = str(schedule.get("cycle_started_utc") or "")
+                stamp = str(ts)[:23]
+                if not started_now or stamp < started_now:
+                    continue
+                segments = self._track_segment(schedule, sched_id, started_now, stamp)
+                segments = self._close_segments(segments, stamp)
+                logger.info("report cycle closed: schedule=%s %s..%s (%d segment(s))",
+                            sched_id, started_now, stamp, len(segments))
+                self.store.set_cycle_state(sched_id, "", "", segments_json="[]")
+                recs = self._cycle_records.pop(sched_id, None) or (
+                    self.runner.find_cycle_records(schedule) if hasattr(self.runner, "find_cycle_records") else {})
+                email_settings = None
+                try:
+                    email_settings = self.email_settings_lookup()
+                except Exception:
+                    email_settings = None
+                try:
+                    kwargs = {"cycle_records": recs} if recs else {}
+                    result = self.runner.run(
+                        schedule, triggered_by="cycle", email_settings=email_settings,
+                        window=(started_now, stamp), segments=segments,
+                        report_id=str(schedule.get("cycle_report_id") or ""), **kwargs)
+                except Exception as exc:
+                    result = {"ok": False, "error": str(exc)}
+                    if recs and hasattr(self.runner, "cancel_cycle_records"):
+                        for gid in recs.values():
+                            try:
+                                self.store.update_generated_render(gid, render_state="failed",
+                                                                   render_error="Report run failed: %s" % exc)
+                            except Exception:
+                                pass
+                try:
+                    self.store.mark_schedule_run(
+                        schedule_id=sched_id, last_run_utc=stamp,
+                        status="success" if result.get("ok") else "error",
+                        error=None if result.get("ok") else str(result.get("error") or ""),
+                        next_run_utc=None)
+                except Exception:
+                    pass
+                schedule["cycle_started_utc"] = ""
+                schedule["cycle_report_id"] = ""
+                schedule["cycle_segments"] = []
+        # still open at the end of this tick: follow the test / cycle tag
+        # (segments) up to now - once, at the right time
+        if str(schedule.get("cycle_started_utc") or ""):
+            self._track_segment(schedule, sched_id, str(schedule.get("cycle_started_utc")), now_stamp)
 
     def _consider_cycle_once(self, schedule: dict[str, Any], stamp: str, since: str) -> str:
         """One open-or-close step from `since`. Returns the boundary it found
