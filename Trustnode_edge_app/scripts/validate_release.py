@@ -37,6 +37,13 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 env = dict(os.environ)
 env.setdefault("VAL_DURATION_S", "600")
+# 2026-11-17: "boot block is from THIS run" is judged against when the RUN
+# started. The run is this gate - source checks included, which now take 20
+# to 80 minutes - not the full-system stage alone, or an app launched right
+# before the gate (as its own message asks) fails by the length of the source
+# phase. The stage reads this; set it beforehand to re-run only the stage.
+import time as _time
+env.setdefault("VAL_RUN_STARTED_AT", str(_time.time()))
 env.setdefault("PYTHONIOENCODING", "utf-8")
 
 # 2026-10-20: the login this gate uses to drive the running app used to be

@@ -199,6 +199,18 @@ for (const tz of ["UTC", "America/Sao_Paulo"]) {
     JSON.stringify({ runStart: new Date(RUN_START).toISOString(), firstPoint: new Date(tfrom).toISOString() }));
   check("  and the time axis starts at the run's start", Array.isArray(t.x) && near(t.x[0], RUN_START, 20e3), JSON.stringify(t.x));
   check("  an open run's axis ends at its newest point (no blank strip)", Array.isArray(t.x) && t.x[1] === "dataMax", JSON.stringify(t.x));
+  // 2026-11-16, reported: "even when I select the trigger option and change
+  // the number of readings or the aggregation, it never changes".
+  const t10 = await render({ window_mode: "trigger", window_tag_name: "Run", window_gateway_id: "gw1", window_operator: "==",
+    window_value: "1", window_stop_tag: "__start_condition_ends__", readings_count: 10 }, 2500);
+  const n10 = Object.values(t10.per).map((v) => v.n);
+  check("trigger: 10 reading points draw about 10 buckets over the run, live rows folded in (not one per reading)",
+    n10.length === 3 && n10.every((n) => n >= 5 && n <= 14), JSON.stringify(n10));
+  const t1m = await render({ window_mode: "trigger", window_tag_name: "Run", window_gateway_id: "gw1", window_operator: "==",
+    window_value: "1", window_stop_tag: "__start_condition_ends__", bucket_interval: "1m" }, 2500);
+  const n1m = Object.values(t1m.per).map((v) => v.n);
+  check("  'Aggregate every 1 min' keeps the trigger chart: axis from the run's start, one point per minute",
+    Array.isArray(t1m.x) && near(t1m.x[0], RUN_START, 20e3) && n1m.length === 3 && n1m.every((n) => n >= 11 && n <= 15), JSON.stringify({ x: t1m.x, n: n1m }));
   const roll = await render({});
   check("rolling (no window) is unchanged: last readings, axis follows the data",
     roll.keys.length === 3 && JSON.stringify(roll.x) === JSON.stringify(["dataMin", "dataMax"]), JSON.stringify(roll.x));

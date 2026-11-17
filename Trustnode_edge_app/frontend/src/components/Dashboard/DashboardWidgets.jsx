@@ -404,10 +404,38 @@ function getPiePalette(widget) {
   ];
 }
 
-function _formatChartTickTime(ms, formatKey) {
+// 2026-11-16, measured on the window with seven widgets (DevTools profile):
+// 43% of ALL renderer time was inside this function, 92% of a core was
+// script, 9 frames a second. `toLocaleTimeString(opts)` builds a new
+// Intl.DateTimeFormat on every call, and the chart library calls the tick
+// formatter for every candidate tick, several passes per render, on every
+// live tick of every chart. One formatter per format, one string per
+// (format, ms): the same labels, for nothing.
+const _NUM3_FMT = new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 });
+const _TICK_FMT = new Map();     // formatKey -> Intl.DateTimeFormat
+const _TICK_MEMO = new Map();    // "formatKey|ms" -> label
+const _TICK_MEMO_MAX = 8192;
+export function _formatChartTickTime(ms, formatKey) {
   if (!Number.isFinite(ms)) return "";
+  const key = String(formatKey || "hh_mm_ss").toLowerCase();
+  const memoKey = key + "|" + ms;
+  const hit = _TICK_MEMO.get(memoKey);
+  if (hit !== undefined) return hit;
   try {
     const d = new Date(ms);
+    let fmt = _TICK_FMT.get(key);
+    if (!fmt) {
+      fmt = new Intl.DateTimeFormat([], _tickFormatOptions(key));
+      _TICK_FMT.set(key, fmt);
+    }
+    const out = fmt.format(d);
+    if (_TICK_MEMO.size >= _TICK_MEMO_MAX) _TICK_MEMO.clear();
+    _TICK_MEMO.set(memoKey, out);
+    return out;
+  } catch (_) { return ""; }
+}
+function _tickFormatOptions(formatKey) {
+  {
     const opts = (() => {
       switch (String(formatKey || "hh_mm_ss").toLowerCase()) {
         case "hh_mm":
@@ -426,8 +454,8 @@ function _formatChartTickTime(ms, formatKey) {
           return { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
       }
     })();
-    return d.toLocaleTimeString([], opts);
-  } catch (_) { return ""; }
+    return opts;
+  }
 }
 
 // 2026-11-16, reported: "a gap is shown in the beginning and on the end of
@@ -566,13 +594,12 @@ function buildXAxisProps(series, cfg = {}, opts = {}) {
   };
 }
 
+const _Y_TICK_FMT = new Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const yAxisProps = {
   tick: { fill: "var(--ink-soft, #8a98ab)", fontSize: 11 },
   tickFormatter: (v) => {
     const n = Number(v);
-    return Number.isFinite(n)
-      ? n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-      : "";
+    return Number.isFinite(n) ? _Y_TICK_FMT.format(n) : "";
   },
   axisLine: { stroke: "var(--line, rgba(255,255,255,0.07))" },
   tickLine: false,
@@ -616,7 +643,7 @@ function formatByPreset(value, preset = "auto") {
       return n.toExponential(2);
     case "auto":
     default:
-      return n.toLocaleString(undefined, { maximumFractionDigits: 3 });
+      return _NUM3_FMT.format(n);
   }
 }
 
@@ -1467,9 +1494,17 @@ function LiveTagChart({
       "1s": 1000, "5s": 5000, "10s": 10000, "30s": 30000,
       "1m": 60000, "5m": 300000, "15m": 900000, "1h": 3600000,
     };
-    return map[groupKey] || 0;
+    // 2026-11-16, reported: in a trigger window "Reading points" and
+    // "Aggregate every" never changed the chart. The seed WAS bucketed to the
+    // reading count, but every live reading was then appended raw, so the
+    // chart filled back up to one point per reading; and an explicit
+    // "Aggregate every" (kept in bucket_interval for charts) was not read
+    // here at all. Live rows now fold into the same bucket as the seed.
+    const explicit = (bucketSecondsFor(cfg) * 1000) || map[groupKey] || 0;
+    if (explicit > 0) return explicit;
+    return trigCfg && seedBucketMs > 0 ? seedBucketMs : 0;
   })();
-  const reducerKey = String(cfg.query_result_aggregation || "last").toLowerCase();
+  const reducerKey = String(cfg.bucket_aggregation || cfg.query_result_aggregation || "last").toLowerCase();
 
   useEffect(() => {
     const fresh = new Map();
@@ -1782,9 +1817,11 @@ function LiveTagChart({
         tmp.get(bucketStart).push(buf.get(ts));
       }
       for (const [bucketStart, vals] of tmp.entries()) {
-        const center = bucketStart + Math.floor(groupBucketMs / 2);
+        // 2026-11-16: stamped at the bucket START, like the server's buckets
+        // the seed is made of - a centre stamp put the live tail half a
+        // bucket ahead of the seed (and of the clock).
         const r = reduce(vals);
-        if (Number.isFinite(r)) grouped.set(center, r);
+        if (Number.isFinite(r)) grouped.set(bucketStart, r);
       }
       perSeries.set(s.id, grouped);
     }
@@ -2070,7 +2107,7 @@ function LiveTagChart({
       case "3dp": return n.toFixed(3);
       case "scientific": return n.toExponential(2);
       case "auto":
-      default: return n.toLocaleString(undefined, { maximumFractionDigits: 3 });
+      default: return _NUM3_FMT.format(n);
     }
   };
 
@@ -2103,7 +2140,7 @@ function LiveTagChart({
         case "2dp": return n.toFixed(2);
         case "3dp": return n.toFixed(3);
         case "scientific": return n.toExponential(2);
-        default: return n.toLocaleString(undefined, { maximumFractionDigits: 3 });
+        default: return _NUM3_FMT.format(n);
       }
     };
     return (v) => `${prefix ? `${prefix}` : ""}${fmtNum(v)}${unit ? ` ${unit}` : ""}${suffix ? ` ${suffix}` : ""}`;
@@ -2158,28 +2195,9 @@ function LiveTagChart({
   // (industrial convention). Operator can pick HH:MM, HH:MM:SS, or
   // include the date in the editor.
   const xTimeFormat = String(cfg.chart_x_time_format || "hh_mm_ss").toLowerCase();
-  const formatTickTime = (d) => {
-    if (!Number.isFinite(d.getTime())) return "";
-    const opts = (() => {
-      switch (xTimeFormat) {
-        case "hh_mm":
-          return { hour: "2-digit", minute: "2-digit", hour12: false };
-        case "hh_mm_ss":
-          return { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
-        case "date_hh_mm":
-          return { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false };
-        case "date_hh_mm_ss":
-          return { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
-        case "full_date_hh_mm":
-          return { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false };
-        case "hh_mm_12h":
-          return { hour: "numeric", minute: "2-digit", hour12: true };
-        default:
-          return { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
-      }
-    })();
-    return d.toLocaleTimeString([], opts);
-  };
+  // 2026-11-16: one cached formatter per format (see _formatChartTickTime) -
+  // this built an Intl.DateTimeFormat per tick label on every live tick.
+  const formatTickTime = (d) => _formatChartTickTime(d instanceof Date ? d.getTime() : Number(d), xTimeFormat);
   // Operator 2026-06-16: X axis now uses tsMs directly (numeric time
   // scale), so the formatter receives raw ms — points space themselves
   // by real time, matching the gateway's poll interval. Two charts
@@ -3587,7 +3605,11 @@ function DashboardWidgetCardImpl({
     && ((String(cfg?.window_mode || "count") === "trigger" && !!String(cfg?.window_tag_name || "").trim())
       || (cfgTimePreset === "none" && !cfgTimeFrom.trim() && !cfgTimeTo.trim()))
     && !(Array.isArray(cfg?.series_extra) && cfg.series_extra.some((s) => String(s?.chart_type || "").toLowerCase() === "limit"))
-    && bucketSecondsFor(cfg) <= 0;
+    // 2026-11-16: a trigger window keeps the live chart with an explicit
+    // "Aggregate every" too - the live chart buckets its own seed and tail;
+    // the windowed chart knows nothing of the run.
+    && (bucketSecondsFor(cfg) <= 0
+      || (String(cfg?.window_mode || "count") === "trigger" && !!String(cfg?.window_tag_name || "").trim()));
   const extraSeriesRowsByDef = useMemo(() => {
     if (!extraSeriesDefs.length || usesLiveChart) return {};
     const liveRows = Array.isArray(dataLogView) ? dataLogView : [];
@@ -4417,7 +4439,9 @@ function DashboardWidgetCardImpl({
         !historicalMode
         && (hasTriggerWindow || (!hasTimePreset && !hasTimeRange))
         && (resolvedLimitLines || []).length === 0
-        && bucketSecondsFor(cfg) <= 0;     // aggregated charts are served bucketed
+        // aggregated charts are served bucketed - except in a trigger window,
+        // where the live chart buckets its own seed and tail (2026-11-16)
+        && (bucketSecondsFor(cfg) <= 0 || hasTriggerWindow);
       if (liveModeEligible) {
         return (
           <LiveTagChart

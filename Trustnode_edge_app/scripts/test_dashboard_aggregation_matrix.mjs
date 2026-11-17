@@ -75,7 +75,7 @@ const esbuild = await import("file:///" + path.join(SRC, "..", "node_modules", "
 const out = path.join(os.tmpdir(), "tn_probe_" + process.pid + ".mjs");
 await esbuild.build({
   stdin: {
-    contents: "export { DashboardWidgetCard } from " + JSON.stringify(WIDGETS.replace(/\\/g, "/")) + ";\n"
+    contents: "export { DashboardWidgetCard, _formatChartTickTime } from " + JSON.stringify(WIDGETS.replace(/\\/g, "/")) + ";\n"
       + "export { default as React } from \"react\"; export { createRoot } from \"react-dom/client\"; export { flushSync } from \"react-dom\";",
     resolveDir: SRC, loader: "js",
   },
@@ -91,7 +91,7 @@ await esbuild.build({
     },
   }],
 });
-const { DashboardWidgetCard, React, createRoot, flushSync } = await import("file:///" + out.replace(/\\/g, "/"));
+const { DashboardWidgetCard, _formatChartTickTime, React, createRoot, flushSync } = await import("file:///" + out.replace(/\\/g, "/"));
 
 const NOW = Date.now();
 const RUN_START = NOW - 12 * 60 * 1000;          // a trigger run that started 12 min ago
@@ -323,6 +323,19 @@ console.log("\n[the data filter: other tags' values at the same time]");
   const w = await show("line_chart", { readings_count: 100, data_filter: { logic: "all", conditions: [{ tag_name: "Run", operator: "eq", value1: 0 }] } }, false, 1500);
   const s2 = w.snap(); w.root.unmount(); w.el.remove();
   check("  and Run = 0 keeps only the rows before the run (the two filters are disjoint)", s2.pts.length > 0 && s2.pts.every((t) => t < RUN_START + 1), `${s2.pts.length} pts`);
+}
+
+// ---------------------------------------------------------------- 1e. tick labels are cheap
+console.log("\n[tick labels: cached formatters]");
+{
+  // 2026-11-16, DevTools profile on the window with seven widgets: 43% of all
+  // renderer time was the X tick formatter (a new Intl.DateTimeFormat per
+  // call, thousands of calls a second); 9 frames a second.
+  const t0 = performance.now();
+  for (let i = 0; i < 50000; i += 1) _formatChartTickTime(1700000000000 + (i % 2000) * 500, i % 2 ? "hh_mm_ss" : "date_hh_mm");
+  const ms = performance.now() - t0;
+  check("50 000 tick labels format in under 400 ms (was seconds: one Intl formatter per call)", ms < 400, `${Math.round(ms)} ms`);
+  check("  and the label is unchanged", /^\d\d:\d\d:\d\d$/.test(_formatChartTickTime(1700000000000, "hh_mm_ss")), _formatChartTickTime(1700000000000, "hh_mm_ss"));
 }
 
 // ---------------------------------------------------------------- 2. a change applies at once

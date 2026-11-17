@@ -179,7 +179,12 @@ import boot_log_check as _boot  # noqa: E402
 #: When this run began - the boot block is judged against this,
 #: not against the wall clock, so a long soak does not fail
 #: simply because its own duration aged the boot out.
-RUN_STARTED_AT = time.time()
+# 2026-11-17: the gate passes its own start (source checks included); alone,
+# this stage's start is the run's start.
+try:
+    RUN_STARTED_AT = float(os.environ.get("VAL_RUN_STARTED_AT") or 0) or time.time()
+except (TypeError, ValueError):
+    RUN_STARTED_AT = time.time()
 import validate_surfaces as _surf  # noqa: E402  (2026-08-21: LAN surfaces + access policy)
 import validate_licence_and_views as _lic  # noqa: E402  (2026-08-29: licensing, customers, Lite/web views)
 BOOT_MAX_HEALTH_MS = int(os.environ.get("VAL_BOOT_MAX_HEALTH_MS", "15000"))
